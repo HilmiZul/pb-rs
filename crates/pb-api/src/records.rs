@@ -321,3 +321,319 @@ fn find_by_column(
 fn bearer(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("Bearer {value}")).ok()
 }
+
+// ---------------------------------------------------------------------------
+// Records CRUD (basic: list/view/create/update/delete, no filter/expand yet)
+// ---------------------------------------------------------------------------
+
+use axum::extract::Query;
+use axum::http::StatusCode;
+use serde::Deserialize;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RecordsListParams {
+    pub page: Option<String>,
+    #[serde(rename = "perPage")]
+    pub per_page: Option<String>,
+    pub sort: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "skipTotal")]
+    pub skip_total: Option<String>,
+}
+
+fn parse_page(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(1).max(1)
+}
+
+fn parse_per_page(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse().ok())
+        .unwrap_or(30)
+        .clamp(1, 500)
+}
+
+fn find_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {
+    Collection::find(conn, id_or_name)
+        .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
+        .ok_or_else(|| ApiError::not_found("Missing collection context."))
+}
+
+/// `GET /api/collections/{collection}/records`
+pub async fn list(
+    State(db): State<Db>,
+    Path(id_or_name): Path<String>,
+    Query(params): Query<RecordsListParams>,
+) -> Result<Json<Value>, ApiError> {
+    let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_collection(&conn, &id_or_name)?;
+
+    let page = parse_page(params.page.as_deref());
+    let per_page = parse_per_page(params.per_page.as_deref());
+    let offset = (page - 1) * per_page;
+
+    // Sort
+    let sort = params.sort.clone().unwrap_or_default();
+    let order_clause = build_order(&collection, &sort);
+
+    let total: i64 = conn
+        .query_row(&format!("SELECT count(*) FROM {}", quote_table(&collection.name)), [], |r| r.get(0))
+        .map_err(|e| ApiError::internal(format!("count failed: {e}")))?;
+
+    let sql = format!(
+        "SELECT * FROM {} {} LIMIT ?1 OFFSET ?2",
+        quote_table(&collection.name),
+        order_clause
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| ApiError::internal(format!("prepare failed: {e}")))?;
+    let rows = stmt.query(rusqlite::params![per_page, offset]).map_err(|e| ApiError::internal(format!("query failed: {e}")))?;
+    let mut records = Vec::new();
+    let mut rows = rows;
+    while let Some(row) = rows.next().map_err(|e| ApiError::internal(format!("row failed: {e}")))? {
+        let rec = Record::from_row(&collection, row).map_err(|e| ApiError::internal(format!("from_row failed: {e}")))?;
+        records.push(rec.to_api_json());
+    }
+
+    let total_pages = if per_page > 0 {
+        (total + per_page - 1) / per_page
+    } else {
+        1
+    };
+
+    let skip_total = params
+        .skip_total
+        .as_deref()
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let mut out = Map::new();
+    out.insert("page".into(), Value::Number(page.into()));
+    out.insert("perPage".into(), Value::Number(per_page.into()));
+    if !skip_total {
+        out.insert("totalItems".into(), Value::Number(total.into()));
+        out.insert("totalPages".into(), Value::Number(total_pages.into()));
+    }
+    out.insert("items".into(), Value::Array(records));
+    Ok(Json(Value::Object(out)))
+}
+
+fn quote_table(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn build_order(collection: &Collection, sort: &str) -> String {
+    if sort.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for token in sort.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (desc, field) = if let Some(rest) = token.strip_prefix('-') {
+            (true, rest)
+        } else {
+            (false, token)
+        };
+        let col = match field {
+            "@rowid" => "_rowid_".to_string(),
+            "@created" | "@updated" | "@random" => field.trim_start_matches('@').to_string(),
+            other => other.to_string(),
+        };
+        // validate column exists
+        let exists = collection.field_list().items().iter().any(|f| {
+            pb_core::fields::field_name(f) == col
+        }) || col == "_rowid_" || col == "id" || col == "created" || col == "updated";
+        if !exists {
+            continue;
+        }
+        let dir = if desc { "DESC" } else { "ASC" };
+        parts.push(format!("{} {}", quote_table(&col), dir));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("ORDER BY {}", parts.join(", "))
+    }
+}
+
+/// `GET /api/collections/{collection}/records/{id}`
+pub async fn view(
+    State(db): State<Db>,
+    Path((id_or_name, record_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_collection(&conn, &id_or_name)?;
+    let record = Record::find_by_id(&conn, &collection, &record_id)
+        .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+    Ok(Json(record.to_api_json()))
+}
+
+/// `POST /api/collections/{collection}/records`
+pub async fn create(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_collection(&conn, &id_or_name)?;
+
+    let payload: Map<String, Value> = if body.is_empty() {
+        Map::new()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(Value::Object(m)) => m,
+            _ => return Err(ApiError::bad_request("Failed to load the submitted data due to invalid formatting.")),
+        }
+    };
+
+    // Build column list from collection fields + id
+    let fields = collection.field_list();
+    let mut columns: Vec<String> = Vec::new();
+    let mut placeholders: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+
+    // id
+    let id = payload.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| {
+        // `r` + 14 hex chars (matches `DEFAULT ('r'||lower(hex(randomblob(7))))`).
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut out = String::from("r");
+        for _ in 0..14 {
+            out.push_str(&format!("{:x}", rng.gen_range(0..16u8)));
+        }
+        out
+    });
+    columns.push("id".into());
+    placeholders.push("?".into());
+    values.push(Value::String(id.clone()));
+
+    for field in fields.items() {
+        let name = pb_core::fields::field_name(field).to_string();
+        if name == "id" {
+            continue;
+        }
+        let val = payload.get(&name).cloned().unwrap_or(Value::Null);
+        // Convert JSON to storage form
+        let stored = json_to_column(&val, pb_core::fields::field_type(field));
+        columns.push(name);
+        placeholders.push("?".into());
+        values.push(stored);
+    }
+
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_table(&collection.name),
+        columns.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", "),
+        placeholders.join(", ")
+    );
+
+    let params: Vec<rusqlite::types::Value> = values.iter().map(json_to_sqlite).collect();
+    conn.execute(&sql, rusqlite::params_from_iter(params))
+        .map_err(|e| ApiError::bad_request(format!("Failed to create record. Raw error: \n{e}")))?;
+
+    let record = Record::find_by_id(&conn, &collection, &id)
+        .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
+        .ok_or_else(|| ApiError::internal("created record is missing"))?;
+    Ok(Json(record.to_api_json()))
+}
+
+fn json_to_column(value: &Value, field_type: &str) -> Value {
+    match field_type {
+        "bool" => value.clone(),
+        "number" => value.clone(),
+        "json" => value.clone(),
+        _ => value.clone(),
+    }
+}
+
+fn json_to_sqlite(value: &Value) -> rusqlite::types::Value {
+    match value {
+        Value::Null => rusqlite::types::Value::Null,
+        Value::Bool(b) => rusqlite::types::Value::Integer(if *b { 1 } else { 0 }),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rusqlite::types::Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                rusqlite::types::Value::Real(f)
+            } else {
+                rusqlite::types::Value::Text(n.to_string())
+            }
+        }
+        Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+        Value::Array(_) | Value::Object(_) => {
+            rusqlite::types::Value::Text(serde_json::to_string(value).unwrap_or_default())
+        }
+    }
+}
+
+/// `PATCH /api/collections/{collection}/records/{id}`
+pub async fn update(
+    State(db): State<Db>,
+    Path((id_or_name, record_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_collection(&conn, &id_or_name)?;
+
+    let payload: Map<String, Value> = if body.is_empty() {
+        Map::new()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(Value::Object(m)) => m,
+            _ => return Err(ApiError::bad_request("Failed to load the submitted data due to invalid formatting.")),
+        }
+    };
+
+    // Build SET clause
+    let fields = collection.field_list();
+    let mut sets = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    for (key, val) in &payload {
+        if key == "id" || key == "collectionId" || key == "collectionName" {
+            continue;
+        }
+        // check field exists
+        let field_type = fields.items().iter().find(|f| pb_core::fields::field_name(f) == key).map(|f| pb_core::fields::field_type(f).to_string());
+        let ft = match field_type {
+            Some(t) => t,
+            None => continue,
+        };
+        sets.push(format!("{} = ?", quote_table(key)));
+        values.push(json_to_column(val, &ft));
+    }
+    if sets.is_empty() {
+        let record = Record::find_by_id(&conn, &collection, &record_id)
+            .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
+            .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+        return Ok(Json(record.to_api_json()));
+    }
+    values.push(Value::String(record_id.clone()));
+    let sql = format!(
+        "UPDATE {} SET {} WHERE id = ?",
+        quote_table(&collection.name),
+        sets.join(", ")
+    );
+    let params: Vec<rusqlite::types::Value> = values.iter().map(json_to_sqlite).collect();
+    conn.execute(&sql, rusqlite::params_from_iter(params))
+        .map_err(|e| ApiError::bad_request(format!("Failed to update record. Raw error: \n{e}")))?;
+
+    let record = Record::find_by_id(&conn, &collection, &record_id)
+        .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+    Ok(Json(record.to_api_json()))
+}
+
+/// `DELETE /api/collections/{collection}/records/{id}`
+pub async fn delete(
+    State(db): State<Db>,
+    Path((id_or_name, record_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_collection(&conn, &id_or_name)?;
+    let sql = format!("DELETE FROM {} WHERE id = ?1", quote_table(&collection.name));
+    conn.execute(&sql, [&record_id])
+        .map_err(|e| ApiError::bad_request(format!("Failed to delete record. Raw error: \n{e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}

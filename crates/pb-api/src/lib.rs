@@ -82,6 +82,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             "/collections/:collection/truncate",
             delete(collections::truncate),
         )
+        .route(
+            "/collections/:collection/records",
+            get(records::list).post(records::create),
+        )
+        .route(
+            "/collections/:collection/records/:id",
+            get(records::view).patch(records::update).delete(records::delete),
+        )
         .route("/collections/:collection/auth-methods", get(records::methods))
         .route(
             "/collections/:collection/auth-with-password",
