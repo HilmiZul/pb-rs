@@ -362,11 +362,18 @@ fn find_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Coll
 /// `GET /api/collections/{collection}/records`
 pub async fn list(
     State(db): State<Db>,
+    headers: HeaderMap,
     Path(id_or_name): Path<String>,
     Query(params): Query<RecordsListParams>,
 ) -> Result<Json<Value>, ApiError> {
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser && collection.list_rule.is_none() {
+        return Err(ApiError::forbidden("Only superusers can perform this action."));
+    }
 
     let page = parse_page(params.page.as_deref());
     let per_page = parse_per_page(params.per_page.as_deref());
@@ -549,10 +556,18 @@ fn build_order(collection: &Collection, sort: &str) -> String {
 /// `GET /api/collections/{collection}/records/{id}`
 pub async fn view(
     State(db): State<Db>,
+    headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser && collection.view_rule.is_none() {
+        return Err(ApiError::forbidden("Only superusers can perform this action."));
+    }
+
     let record = Record::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
@@ -568,6 +583,12 @@ pub async fn create(
 ) -> Result<Json<Value>, ApiError> {
     let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser && collection.update_rule.is_none() {
+        return Err(ApiError::forbidden("Only superusers can perform this action."));
+    }
 
     let payload: Map<String, Value> = if body.is_empty() {
         Map::new()
@@ -661,11 +682,18 @@ fn json_to_sqlite(value: &Value) -> rusqlite::types::Value {
 /// `PATCH /api/collections/{collection}/records/{id}`
 pub async fn update(
     State(db): State<Db>,
+    headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser && collection.update_rule.is_none() {
+        return Err(ApiError::forbidden("Only superusers can perform this action."));
+    }
 
     let payload: Map<String, Value> = if body.is_empty() {
         Map::new()
@@ -718,10 +746,18 @@ pub async fn update(
 /// `DELETE /api/collections/{collection}/records/{id}`
 pub async fn delete(
     State(db): State<Db>,
+    headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser && collection.delete_rule.is_none() {
+        return Err(ApiError::forbidden("Only superusers can perform this action."));
+    }
+
     let sql = format!("DELETE FROM {} WHERE id = ?1", quote_table(&collection.name));
     conn.execute(&sql, [&record_id])
         .map_err(|e| ApiError::bad_request(format!("Failed to delete record. Raw error: \n{e}")))?;
