@@ -72,11 +72,30 @@ CLI, `/_/` static serving of the mirrored UI.
    loads the login form, authenticates, stores the session, and lands on
    `#/collections`. Record-list 404s are explicitly listed as M3 scope.
 
-### M2b — collections/settings writes  ← next
+### M2b — settings writes  ✅ done
 
-Scope: `_collections` create/update/delete with record-table sync, field builder
-validation, import/export, `POST /meta/dry-run-view`, truncate,
-`PATCH /api/settings`, and the `filter` query language for the collections list.
+Scope: `PATCH /api/settings` with oracle-identical recursive merge and
+validation. Gate: `tools/gate_m2.sh` phase 1 (settings row byte-identical).
+
+### M2c — collection create/delete/truncate  ✅ done
+
+Scope: `POST /api/collections`, `DELETE /api/collections/{c}`,
+`DELETE /api/collections/{c}/truncate`, field builder validation, auth option
+binding, per-index error trees, SQLite error translation. Gate:
+`tools/gate_m2.sh` (m2c scenario, 81 requests, DB rows + schema identical).
+
+### M2d — collection update  ✅ done
+
+Scope: `PATCH /api/collections/{c}` — table rename, column add/drop/rename,
+single↔multiple normalization, index sync, auth option merge, system-field and
+rule guards. Gate: `tools/gate_m2.sh` (m2d scenario, 27 requests, DB rows +
+schema identical).
+
+### M2e — collections list `filter`, import/export, dry-run-view  ← next
+
+Scope: `GET /api/collections?filter=...`, `POST /api/collections/import`,
+`GET /api/collections/{id}/export`, `POST /api/collections/meta/dry-run-view`,
+and `CreateViewFields` (identifier parser, `_clone_` ids).
 
 ## M3 — Records CRUD, filter/sort/expand, rules
 

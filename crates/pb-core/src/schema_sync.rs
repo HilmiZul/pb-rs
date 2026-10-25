@@ -464,6 +464,276 @@ pub fn go_sqlite_error(err: &rusqlite::Error) -> String {
     }
 }
 
+/// `app.HasTable`.
+pub fn has_table(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT (1) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// `SyncRecordTableSchema` failure: either a raw driver error or a set of
+/// per-index validation errors that the API surfaces as a tree.
+#[derive(Debug)]
+pub enum SyncError {
+    Raw(String),
+    Indexes(Vec<(usize, String)>),
+}
+
+/// `SyncRecordTableSchema` for both create and update. `old` is `None` on
+/// create.
+pub fn sync_table(
+    conn: &Connection,
+    new: &Collection,
+    old: Option<&Collection>,
+) -> Result<(), SyncError> {
+    if new.is_view() {
+        return Ok(());
+    }
+
+    let create = match old {
+        Some(old) if has_table(conn, &old.name) => false,
+        _ => true,
+    };
+
+    if create {
+        conn.execute_batch(&create_table_sql(new))
+            .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+        return create_indexes_checked(conn, new);
+    }
+
+    let old = old.unwrap();
+    let old_fields = old.field_list();
+    let new_fields = new.field_list();
+
+    let need_rename = !old.name.eq_ignore_ascii_case(&new.name);
+    let need_indexes = need_rename
+        || serde_json::to_string(&old.fields).unwrap_or_default()
+            != serde_json::to_string(&new.fields).unwrap_or_default()
+        || serde_json::to_string(&old.indexes).unwrap_or_default()
+            != serde_json::to_string(&new.indexes).unwrap_or_default();
+
+    if need_indexes {
+        drop_indexes(conn, old).map_err(|e| SyncError::Raw(e.to_string()))?;
+    }
+
+    if need_rename {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} RENAME TO {}",
+            quote_ident(&old.name),
+            quote_ident(&new.name)
+        ))
+        .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+    }
+
+    // dropped columns
+    for old_field in old_fields.items() {
+        let old_id = crate::fields::field_id(old_field);
+        if new_fields.get_by_id(old_id).is_some() {
+            continue;
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            quote_ident(&new.name),
+            quote_ident(crate::fields::field_name(old_field))
+        ))
+        .map_err(|e| {
+            SyncError::Raw(format!(
+                "failed to drop column {} - {}",
+                crate::fields::field_name(old_field),
+                go_sqlite_error(&e)
+            ))
+        })?;
+    }
+
+    // added or renamed columns (via a temporary name to avoid collisions)
+    let mut to_rename: Vec<(String, String)> = Vec::new();
+    for field in new_fields.items() {
+        let old_field = old_fields.get_by_id(crate::fields::field_id(field));
+        match old_field {
+            None => {
+                let temp = format!("{}{}", crate::fields::field_name(field), ids_random(5));
+                to_rename.push((temp.clone(), crate::fields::field_name(field).to_string()));
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    quote_ident(&new.name),
+                    quote_ident(&temp),
+                    crate::fields::column_type(field)
+                ))
+                .map_err(|e| {
+                    SyncError::Raw(format!(
+                        "failed to add column {} - {}",
+                        crate::fields::field_name(field),
+                        go_sqlite_error(&e)
+                    ))
+                })?;
+            }
+            Some(old_field) if crate::fields::field_name(old_field)
+                != crate::fields::field_name(field) =>
+            {
+                let temp = format!("{}{}", crate::fields::field_name(field), ids_random(5));
+                to_rename.push((temp.clone(), crate::fields::field_name(field).to_string()));
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                    quote_ident(&new.name),
+                    quote_ident(crate::fields::field_name(old_field)),
+                    quote_ident(&temp)
+                ))
+                .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+            }
+            _ => {}
+        }
+    }
+    for (temp, actual) in &to_rename {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            quote_ident(&new.name),
+            quote_ident(temp),
+            quote_ident(actual)
+        ))
+        .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+    }
+
+    // single <-> multiple conversion
+    normalize_single_vs_multiple(conn, new, old)?;
+
+    if need_indexes {
+        return create_indexes_checked(conn, new);
+    }
+
+    Ok(())
+}
+
+fn create_indexes_checked(
+    conn: &Connection,
+    collection: &Collection,
+) -> Result<(), SyncError> {
+    let errors = create_indexes_errors(conn, collection);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(SyncError::Indexes(errors))
+    }
+}
+
+fn ids_random(n: usize) -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..n)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+fn normalize_single_vs_multiple(
+    conn: &Connection,
+    new: &Collection,
+    old: &Collection,
+) -> Result<(), SyncError> {
+    let new_fields = new.field_list();
+    let old_fields = old.field_list();
+
+    for field in new_fields.items() {
+        let is_new_multiple = crate::fields::is_multiple(field);
+        let is_old_multiple = old_fields
+            .get_by_id(crate::fields::field_id(field))
+            .map(crate::fields::is_multiple)
+            .unwrap_or(false);
+
+        if is_old_multiple == is_new_multiple {
+            continue;
+        }
+
+        // drop all views, restore them afterwards
+        let views: Vec<(String, String)> = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type='view' AND sql IS NOT NULL")
+            .map_err(|e| SyncError::Raw(e.to_string()))?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| SyncError::Raw(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+
+        for (name, _) in &views {
+            conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)))
+                .map_err(|e| SyncError::Raw(e.to_string()))?;
+        }
+
+        let table = quote_ident(&new.name);
+        let original = quote_ident(crate::fields::field_name(field));
+        let old_temp = quote_ident(&format!("_{}{}", crate::fields::field_name(field), ids_random(5)));
+
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            table, original, old_temp
+        ))
+        .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table, original, crate::fields::column_type(field)
+        ))
+        .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+
+        let old_temp_name = old_temp.trim_matches('`');
+        let sql = if !is_old_multiple && is_new_multiple {
+            format!(
+                "UPDATE {table} SET {original} = (
+                    CASE
+                        WHEN COALESCE({old}, '') = ''
+                        THEN '[]'
+                        ELSE (
+                            CASE
+                                WHEN json_valid({old}) AND json_type({old}) == 'array'
+                                THEN {old}
+                                ELSE json_array({old})
+                            END
+                        )
+                    END
+                )",
+                table = table,
+                original = original,
+                old = quote_ident(old_temp_name)
+            )
+        } else {
+            format!(
+                "UPDATE {table} SET {original} = (
+                    CASE
+                        WHEN COALESCE({old}, '[]') = '[]'
+                        THEN ''
+                        ELSE (
+                            CASE
+                                WHEN json_valid({old}) AND json_type({old}) == 'array'
+                                THEN COALESCE(json_extract({old}, '$[#-1]'), '')
+                                ELSE {old}
+                            END
+                        )
+                    END
+                )",
+                table = table,
+                original = original,
+                old = quote_ident(old_temp_name)
+            )
+        };
+        conn.execute_batch(&sql)
+            .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            table, old_temp
+        ))
+        .map_err(|e| SyncError::Raw(go_sqlite_error(&e)))?;
+
+        for (_, sql) in &views {
+            conn.execute_batch(sql)
+                .map_err(|e| SyncError::Raw(e.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// `dropCollectionIndexes`.
 pub fn drop_indexes(conn: &Connection, collection: &Collection) -> Result<()> {
     for raw in collection.index_list() {

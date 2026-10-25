@@ -29,7 +29,7 @@ GO_PORT="${GO_PORT:-18120}"
 RS_PORT="${RS_PORT:-18121}"
 EMAIL="admin@example.com"
 PASSWORD="pass12345678"
-SCENARIOS="harness/scenarios/m2-auth.json harness/scenarios/m2b-settings.json harness/scenarios/m2c-collections-write.json"
+SCENARIOS="harness/scenarios/m2-auth.json harness/scenarios/m2b-settings.json harness/scenarios/m2c-collections-write.json harness/scenarios/m2d-collection-update.json"
 
 status=0
 

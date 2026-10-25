@@ -209,18 +209,19 @@ differently. Documented rather than hidden: `create-form-body` was recorded
 against the oracle and removed from the scenario because the port cannot bind it.
 *Status:* may be ported later with the shared request-binding layer.
 
-### D12 — Collection update and import/export are not implemented
+### D12 — Collection import/export and dry-run-view are not implemented
 
-`PATCH /api/collections/{collection}` answers 405 (no handler) and
-`POST /api/collections/import` / `GET .../export` are absent. The oracle renames
-the table, adds/drops/renames columns, normalizes single↔multiple fields and
-recreates indexes.
+`PATCH /api/collections/{collection}` is implemented (table rename, column
+add/drop/rename, single↔multiple normalization, index sync) and gated by
+`m2d-collection-update`. What remains:
 
-*Why:* the schema-diff writer (`SyncRecordTableSchema` on an existing table) is
-the next milestone.
-*Impact:* the admin UI can create and delete collections but not edit them; the
-collections "import/export" buttons fail.
-*Status:* pending M2d.
+* `POST /api/collections/import` and `GET /api/collections/{id}/export` (bulk
+  import/export of collection definitions).
+* `POST /api/collections/meta/dry-run-view` (view query validation).
+
+*Why:* these are convenience endpoints the admin UI calls from the import/export
+buttons; the core table sync they depend on is done.
+*Status:* pending (small follow-up).
 
 ### D13 — Raw SQLite errors are only translated on the surfaced paths
 

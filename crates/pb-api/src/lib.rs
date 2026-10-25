@@ -73,7 +73,9 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
         )
         .route(
             "/collections/:collection",
-            get(collections::view).delete(collections::delete),
+            get(collections::view)
+                .patch(collections::update)
+                .delete(collections::delete),
         )
         .route(
             "/collections/:collection/truncate",
