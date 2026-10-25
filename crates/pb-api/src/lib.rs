@@ -57,7 +57,7 @@ async fn not_found() -> impl IntoResponse {
 pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/health", get(health))
-        .route("/settings", get(settings::list))
+        .route("/settings", get(settings::list).patch(settings::set))
         .route("/collections", get(collections::list))
         // Static `meta` routes must be declared before the `:collection`
         // wildcard; matchit prefers static segments regardless of order, but

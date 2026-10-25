@@ -111,3 +111,31 @@ evaluates the filter against the whitelisted collection fields.
 records query work (M2b/M3).
 *Status:* pending M2b. The admin UI's collections page does not send a filter on
 load (it uses `page`/`perPage`/`skipTotal`), so the M2 gate is unaffected.
+
+### D7 — JS migrations and hooks are not executed
+
+The oracle's default JS migrations directory is `<dataDir>/../pb_migrations`
+(`plugins/jsvm`), and API collection changes are written there as `*.js` files.
+The port has no JSVM in v1, so those files are ignored: a database whose schema
+was produced by JS migrations must already contain the resulting collections.
+
+*Why:* the JSVM (goja) is explicitly out of scope for v1 (tier (a) covers the API
+and the data model).
+*Impact:* an install migrated only through JS files will look empty to the port.
+Probe/test installs must therefore be isolated per parent directory — a shared
+parent makes one install's auto-generated migrations leak into another, which is
+what the M2 gate now avoids by nesting each install under its own root.
+*Status:* pending v2 (JSVM). Revisit before claiming "hooks compatible".
+
+### D8 — JSON request bodies are matched case-sensitively
+
+The oracle decodes JSON with `json.MatchCaseInsensitiveNames(true)`, so
+`{"META":{"APPNAME":"X"}}` updates `meta.appName`. The port's `serde`
+deserializers match keys exactly, so such a body is silently ignored (unknown
+keys are always ignored by both sides).
+
+*Why:* serde has no wildcard case-insensitive field matching; emulating it needs
+a normalisation pass over every bound body against a canonical key skeleton.
+*Impact:* only hand-written clients that rely on non-canonical casing. The admin
+UI always sends the exact camelCase keys.
+*Status:* recorded; may be ported later with the shared request-binding layer.
