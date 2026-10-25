@@ -872,6 +872,7 @@ dependencies = [
  "bcrypt",
  "jsonwebtoken",
  "rand",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

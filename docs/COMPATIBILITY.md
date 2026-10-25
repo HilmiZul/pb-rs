@@ -9,7 +9,7 @@ compatibility promise.
 |---|---|---|
 | L1 CLI | `serve`, `superuser {create,update,upsert,delete,otp,ips}`, `migrate`, `version` accept the same flags and produce the same exit codes | scenario: CLI matrix |
 | L2 On-disk | `pb_data/data.db` schema identical; `_migrations` rows identical; `_params.settings` byte-identical (incl. BLOB storage class); `_collections` identical modulo per-install secrets; installer superuser created on a fresh install | `tools/gate_m1.sh` |
-| L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{code,message,data}` | harness `basic` + per-domain scenarios; `tools/gate_m2.sh` for auth/settings/collections reads |
+| L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{code,message,data}` | harness `basic` + per-domain scenarios; `tools/gate_m2.sh` for auth/settings/collections reads and collection create/delete/truncate |
 | L4 Auth | bcrypt hashes verify; JWT `HS256` with per-collection `authToken.secret`, claims `{collectionId,id,type,refreshable,exp}`; refresh, OTP, MFA, OAuth2, file tokens | cross-token test in `tools/gate_m2.sh`: a token minted by the oracle validates in the port and vice versa |
 | L5 Query | filter/sort/expand/fields syntax and semantics, including NULL and relation traversal | differential fuzz of the filter parser |
 | L6 Realtime | `text/event-stream` framing, `PB_CONNECT` event, subscription payloads | SSE scenario |
@@ -21,9 +21,12 @@ compatibility promise.
 1. **Normalization is explicit.** The harness replaces volatile values (record ids,
    timestamps, JWTs, secrets) with placeholders before comparing. A new
    normalization rule must be reviewed, because it can hide a real difference.
-   The at-rest gate normalizes exactly two things: the 50-char `[A-Za-z0-9]` token
-   secrets inside `_collections.options`, and the installer superuser's
-   `id`/`password`/`tokenKey` (which are checked for shape instead of equality).
+   The at-rest gate normalizes exactly four things: the 50-char `[A-Za-z0-9]`
+   token secrets inside `_collections.options`, the OAuth2 provider
+   `clientSecret` values (also inside `options`), `_collections.created/updated`
+   timestamps, and `_clone_XXXX` field ids (view collections, not produced yet).
+   The installer superuser's `id`/`password`/`tokenKey` are checked for shape
+   instead of equality.
 
    The HTTP harness normalizes: JWTs, 50-char secrets, 15-char record ids,
    timestamps, and the 10-char random suffix that
@@ -40,6 +43,11 @@ compatibility promise.
 5. **Unknowns are recorded, not guessed.** When the oracle cannot be made to reveal
    behaviour (e.g. a code path requiring an external SMTP server), the gap is listed
    in `docs/UNKNOWNS.md` rather than filled with an assumption.
+6. **Request binding follows `encoding/json/v2`.** A JSON `null` **zeroes** the
+   target (it is not the v1 no-op), so `{"authToken":null}` wipes the whole token
+   config and fails validation, while a partial object (`{"duration":120}`)
+   merges onto the existing struct. Slices/maps zero to `[]`/`{}`. This is
+   covered by `m2c-collections-write` (`create-auth-options-null`).
 
 ## Deliberate divergences
 
@@ -139,3 +147,89 @@ a normalisation pass over every bound body against a canonical key skeleton.
 *Impact:* only hand-written clients that rely on non-canonical casing. The admin
 UI always sends the exact camelCase keys.
 *Status:* recorded; may be ported later with the shared request-binding layer.
+
+### D9 — View collections are not created and rules are not parsed
+
+Three related gaps, all rooted in the missing filter-expression parser:
+
+* `POST /api/collections` with `type: "view"` answers 400
+  (`fields: required`) instead of 200. The oracle first runs
+  `CreateViewFields(viewQuery)` to derive the fields from the query, then
+  validates; without that step every view create fails the "missing id PK"
+  check.
+* `POST /api/collections/meta/dry-run-view` answers 404 (route not mounted).
+* `listRule`/`viewRule`/`createRule`/`updateRule`/`deleteRule`,
+  `authRule`/`manageRule` and `mfa.rule` are stored and round-tripped verbatim,
+  but an invalid expression is accepted where the oracle returns
+  `validation_invalid_rule` (`Invalid rule. Raw error: ...`).
+
+*Why:* `search.FilterData` + `NewRecordFieldResolver` is a subsystem of its own
+and lands with the records query work (M3).
+*Impact:* creating or editing a view collection through the API, and typos in
+rules, are not detected. Reading/updating existing collections and their rules
+is unaffected (the values are opaque strings to the port).
+*Proven harmless by:* `m2c-collections-write` exercises base/auth creates only;
+the gate never creates a view.
+
+### D10 — Truncate skips record hooks
+
+`DELETE /api/collections/{collection}/truncate` deletes the records with a plain
+`DELETE FROM <table>` inside a transaction. The oracle deletes the records one by
+one, so it also runs the record hooks: cascade-deleting relation references and
+failing on the "you can't delete the only superuser" guard.
+
+The superuser guard is reproduced for `_superusers` (the only place the oracle's
+gate is reachable today). Cascade deletes through required relation fields are
+not.
+
+*Why:* record hooks belong to the records CRUD milestone; the storage-level
+delete is already the correct end state for tables without cascade relations.
+*Impact:* a truncate that the oracle rejects (because a record is referenced by a
+required relation) succeeds in the port and leaves dangling ids.
+*Status:* pending with record CRUD (M3); revisit before claiming record-level
+compatibility.
+
+### D11 — Only JSON request bodies are bound
+
+`BindBody` in the oracle supports `application/json`, form
+(`application/x-www-form-urlencoded`, `multipart/form-data`) and XML
+(`text/xml`, `application/xml`). The port's `pb-api::body::bind_json` implements
+the JSON path only:
+
+* form bodies are treated as an empty body (no fields are bound, so the request
+  behaves like one without a body);
+* XML and other content types fail with the same "invalid formatting" error the
+  oracle returns for an unsupported type.
+
+*Why:* the admin UI and both official SDKs always send JSON; the form/XML
+binders (`UnmarshalRequestData` with its `form` tags, Go's `encoding/xml`) are a
+large surface with no observed client.
+*Impact:* `curl -d 'name=x'` style requests (and HTML form posts) behave
+differently. Documented rather than hidden: `create-form-body` was recorded
+against the oracle and removed from the scenario because the port cannot bind it.
+*Status:* may be ported later with the shared request-binding layer.
+
+### D12 — Collection update and import/export are not implemented
+
+`PATCH /api/collections/{collection}` answers 405 (no handler) and
+`POST /api/collections/import` / `GET .../export` are absent. The oracle renames
+the table, adds/drops/renames columns, normalizes single↔multiple fields and
+recreates indexes.
+
+*Why:* the schema-diff writer (`SyncRecordTableSchema` on an existing table) is
+the next milestone.
+*Impact:* the admin UI can create and delete collections but not edit them; the
+collections "import/export" buttons fail.
+*Status:* pending M2d.
+
+### D13 — Raw SQLite errors are only translated on the surfaced paths
+
+Index creation and record-table DDL failures are formatted exactly like the
+oracle's `modernc.org/sqlite` driver (`SQL logic error: no such column: nope
+(1)`), and index failures are returned as a per-index validation tree. Errors
+from the remaining statements (e.g. a constraint violation on the `_collections`
+insert) keep `rusqlite`'s text.
+
+*Why:* only the index path is reachable from a normal API request; the others are
+500-class failures that a client cannot trigger deliberately.
+*Status:* revisit if a differential scenario ever surfaces one.

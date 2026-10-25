@@ -5,11 +5,14 @@
 //! `pb_core::collections`; pagination and sorting follow
 //! `tools/search/provider.go` so the envelope matches the oracle exactly.
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use pb_core::collection_write::{self, SaveError};
 use pb_core::collections::Collection;
+use pb_core::validation;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -265,6 +268,121 @@ pub async fn oauth2_providers(
 ) -> Result<Response, ApiError> {
     require_superuser(&db, &headers)?;
     Ok(embedded_json(pb_core::assets::OAUTH2_PROVIDERS.to_string()))
+}
+
+/// `e.BadRequestError("Failed to load the collection type data due to invalid formatting.", err)`
+fn type_load_error() -> ApiError {
+    ApiError::bad_request("Failed to load the collection type data due to invalid formatting.")
+}
+
+/// `e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)`
+fn submitted_load_error() -> ApiError {
+    ApiError::bad_request("Failed to load the submitted data due to invalid formatting.")
+}
+
+/// `POST /api/collections`
+///
+/// `apis/collection.go: collectionCreate`: bind the minimal factory data, build
+/// the scaffold, bind the full payload onto it, then save (normalize → validate
+/// → sync the record table).
+pub async fn create(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_superuser(&db, &headers)?;
+
+    let payload = match crate::body::bind_json(&headers, &body) {
+        Ok(Some(value)) => value,
+        Ok(None) => Value::Null,
+        Err(()) => return Err(type_load_error()),
+    };
+
+    let (kind, name) =
+        collection_write::factory_extract(&payload).map_err(|_| type_load_error())?;
+
+    let mut draft = collection_write::factory(&kind, &name);
+    collection_write::apply_request(&mut draft, &payload).map_err(|_| submitted_load_error())?;
+
+    let mut conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let all = Collection::load_all(&conn)
+        .map_err(|e| ApiError::internal(format!("failed to load collections: {e}")))?;
+
+    match collection_write::save(&mut conn, &mut draft, &all) {
+        Ok(()) => Ok(Json(draft.collection.to_api_json()).into_response()),
+        Err(SaveError::Validation(errors)) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Failed to create collection.",
+            validation::errors_to_value(&errors),
+        )),
+        // `e.BadRequestError("Failed to create collection. Raw error: \n"+err.Error(), nil)`
+        Err(SaveError::Raw(message)) => Err(ApiError::bad_request(format!(
+            "Failed to create collection. Raw error: \n{message}"
+        ))),
+    }
+}
+
+/// `DELETE /api/collections/{collection}`
+pub async fn delete(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Response, ApiError> {
+    require_superuser(&db, &headers)?;
+
+    let mut conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = Collection::find(&conn, &id_or_name)
+        .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+
+    let all = Collection::load_all(&conn)
+        .map_err(|e| ApiError::internal(format!("failed to load collections: {e}")))?;
+    let references = collection_write::find_references(&collection, &all);
+
+    match collection_write::delete(&mut conn, &collection) {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(_) => {
+            let mut message = String::from("Failed to delete collection");
+            if !references.is_empty() {
+                message.push_str(" probably due to existing reference in ");
+                message.push_str(&references.join(", "));
+            }
+            Err(ApiError::bad_request(validation::sentenize(&message)))
+        }
+    }
+}
+
+/// `DELETE /api/collections/{collection}/truncate`
+pub async fn truncate(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Response, ApiError> {
+    require_superuser(&db, &headers)?;
+
+    let mut conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = Collection::find(&conn, &id_or_name)
+        .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+
+    if collection.is_view() {
+        return Err(ApiError::bad_request(
+            "View collections cannot be truncated since they don't store their own records.",
+        ));
+    }
+
+    match collection_write::truncate(&mut conn, &collection) {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(_) => Err(ApiError::bad_request(
+            "Failed to truncate collection (most likely due to required cascade delete record references).",
+        )),
+    }
 }
 
 #[cfg(test)]

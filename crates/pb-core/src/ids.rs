@@ -9,6 +9,19 @@ pub const ID_LENGTH: usize = 15;
 /// `security.defaultRandomAlphabet`
 pub const RANDOM_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+/// `crc32.ChecksumIEEE`, used for collection and field ids.
+pub fn crc32(value: &str) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in value.bytes() {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 /// Equivalent of `core.GenerateDefaultRandomId`.
 pub fn default_random_id() -> String {
     pseudorandom_string(ID_LENGTH, ID_ALPHABET)
@@ -48,6 +61,13 @@ mod tests {
             assert_eq!(id.len(), 15);
             assert!(id.chars().all(|c| ID_ALPHABET.contains(c)));
         }
+    }
+
+    #[test]
+    fn crc32_matches_the_oracle_ids() {
+        // `posts` -> `pbc_1125843985`, `title` -> `text724990059`
+        assert_eq!(crc32("baseposts"), 1125843985);
+        assert_eq!(crc32("title"), 724990059);
     }
 
     #[test]

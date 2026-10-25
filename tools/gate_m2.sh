@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# M2 gate: superuser auth + settings/collections read parity.
+# M2 gate: superuser auth + settings/collections read/write parity.
 #
 # Phases:
 #   1. Response parity   — the same scenarios replayed against the oracle and the
-#      port must produce identical responses (harness diff, 0 mismatches), and
-#      the settings written by `PATCH /api/settings` must be byte-identical.
+#      port must produce identical responses (harness diff, 0 mismatches), the
+#      settings written by `PATCH /api/settings` must be byte-identical, and the
+#      `_collections` rows + generated schema must match.
 #   2. Cross-implementation auth — a token minted by the oracle must be accepted
 #      by the port and vice versa, on the same database.
 #   3. Admin UI login    — the real embedded admin UI, driven in headless Chrome,
@@ -28,7 +29,7 @@ GO_PORT="${GO_PORT:-18120}"
 RS_PORT="${RS_PORT:-18121}"
 EMAIL="admin@example.com"
 PASSWORD="pass12345678"
-SCENARIOS="harness/scenarios/m2-auth.json harness/scenarios/m2b-settings.json"
+SCENARIOS="harness/scenarios/m2-auth.json harness/scenarios/m2b-settings.json harness/scenarios/m2c-collections-write.json"
 
 status=0
 
@@ -122,6 +123,14 @@ if [ -n "$SETTINGS_GO" ] && [ "$SETTINGS_GO" = "$SETTINGS_RS" ]; then
     check "_params.settings written by PATCH is byte-identical" ok ok
 else
     check "_params.settings written by PATCH is byte-identical" differs identical
+fi
+
+# The `m2c-collections-write` scenario creates/deletes/truncates collections, so
+# both `_collections` rows and the generated `sqlite_master` schema must match.
+if tools/compare_collections.py "$GO_DIR/data.db" "$RS_DIR/data.db"; then
+    check "_collections rows and schema identical" ok ok
+else
+    check "_collections rows and schema identical" differs identical
 fi
 
 # ---------------------------------------------------------------- phase 2

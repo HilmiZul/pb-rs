@@ -21,6 +21,12 @@ const COLLECTION_SCAFFOLDS_TEMPLATE: &str =
 /// `GET /api/collections/meta/oauth2-providers`
 pub const OAUTH2_PROVIDERS: &str = include_str!("../assets/oauth2_providers.json");
 
+/// `setDefaultAuthOptions()`: the default auth collection options, recorded from
+/// `core.NewAuthCollection` on the oracle. The token `secret` values are absent
+/// on purpose — they are per-collection random strings and are generated when a
+/// collection is created.
+pub const AUTH_OPTIONS_TEMPLATE: &str = include_str!("../assets/auth_options.json");
+
 /// `collectionScaffolds`: the scaffold payload for this request.
 pub fn collection_scaffolds() -> String {
     let random_id = ids::random_string_with_alphabet(10, ids::ID_ALPHABET);

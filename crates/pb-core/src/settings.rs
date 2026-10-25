@@ -13,7 +13,6 @@
 //! recursively, arrays and scalars are replaced, and `null` resets a value to
 //! its zero value. `merge_json` + [`null_default`] reproduce that.
 
-use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -21,6 +20,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::validation::{
+    branch, invalid_in, leaf, leaf_with_params, length, max, min, push, required, Errors, Node,
+};
+
+/// Re-exported so existing callers keep their import path.
+pub use crate::validation::{errors_to_value, ValidationError};
 
 pub const PARAM_ID: &str = "settings";
 
@@ -336,109 +342,6 @@ impl Settings {
 // Validation (`Settings.PostValidate` and the nested `Validate` methods)
 // ---------------------------------------------------------------------------
 
-/// A single ozzo-style validation error, as exposed by the API.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct ValidationError {
-    pub code: &'static str,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-}
-
-/// A validation error tree: keys are field names or slice indexes.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum Node {
-    Leaf(ValidationError),
-    Branch(Errors),
-}
-
-pub type Errors = BTreeMap<String, Node>;
-
-fn leaf(code: &'static str, message: impl Into<String>) -> Node {
-    Node::Leaf(ValidationError {
-        code,
-        message: message.into(),
-        params: None,
-    })
-}
-
-fn leaf_with_params(code: &'static str, message: impl Into<String>, params: Value) -> Node {
-    Node::Leaf(ValidationError {
-        code,
-        message: message.into(),
-        params: Some(params),
-    })
-}
-
-fn required() -> Node {
-    leaf("validation_required", "Cannot be blank.")
-}
-
-fn invalid_in() -> Node {
-    leaf("validation_in_invalid", "Must be a valid value.")
-}
-
-/// `validation.Length(min, max)`, skipping empty values.
-fn length(value: &str, min: usize, max: usize) -> Option<Node> {
-    if value.is_empty() {
-        return None;
-    }
-    let len = value.len();
-    if min > 0 && len < min || max > 0 && len > max {
-        let (code, message) = if min == max {
-            ("validation_length_invalid", format!("The length must be exactly {min}."))
-        } else {
-            (
-                "validation_length_out_of_range",
-                format!("The length must be between {min} and {max}."),
-            )
-        };
-        return Some(leaf_with_params(
-            code,
-            message,
-            json!({ "min": min, "max": max }),
-        ));
-    }
-    None
-}
-
-/// `validation.Min(threshold)`, skipping zero values.
-fn min(value: i64, threshold: i64) -> Option<Node> {
-    if value == 0 {
-        return None;
-    }
-    if value < threshold {
-        return Some(leaf_with_params(
-            "validation_min_greater_equal_than_required",
-            format!("Must be no less than {threshold}."),
-            json!({ "threshold": threshold }),
-        ));
-    }
-    None
-}
-
-/// `validation.Max(threshold)`, skipping zero values.
-fn max(value: i64, threshold: i64) -> Option<Node> {
-    if value == 0 {
-        return None;
-    }
-    if value > threshold {
-        return Some(leaf_with_params(
-            "validation_max_less_equal_than_required",
-            format!("Must be no greater than {threshold}."),
-            json!({ "threshold": threshold }),
-        ));
-    }
-    None
-}
-
-fn push(errs: &mut Errors, key: &str, node: Option<Node>) {
-    if let Some(node) = node {
-        errs.insert(key.to_string(), node);
-    }
-}
-
 /// `Settings.PostValidate`.
 pub fn validate(settings: &Settings) -> Errors {
     let mut errs = Errors::new();
@@ -729,14 +632,6 @@ fn check_unique_rule_labels(rules: &[RateLimitRule]) -> Option<Node> {
     None
 }
 
-fn branch(errs: Errors) -> Option<Node> {
-    if errs.is_empty() {
-        None
-    } else {
-        Some(Node::Branch(errs))
-    }
-}
-
 /// `validation.Field(&c.AppName, validation.Required, validation.Length(1, 255))`
 fn required_or_length(value: &str, min_len: usize, max_len: usize) -> Option<Node> {
     if value.is_empty() {
@@ -766,11 +661,6 @@ fn email_then_required(value: &str) -> Option<Node> {
     } else {
         None
     }
-}
-
-/// Serialize an error tree. `BTreeMap` keeps the keys sorted, like Go's maps.
-pub fn errors_to_value(errors: &Errors) -> Value {
-    serde_json::to_value(errors).expect("validation errors serialize")
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,7 +1122,7 @@ mod tests {
             meta["accentColor"],
             leaf_with_params(
                 "validation_length_invalid",
-                "The length must be exactly 7.",
+                "the length must be exactly {{.min}}",
                 json!({"min": 7, "max": 7})
             )
         );
@@ -1240,7 +1130,7 @@ mod tests {
             meta["appName"],
             leaf_with_params(
                 "validation_length_out_of_range",
-                "The length must be between 1 and 255.",
+                "the length must be between {{.min}} and {{.max}}",
                 json!({"min": 1, "max": 255})
             )
         );

@@ -98,6 +98,25 @@ impl Collection {
         self.kind == TYPE_VIEW
     }
 
+    /// The stored `fields` array as a `FieldsList`.
+    pub fn field_list(&self) -> crate::fields::FieldsList {
+        crate::fields::FieldsList::from_stored(&self.fields)
+    }
+
+    /// The stored `indexes` array as strings.
+    pub fn index_list(&self) -> Vec<String> {
+        self.indexes
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn load_all(conn: &Connection) -> Result<Vec<Self>> {
         let mut stmt = conn.prepare(
             "SELECT id, system, type, name, fields, indexes, listRule, viewRule,

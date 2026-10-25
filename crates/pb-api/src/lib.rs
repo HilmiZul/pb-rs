@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -16,6 +16,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub use axum;
 
 pub mod auth;
+pub mod body;
 pub mod collections;
 pub mod error;
 pub mod records;
@@ -58,7 +59,10 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/settings", get(settings::list).patch(settings::set))
-        .route("/collections", get(collections::list))
+        .route(
+            "/collections",
+            get(collections::list).post(collections::create),
+        )
         // Static `meta` routes must be declared before the `:collection`
         // wildcard; matchit prefers static segments regardless of order, but
         // keeping them together documents the relationship.
@@ -67,7 +71,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             "/collections/meta/oauth2-providers",
             get(collections::oauth2_providers),
         )
-        .route("/collections/:collection", get(collections::view))
+        .route(
+            "/collections/:collection",
+            get(collections::view).delete(collections::delete),
+        )
+        .route(
+            "/collections/:collection/truncate",
+            delete(collections::truncate),
+        )
         .route("/collections/:collection/auth-methods", get(records::methods))
         .route(
             "/collections/:collection/auth-with-password",

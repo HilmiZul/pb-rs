@@ -6,7 +6,7 @@
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use pb_core::settings::{self, Settings};
 use serde_json::Value;
@@ -85,39 +85,13 @@ pub async fn set(
 /// a form-encoded body (PocketBase binds those through form tags, which the
 /// admin UI never uses for settings).
 fn bind_body(headers: &HeaderMap, body: &[u8]) -> Result<Option<Value>, ApiError> {
-    if body.is_empty() {
-        return Ok(None);
-    }
-
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-
-    if content_type.starts_with("application/json") {
-        // Go decodes a single JSON value and ignores trailing bytes, so use
-        // the streaming decoder instead of `from_slice`.
-        let mut stream = serde_json::Deserializer::from_slice(body).into_iter::<Value>();
-        return match stream.next() {
-            Some(Ok(value)) => Ok(Some(value)),
-            _ => Err(load_error()),
-        };
-    }
-
-    if content_type.starts_with("multipart/form-data")
-        || content_type.starts_with("application/x-www-form-urlencoded")
-    {
-        return Ok(None);
-    }
-
-    // `text/xml`, `text/plain`, … — the oracle fails to bind these.
-    Err(load_error())
+    crate::body::bind_json(headers, body).map_err(|_| load_error())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{header, HeaderValue};
 
     fn headers(content_type: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
