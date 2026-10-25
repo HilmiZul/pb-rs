@@ -404,24 +404,35 @@ pub fn build_sql(expr: &Expr, allowed_fields: &[String]) -> Result<SqlFilter, Pa
     build_sql_with_auth(expr, allowed_fields, None)
 }
 
-pub fn build_sql_with_auth(
+pub fn build_sql_with_auth_and_relations(
     expr: &Expr,
     allowed_fields: &[String],
     auth: Option<&PbRecord>,
+    relations: &std::collections::HashMap<String, String>,
 ) -> Result<SqlFilter, ParseError> {
     let mut ctx = BuildCtx {
         params: Vec::new(),
         allowed: allowed_fields,
         auth,
+        relations,
     };
     let sql = build_expr(expr, &mut ctx)?;
     Ok(SqlFilter { sql, params: ctx.params })
+}
+
+pub fn build_sql_with_auth(
+    expr: &Expr,
+    allowed_fields: &[String],
+    auth: Option<&PbRecord>,
+) -> Result<SqlFilter, ParseError> {
+    build_sql_with_auth_and_relations(expr, allowed_fields, auth, &std::collections::HashMap::new())
 }
 
 struct BuildCtx<'a> {
     params: Vec<serde_json::Value>,
     allowed: &'a [String],
     auth: Option<&'a PbRecord>,
+    relations: &'a std::collections::HashMap<String, String>,
 }
 
 fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
@@ -442,11 +453,18 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
         }
         Expr::Cmp { left, op, right } => build_cmp(left, *op, right, ctx),
         Expr::Field(name) => {
+            if name.contains('.') {
+                let first = name.split('.').next().unwrap_or(name);
+                if !ctx.allowed.iter().any(|f| f == first) && first != "id" {
+                    return Err(ParseError(format!("unknown field: {}", name)));
+                }
+                return Ok(format!("__FIELD__{}", name));
+            }
             if !ctx.allowed.iter().any(|f| f == name) && name != "id" {
-                return Err(ParseError(format!("unknown field: {name}")));
+                return Err(ParseError(format!("unknown field: {}", name)));
             }
             // quote identifier
-            Ok(format!("\"{}\"", name.replace('"', "\"\"")))
+            Ok(format!("\"{}\"", name.replace('"', "\"")))
         }
         Expr::AuthField(path) => {
             let val = ctx
@@ -491,6 +509,39 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
 }
 
 fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
+    // Relation traversal: left is __FIELD__field.sub
+    if let Expr::Field(name) = left {
+        if let Some(rest) = name.strip_prefix("__FIELD__") {
+            let parts: Vec<&str> = rest.splitn(2, '.').collect();
+            let field = parts[0];
+            let sub = parts[1];
+            if let Some(rel_table) = ctx.relations.get(field).cloned() {
+                let r = build_expr(right, ctx)?;
+                let sql_op = match op {
+                    CmpOp::Eq => "=",
+                    CmpOp::Ne => "!=",
+                    CmpOp::Gt => ">",
+                    CmpOp::Gte => ">=",
+                    CmpOp::Lt => "<",
+                    CmpOp::Lte => "<=",
+                    CmpOp::Contains => "LIKE",
+                    CmpOp::NotContains => "NOT LIKE",
+                };
+                let cmp_expr = if matches!(op, CmpOp::Contains | CmpOp::NotContains) {
+                    format!("{} {} '%' || {} || '%'", sub, sql_op, r)
+                } else {
+                    format!("{} {} {}", sub, sql_op, r)
+                };
+                return Ok(format!(
+                    "{} IN (SELECT id FROM \"{}\" WHERE {})",
+                    crate::records::quote_ident(field),
+                    rel_table,
+                    cmp_expr
+                ));
+            }
+        }
+    }
+
     // Handle null comparisons
     if let Expr::Literal(Literal::Null) = right {
         let l = build_expr(left, ctx)?;
@@ -606,6 +657,6 @@ pub fn build_rule_sql(
     let expr = parse(rule).ok()?;
     let transformed = transform_eval(&expr, record_data, auth);
     let allowed: Vec<String> = Vec::new();
-    let sf = build_sql(&transformed, &allowed).ok()?;
+    let sf = build_sql_with_auth_and_relations(&transformed, &allowed, auth, &std::collections::HashMap::new()).ok()?;
     Some((sf.sql, sf.params))
 }

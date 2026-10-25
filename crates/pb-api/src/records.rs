@@ -367,11 +367,12 @@ pub async fn list(
     Path(id_or_name): Path<String>,
     Query(params): Query<RecordsListParams>,
 ) -> Result<Json<Value>, ApiError> {
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser && collection.list_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
@@ -426,8 +427,18 @@ pub async fn list(
             .chain(std::iter::once("id".to_string()))
             .collect();
         let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        let auth_record = load_auth(&db, &headers).map(|a| a.record);
-        let sf = search::build_sql_with_auth(&expr, &allowed, auth_record.as_ref())
+        let auth_record = auth.as_ref().map(|a| a.record.clone());
+        // Build relation field -> table name map for traversal.
+        let mut relations: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in collection.field_list().items() {
+            if pb_core::fields::field_type(f) == "relation" {
+                let coll_id = pb_core::fields::field_str(f, "collectionId");
+                if let Ok(Some(c)) = Collection::find(&conn, coll_id) {
+                    relations.insert(pb_core::fields::field_name(f).to_string(), c.name.clone());
+                }
+            }
+        }
+        let sf = search::build_sql_with_auth_and_relations(&expr, &allowed, auth_record.as_ref(), &relations)
             .map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
         (format!("WHERE {}", sf.sql), sf.params)
     } else {
@@ -440,8 +451,18 @@ pub async fn list(
             .chain(std::iter::once("id".to_string()))
             .collect();
         let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        let auth_record = load_auth(&db, &headers).map(|a| a.record);
-        let sf = search::build_sql_with_auth(&expr, &allowed, auth_record.as_ref())
+        let auth_record = auth.as_ref().map(|a| a.record.clone());
+        // Build relation field -> table name map for traversal.
+        let mut relations: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in collection.field_list().items() {
+            if pb_core::fields::field_type(f) == "relation" {
+                let coll_id = pb_core::fields::field_str(f, "collectionId");
+                if let Ok(Some(c)) = Collection::find(&conn, coll_id) {
+                    relations.insert(pb_core::fields::field_name(f).to_string(), c.name.clone());
+                }
+            }
+        }
+        let sf = search::build_sql_with_auth_and_relations(&expr, &allowed, auth_record.as_ref(), &relations)
             .map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
         (format!("WHERE {} AND ({})", rule_filter, sf.sql), [rule_params, sf.params].concat())
     };
@@ -674,11 +695,12 @@ pub async fn view(
     headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser && collection.view_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
@@ -731,11 +753,12 @@ pub async fn create(
     Path(id_or_name): Path<String>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+
     let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser && collection.update_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
@@ -853,11 +876,12 @@ pub async fn update(
     Path((id_or_name, record_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+
     let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser && collection.update_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
@@ -953,11 +977,12 @@ pub async fn delete(
     headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser && collection.delete_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
