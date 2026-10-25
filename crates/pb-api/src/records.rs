@@ -660,6 +660,21 @@ pub async fn view(
     let record = Record::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+
+    // View rule evaluation for non-superusers.
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser {
+        if let Some(rule) = &collection.view_rule {
+            if !rule.is_empty() {
+                let data_map: serde_json::Map<String, serde_json::Value> = record.data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
+                    return Err(ApiError::not_found("The requested resource wasn't found."));
+                }
+            }
+        }
+    }
+
     Ok(Json(record.to_api_json()))
 }
 
@@ -888,6 +903,21 @@ pub async fn update(
     let record = Record::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+
+    // View rule evaluation for non-superusers.
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser {
+        if let Some(rule) = &collection.view_rule {
+            if !rule.is_empty() {
+                let data_map: serde_json::Map<String, serde_json::Value> = record.data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
+                    return Err(ApiError::not_found("The requested resource wasn't found."));
+                }
+            }
+        }
+    }
+
     Ok(Json(record.to_api_json()))
 }
 
