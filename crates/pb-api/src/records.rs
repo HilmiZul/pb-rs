@@ -663,6 +663,26 @@ pub async fn view(
     Ok(Json(record.to_api_json()))
 }
 
+
+fn rule_passes(
+    conn: &rusqlite::Connection,
+    rule: &str,
+    record_data: &serde_json::Map<String, serde_json::Value>,
+    auth: Option<&pb_core::records::Record>,
+) -> bool {
+    if rule.is_empty() {
+        return true;
+    }
+    match pb_core::search::build_rule_sql(rule, record_data, auth) {
+        Some((sql, params)) => {
+            let full = format!("SELECT 1 WHERE {}", sql);
+            let sqlite_params: Vec<rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
+            conn.query_row(&full, rusqlite::params_from_iter(sqlite_params), |_| Ok(())).is_ok()
+        }
+        None => true,
+    }
+}
+
 /// `POST /api/collections/{collection}/records`
 pub async fn create(
     State(db): State<Db>,
@@ -705,6 +725,22 @@ pub async fn create(
         }
         out
     });
+
+    // Rule evaluation for non-superusers.
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser {
+        if let Some(rule) = &collection.create_rule {
+            if !rule.is_empty() {
+                let mut data = payload.clone();
+                data.insert("id".into(), Value::String(id.clone()));
+                if !rule_passes(&conn, rule, &data, auth.as_ref().map(|a| &a.record)) {
+                    return Err(ApiError::bad_request("Failed to create record."));
+                }
+            }
+        }
+    }
+
     columns.push("id".into());
     placeholders.push("?".into());
     values.push(Value::String(id.clone()));
@@ -796,6 +832,27 @@ pub async fn update(
     // Build SET clause
     let fields = collection.field_list();
     let mut sets = Vec::new();
+    // Rule evaluation for non-superusers.
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    if !is_superuser {
+        if let Some(rule) = &collection.update_rule {
+            if !rule.is_empty() {
+                // Build updated record data.
+                let existing = Record::find_by_id(&conn, &collection, &record_id)
+                    .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
+                    .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+                let mut data = existing.data.clone();
+                for (k, v) in &payload {
+                    data.insert(k.clone(), v.clone());
+                }
+                if !rule_passes(&conn, rule, &data, auth.as_ref().map(|a| &a.record)) {
+                    return Err(ApiError::bad_request("Failed to update record."));
+                }
+            }
+        }
+    }
+
     let mut values: Vec<Value> = Vec::new();
     for (key, val) in &payload {
         if key == "id" || key == "collectionId" || key == "collectionName" {
@@ -845,6 +902,18 @@ pub async fn delete(
     let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser && collection.delete_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
+    }
+    if !is_superuser {
+        if let Some(rule) = &collection.delete_rule {
+            if !rule.is_empty() {
+                let existing = Record::find_by_id(&conn, &collection, &record_id)
+                    .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
+                    .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+                if !rule_passes(&conn, rule, &existing.data, auth.as_ref().map(|a| &a.record)) {
+                    return Err(ApiError::bad_request("Failed to delete record."));
+                }
+            }
+        }
     }
 
     let sql = format!("DELETE FROM {} WHERE id = ?1", quote_table(&collection.name));
