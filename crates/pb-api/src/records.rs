@@ -340,6 +340,7 @@ pub struct RecordsListParams {
     pub filter: Option<String>,
     #[serde(rename = "skipTotal")]
     pub skip_total: Option<String>,
+    pub expand: Option<String>,
 }
 
 fn parse_page(raw: Option<&str>) -> i64 {
@@ -422,6 +423,63 @@ pub async fn list(
     while let Some(row) = rows.next().map_err(|e| ApiError::internal(format!("row failed: {e}")))? {
         let rec = Record::from_row(&collection, row).map_err(|e| ApiError::internal(format!("from_row failed: {e}")))?;
         records.push(rec.to_api_json());
+    }
+
+    // Expand (single level, basic): add an "expand" object to each record.
+    let expand_param = params.expand.clone().unwrap_or_default();
+    if !expand_param.is_empty() {
+        let expands: Vec<&str> = expand_param.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        for rec in &mut records {
+            // rec is Value::Object; we need mutable access. Rebuild.
+        }
+        // We'll do expand by re-querying; simpler: build expand into a parallel vec.
+        let mut expanded: Vec<Value> = Vec::with_capacity(records.len());
+        for rec in &records {
+            let mut rec = rec.clone();
+            let mut expand_obj = Map::new();
+            if let Some(obj) = rec.as_object_mut() {
+                for field_name in &expands {
+                    // find the relation field
+                    let fl = collection.field_list();
+                    let rel_field = fl.items().iter().find(|f| {
+                        pb_core::fields::field_name(f) == *field_name
+                            && pb_core::fields::field_type(f) == "relation"
+                    });
+                    let rel_field = match rel_field {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    let coll_id = pb_core::fields::field_str(rel_field, "collectionId");
+                    let rel_coll = match Collection::find(&conn, coll_id) {
+                        Ok(Some(c)) => c,
+                        _ => continue,
+                    };
+                    let is_multiple = pb_core::fields::is_multiple(rel_field);
+                    let val = obj.get(*field_name).cloned().unwrap_or(Value::Null);
+                    if is_multiple {
+                        let ids: Vec<String> = val.as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+                        let mut rels = Vec::new();
+                        for rid in &ids {
+                            if let Ok(Some(r)) = Record::find_by_id(&conn, &rel_coll, rid) {
+                                rels.push(r.to_api_json());
+                            }
+                        }
+                        expand_obj.insert(field_name.to_string(), Value::Array(rels));
+                    } else if let Some(rid) = val.as_str() {
+                        if !rid.is_empty() {
+                            if let Ok(Some(r)) = Record::find_by_id(&conn, &rel_coll, rid) {
+                                expand_obj.insert(field_name.to_string(), r.to_api_json());
+                            }
+                        }
+                    }
+                }
+                if !expand_obj.is_empty() {
+                    obj.insert("expand".into(), Value::Object(expand_obj));
+                }
+            }
+            expanded.push(rec);
+        }
+        records = expanded;
     }
 
     let total_pages = if per_page > 0 {
