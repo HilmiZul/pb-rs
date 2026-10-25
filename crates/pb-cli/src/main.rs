@@ -80,7 +80,7 @@ enum Command {
     /// Manage superusers
     Superuser {
         #[command(subcommand)]
-        _cmd: Option<SuperuserCommand>,
+        cmd: Option<SuperuserCommand>,
     },
 
     /// Executes app DB migration scripts
@@ -110,12 +110,27 @@ struct ServeArgs {
 
 #[derive(Subcommand)]
 enum SuperuserCommand {
-    Create,
-    Update,
-    Upsert,
-    Delete,
-    Otp,
-    Ips,
+    /// Creates a new superuser
+    Create {
+        email: String,
+        password: String,
+    },
+    /// Changes the password of a single superuser
+    Update {
+        email: String,
+        password: String,
+    },
+    /// Creates, or updates if email exists, a single superuser
+    Upsert {
+        email: String,
+        password: String,
+    },
+    /// Deletes an existing superuser
+    Delete { email: String },
+    /// Creates a new OTP for the specified superuser
+    Otp { email: String },
+    /// Lists the IPs the specified superuser has logged in from
+    Ips { email: String },
 }
 
 fn main() -> Result<()> {
@@ -123,7 +138,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Some(Command::Serve(args)) => serve(cli.global, args),
-        Some(Command::Superuser { .. }) => bail!("superuser: not implemented yet (M2)"),
+        Some(Command::Superuser { cmd }) => superuser(cli.global, cmd),
         Some(Command::Migrate) => bail!("migrate: not implemented yet (M1.1)"),
         Some(Command::Update) => bail!("update: not implemented yet (M5)"),
         None => {
@@ -142,25 +157,10 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
         bail!("TLS serving is not implemented yet; use --http");
     }
 
-    let data_dir = &global.dir;
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("create data dir {}", data_dir.display()))?;
-
-    let data_db = pb_core::db::open(&data_dir.join(pb_core::DATA_DB))?;
-    let recorded = pb_core::migrations::migrate_data(&data_db)?;
-    if recorded > 0 {
-        tracing::info!(migrations = recorded, "applied migrations");
-    }
-    pb_core::seed::seed(&data_db)?;
+    let data_db = bootstrap(&global.dir)?;
     if pb_core::superusers::ensure_installer_superuser(&data_db)? {
         tracing::info!("created the installer superuser");
     }
-
-    let aux_db = pb_core::db::open(&data_dir.join(pb_core::AUX_DB))?;
-    pb_core::migrations::migrate_aux(&aux_db)?;
-
-    write_types_dts(data_dir)?;
-    pb_core::db::optimize(&data_db)?;
 
     let addr = resolve_addr(&args)?;
     let ui_dir = resolve_ui_dir();
@@ -176,16 +176,89 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         println!("Server started at http://{addr}");
-        pb_api::axum::serve(listener, pb_api::router(ui_dir))
+        pb_api::axum::serve(listener, pb_api::router(data_db, ui_dir))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("http server")?;
         Ok::<(), anyhow::Error>(())
     })?;
 
-    // Keep the connections alive for the whole server lifetime.
-    drop(data_db);
-    drop(aux_db);
+    Ok(())
+}
+
+/// Open (and if needed create) the data directory's databases, applying
+/// migrations and seeding. Shared by `serve` and `superuser`.
+fn bootstrap(data_dir: &Path) -> Result<pb_core::rusqlite::Connection> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("create data dir {}", data_dir.display()))?;
+
+    let data_db = pb_core::db::open(&data_dir.join(pb_core::DATA_DB))?;
+    let recorded = pb_core::migrations::migrate_data(&data_db)?;
+    if recorded > 0 {
+        tracing::info!(migrations = recorded, "applied migrations");
+    }
+    pb_core::seed::seed(&data_db)?;
+
+    let aux_db = pb_core::db::open(&data_dir.join(pb_core::AUX_DB))?;
+    pb_core::migrations::migrate_aux(&aux_db)?;
+
+    write_types_dts(data_dir)?;
+    pb_core::db::optimize(&data_db)?;
+
+    Ok(data_db)
+}
+
+fn superuser(global: Global, cmd: Option<SuperuserCommand>) -> Result<()> {
+    let Some(cmd) = cmd else {
+        bail!("superuser: missing subcommand (create, update, upsert, delete, otp, ips)");
+    };
+
+    let conn = bootstrap(&global.dir)?;
+
+    match cmd {
+        SuperuserCommand::Upsert { email, password } => {
+            check_email(&email, "missing or invalid email address")?;
+            pb_core::superusers::upsert(&conn, &email, &password)
+                .context("failed to upsert superuser account")?;
+            println!("Successfully saved superuser {:?}!", email.to_lowercase());
+        }
+        SuperuserCommand::Create { email, password } => {
+            check_email(&email, "missing or invalid email address")?;
+            pb_core::superusers::create(&conn, &email, &password)
+                .context("failed to create new superuser account")?;
+            println!(
+                "Successfully created new superuser {:?}!",
+                email.to_lowercase()
+            );
+        }
+        SuperuserCommand::Update { email, password } => {
+            check_email(&email, "missing or invalid email address")?;
+            pb_core::superusers::update_password(&conn, &email, &password)
+                .with_context(|| format!("failed to change superuser {email:?} password"))?;
+            println!(
+                "Successfully changed superuser {:?} password!",
+                email.to_lowercase()
+            );
+        }
+        SuperuserCommand::Delete { email } => {
+            check_email(&email, "invalid or missing email address")?;
+            if pb_core::superusers::delete(&conn, &email)? {
+                println!("Successfully deleted superuser {:?}!", email.to_lowercase());
+            } else {
+                println!("superuser {email:?} is missing or already deleted");
+            }
+        }
+        SuperuserCommand::Otp { .. } => bail!("superuser otp: not implemented yet (M4)"),
+        SuperuserCommand::Ips { .. } => bail!("superuser ips: not implemented yet (M4)"),
+    }
+
+    Ok(())
+}
+
+fn check_email(email: &str, message: &str) -> Result<()> {
+    if !pb_core::superusers::is_valid_email(email) {
+        bail!("{message}");
+    }
     Ok(())
 }
 

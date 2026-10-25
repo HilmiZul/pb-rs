@@ -126,3 +126,127 @@ mod tests {
         assert_eq!(count, 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// CLI operations (`pocketbase superuser ...`), mirroring `cmd/superuser.go`.
+// ---------------------------------------------------------------------------
+
+use crate::collections::Collection;
+use crate::records::Record;
+
+/// Minimal email check matching `is.EmailFormat`'s intent: a local part, an
+/// `@`, and a dotted domain, with no whitespace.
+pub fn is_valid_email(email: &str) -> bool {
+    if email.len() > 255 || email.contains(char::is_whitespace) {
+        return false;
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return false;
+    }
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !host.is_empty() && tld.len() >= 2
+}
+
+fn superusers_collection(conn: &Connection) -> Result<Collection> {
+    Collection::find(conn, COLLECTION_NAME_SUPERUSERS)?
+        .with_context(|| format!("failed to fetch {COLLECTION_NAME_SUPERUSERS:?} collection"))
+}
+
+/// `FindAuthRecordByEmail` for the superusers collection.
+pub fn find(conn: &Connection, email: &str) -> Result<Option<Record>> {
+    let collection = superusers_collection(conn)?;
+    Record::find_by_email(conn, &collection, email)
+}
+
+/// Create or update a superuser by email (`superuser upsert`).
+pub fn upsert(conn: &Connection, email: &str, password: &str) -> Result<Record> {
+    match find(conn, email)? {
+        Some(existing) => {
+            update_record(conn, &existing, email, password)?;
+            find(conn, email)?.context("superuser vanished after update")
+        }
+        None => create_record(conn, email, password),
+    }
+}
+
+/// `superuser create`: fails when the email is already taken.
+pub fn create(conn: &Connection, email: &str, password: &str) -> Result<Record> {
+    if find(conn, email)?.is_some() {
+        anyhow::bail!("superuser with email {email:?} already exists");
+    }
+    create_record(conn, email, password)
+}
+
+/// `superuser update`: changes the password of an existing superuser.
+pub fn update_password(conn: &Connection, email: &str, password: &str) -> Result<Record> {
+    let existing = find(conn, email)?
+        .with_context(|| format!("superuser with email {email:?} doesn't exist"))?;
+    update_record(conn, &existing, email, password)?;
+    find(conn, email)?.context("superuser vanished after update")
+}
+
+/// `superuser delete`: returns false when the record was already gone.
+pub fn delete(conn: &Connection, email: &str) -> Result<bool> {
+    let deleted = conn.execute(
+        "DELETE FROM _superusers WHERE email = ?1",
+        [email.to_lowercase()],
+    )?;
+    Ok(deleted > 0)
+}
+
+fn create_record(conn: &Connection, email: &str, password: &str) -> Result<Record> {
+    let hash = bcrypt::hash_with_result(password, BCRYPT_COST)
+        .context("hash password")?
+        .format_for_version(bcrypt::Version::TwoA);
+
+    conn.execute(
+        "INSERT INTO _superusers
+            (id, email, emailVisibility, password, tokenKey, verified, created, updated)
+         VALUES (?1, ?2, 0, ?3, ?4, 1,
+                 strftime('%Y-%m-%d %H:%M:%fZ', 'now'),
+                 strftime('%Y-%m-%d %H:%M:%fZ', 'now'))",
+        rusqlite::params![
+            ids::default_random_id(),
+            email.to_lowercase(),
+            hash,
+            ids::random_string(TOKEN_KEY_LENGTH),
+        ],
+    )
+    .context("create superuser")?;
+
+    // `pbSuperusersRecordSaveExec`: creating a real superuser removes the
+    // installer placeholder.
+    if !email.eq_ignore_ascii_case(DEFAULT_INSTALLER_EMAIL) {
+        conn.execute(
+            "DELETE FROM _superusers WHERE email = ?1",
+            [DEFAULT_INSTALLER_EMAIL],
+        )?;
+    }
+
+    find(conn, email)?.context("superuser vanished after create")
+}
+
+fn update_record(conn: &Connection, existing: &Record, email: &str, password: &str) -> Result<()> {
+    let hash = bcrypt::hash_with_result(password, BCRYPT_COST)
+        .context("hash password")?
+        .format_for_version(bcrypt::Version::TwoA);
+
+    // `onRecordSaveExecute`: the token key is regenerated whenever the password
+    // or the email changes, which invalidates every issued token.
+    let token_key = ids::random_string(TOKEN_KEY_LENGTH);
+
+    conn.execute(
+        "UPDATE _superusers
+         SET email = ?1, password = ?2, tokenKey = ?3,
+             updated = strftime('%Y-%m-%d %H:%M:%fZ', 'now')
+         WHERE id = ?4",
+        rusqlite::params![email.to_lowercase(), hash, token_key, existing.id()],
+    )
+    .context("update superuser")?;
+    Ok(())
+}

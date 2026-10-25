@@ -3,11 +3,20 @@
 //! Everything here is driven by facts extracted from the reference binary
 //! (v0.40.6, commit 9d281cca) and verified by the differential harness.
 
+/// Re-exported so downstream crates do not need to depend on `rusqlite`
+/// directly (and always share the same version/features).
+pub use rusqlite;
+
+pub mod assets;
+pub mod collections;
 pub mod db;
 pub mod ids;
 pub mod migrations;
+pub mod records;
 pub mod seed;
+pub mod settings;
 pub mod superusers;
+pub mod tokens;
 
 /// API version reported to clients. Must match the oracle, because the admin UI
 /// and SDKs gate features on it.

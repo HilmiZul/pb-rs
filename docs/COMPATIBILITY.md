@@ -9,8 +9,8 @@ compatibility promise.
 |---|---|---|
 | L1 CLI | `serve`, `superuser {create,update,upsert,delete,otp,ips}`, `migrate`, `version` accept the same flags and produce the same exit codes | scenario: CLI matrix |
 | L2 On-disk | `pb_data/data.db` schema identical; `_migrations` rows identical; `_params.settings` byte-identical (incl. BLOB storage class); `_collections` identical modulo per-install secrets; installer superuser created on a fresh install | `tools/gate_m1.sh` |
-| L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{code,message,data}` | harness `basic` + per-domain scenarios |
-| L4 Auth | bcrypt hashes verify; JWT `HS256` with per-collection `authToken.secret`, claims `{collectionId,id,type,refreshable,exp}`; refresh, OTP, MFA, OAuth2, file tokens | cross-token test: token minted by oracle must validate in port and vice versa |
+| L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{code,message,data}` | harness `basic` + per-domain scenarios; `tools/gate_m2.sh` for auth/settings/collections reads |
+| L4 Auth | bcrypt hashes verify; JWT `HS256` with per-collection `authToken.secret`, claims `{collectionId,id,type,refreshable,exp}`; refresh, OTP, MFA, OAuth2, file tokens | cross-token test in `tools/gate_m2.sh`: a token minted by the oracle validates in the port and vice versa |
 | L5 Query | filter/sort/expand/fields syntax and semantics, including NULL and relation traversal | differential fuzz of the filter parser |
 | L6 Realtime | `text/event-stream` framing, `PB_CONNECT` event, subscription payloads | SSE scenario |
 | L7 Static/UI | `/_/` serves the mirrored `ui/` tree with identical content types and SPA fallback | byte comparison of `ui/` |
@@ -24,6 +24,14 @@ compatibility promise.
    The at-rest gate normalizes exactly two things: the 50-char `[A-Za-z0-9]` token
    secrets inside `_collections.options`, and the installer superuser's
    `id`/`password`/`tokenKey` (which are checked for shape instead of equality).
+
+   The HTTP harness normalizes: JWTs, 50-char secrets, 15-char record ids,
+   timestamps, and the 10-char random suffix that
+   `GET /api/collections/meta/scaffolds` regenerates on every request
+   (`collectionScaffolds` calls `security.RandomStringWithAlphabet(10, ...)` and
+   embeds it in the default index names). The rule only matches index names
+   followed by `` ON `` `` — i.e. the scaffold's empty table name — so real
+   collection index names are still compared exactly.
 2. **JSON key order is not a contract.** Comparisons are semantic (parsed JSON).
 3. **Error text is a contract.** The admin UI and SDKs surface `message` strings;
    they are compared verbatim.
@@ -91,3 +99,15 @@ their *shape* (`id` = 15 lowercase alnum, `tokenKey` = 50 alnum, `password` =
 *Why:* the values are per-install secrets by design.
 *Proven harmless by:* gate phase 1 (installer row check) — the row exists exactly
 when the oracle would create it, so the installer flow is triggered identically.
+
+### D6 — Collections-list `filter` is not implemented yet
+
+`GET /api/collections?filter=...` currently answers 400
+("Something went wrong while processing your request.") for any non-empty
+filter, because the search filter language is not ported yet. The oracle
+evaluates the filter against the whitelisted collection fields.
+
+*Why:* the filter expression parser is a whole subsystem and belongs with the
+records query work (M2b/M3).
+*Status:* pending M2b. The admin UI's collections page does not send a filter on
+load (it uses `page`/`perPage`/`skipTotal`), so the M2 gate is unaffected.

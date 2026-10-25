@@ -1,13 +1,13 @@
-//! HTTP surface. M1 exposes `/api/health`, the JSON 404 envelope and the
-//! embedded admin UI. Every response shape here is copied from a recorded
-//! oracle response (`harness` goldens), not from documentation.
+//! HTTP surface. Every response shape here is copied from a recorded oracle
+//! response (`harness` goldens), not from documentation.
 
 use std::path::PathBuf;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
 use tower_http::services::{ServeDir, ServeFile};
@@ -15,20 +15,20 @@ use tower_http::services::{ServeDir, ServeFile};
 /// Re-exported so the CLI can run the server without a direct axum dependency.
 pub use axum;
 
+pub mod auth;
+pub mod collections;
+pub mod error;
+pub mod records;
+pub mod settings;
+
+use auth::Db;
+
 /// `GET /api/health` — `{"message":"API is healthy.","code":200,"data":{}}`
 #[derive(Serialize)]
 struct HealthResponse {
     message: &'static str,
     code: u16,
     data: Value,
-}
-
-/// PocketBase's error envelope: `{"data":{},"message":"...","status":N}`
-#[derive(Serialize)]
-struct ErrorResponse {
-    data: Value,
-    message: String,
-    status: u16,
 }
 
 async fn health() -> impl IntoResponse {
@@ -42,11 +42,11 @@ async fn health() -> impl IntoResponse {
 async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            data: Value::Object(Default::default()),
-            message: "File not found.".to_string(),
-            status: 404,
-        }),
+        Json(serde_json::json!({
+            "data": {},
+            "message": "File not found.",
+            "status": 404,
+        })),
     )
 }
 
@@ -54,8 +54,31 @@ async fn not_found() -> impl IntoResponse {
 ///
 /// `ui_dir` is the mirrored admin UI directory (`ui/_`); when present it is
 /// served under `/_/` with SPA fallback, exactly like the embedded FS.
-pub fn router(ui_dir: Option<PathBuf>) -> Router {
-    let mut app = Router::new().route("/api/health", get(health));
+pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/settings", get(settings::list))
+        .route("/collections", get(collections::list))
+        // Static `meta` routes must be declared before the `:collection`
+        // wildcard; matchit prefers static segments regardless of order, but
+        // keeping them together documents the relationship.
+        .route("/collections/meta/scaffolds", get(collections::scaffolds))
+        .route(
+            "/collections/meta/oauth2-providers",
+            get(collections::oauth2_providers),
+        )
+        .route("/collections/:collection", get(collections::view))
+        .route("/collections/:collection/auth-methods", get(records::methods))
+        .route(
+            "/collections/:collection/auth-with-password",
+            post(records::with_password),
+        )
+        .route(
+            "/collections/:collection/auth-refresh",
+            post(records::refresh),
+        );
+
+    let mut app = Router::new().nest("/api", api);
 
     if let Some(dir) = ui_dir {
         let index = dir.join("index.html");
@@ -63,5 +86,6 @@ pub fn router(ui_dir: Option<PathBuf>) -> Router {
         app = app.nest_service("/_", service);
     }
 
-    app.fallback(not_found)
+    let db: Db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    app.with_state(db).fallback(not_found)
 }

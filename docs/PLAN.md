@@ -47,13 +47,36 @@ Deliverables:
 3. *Reverse drop-in*: the **oracle** opens a port-created install, starts, answers
    `/api/health`, and does not re-run migrations or touch `data.db`.
 
-## M2 — Collections, settings, superuser login  ← next
+## M2 — Collections, settings, superuser login
 
-Scope: `_collections` CRUD, field builder validation, import/export, scaffolds,
-`/api/settings` read/write, superuser auth, `/_/` static serving.
+Split in two: **M2a** is done and gated; **M2b** is next.
 
-**Gate:** the real admin UI (from `ui/`) logs in, lists collections, and renders the
-settings page against the Rust server.
+### M2a — superuser auth + read endpoints  ✅ done
+
+Scope: superuser auth (`auth-with-password`, `auth-refresh`, `auth-methods`),
+`GET /api/settings`, `GET /api/collections`, `GET /api/collections/{id|name}`,
+`GET /api/collections/meta/scaffolds`, `GET /api/collections/meta/oauth2-providers`,
+list pagination/sorting (`page`, `perPage`, `skipTotal`, `sort`), `superuser`
+CLI, `/_/` static serving of the mirrored UI.
+
+**Gate (passed):** `tools/gate_m2.sh`, three phases:
+
+1. *Response parity* — 19 recorded requests replayed against both binaries,
+   compared semantically: 0 mismatches. Covers bad/unknown identity, missing
+   body fields, unknown collection, login, refresh, anonymous/bad-token/valid
+   settings reads, collections list (default, paged, `skipTotal`), collection
+   view (id/name/missing), auth-methods and both `meta` payloads.
+2. *Cross-implementation auth* — a token minted by the oracle is accepted by the
+   port and a port-minted token is accepted by the oracle, on the same database.
+3. *Admin UI login* — the real embedded admin UI, driven in headless Chrome,
+   loads the login form, authenticates, stores the session, and lands on
+   `#/collections`. Record-list 404s are explicitly listed as M3 scope.
+
+### M2b — collections/settings writes  ← next
+
+Scope: `_collections` create/update/delete with record-table sync, field builder
+validation, import/export, `POST /meta/dry-run-view`, truncate,
+`PATCH /api/settings`, and the `filter` query language for the collections list.
 
 ## M3 — Records CRUD, filter/sort/expand, rules
 
