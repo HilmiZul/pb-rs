@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::Json;
 use pb_core::collections::Collection;
 use pb_core::records::Record;
+use pb_core::search;
 use pb_core::tokens::{self, RecordClaims};
 use serde_json::{json, Map, Value};
 
@@ -370,23 +371,54 @@ pub async fn list(
     let per_page = parse_per_page(params.per_page.as_deref());
     let offset = (page - 1) * per_page;
 
-    // Sort
     let sort = params.sort.clone().unwrap_or_default();
     let order_clause = build_order(&collection, &sort);
 
-    let total: i64 = conn
-        .query_row(&format!("SELECT count(*) FROM {}", quote_table(&collection.name)), [], |r| r.get(0))
-        .map_err(|e| ApiError::internal(format!("count failed: {e}")))?;
+    // Filter
+    let filter = params.filter.clone().unwrap_or_default();
+    let (where_clause, filter_params) = if filter.trim().is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        let allowed: Vec<String> = collection
+            .field_list()
+            .items()
+            .iter()
+            .map(|f| pb_core::fields::field_name(f).to_string())
+            .chain(std::iter::once("id".to_string()))
+            .collect();
+        let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
+        let sf = search::build_sql(&expr, &allowed).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
+        let mut sql = format!("WHERE {}", sf.sql);
+        // bind params via ? placeholders already in sql; store them
+        (sql, sf.params)
+    };
 
-    let sql = format!(
-        "SELECT * FROM {} {} LIMIT ?1 OFFSET ?2",
-        quote_table(&collection.name),
-        order_clause
-    );
+    let total_sql = if where_clause.is_empty() {
+        format!("SELECT count(*) FROM {}", quote_table(&collection.name))
+    } else {
+        format!("SELECT count(*) FROM {} {}", quote_table(&collection.name), where_clause)
+    };
+    let total: i64 = if filter_params.is_empty() {
+        conn.query_row(&total_sql, [], |r| r.get(0))
+    } else {
+        let params: Vec<rusqlite::types::Value> = filter_params.iter().map(json_to_sqlite).collect();
+        conn.query_row(&total_sql, rusqlite::params_from_iter(params), |r| r.get(0))
+    }
+    .map_err(|e| ApiError::internal(format!("count failed: {e}")))?;
+
+    let sql = if where_clause.is_empty() {
+        format!("SELECT * FROM {} {} LIMIT ?1 OFFSET ?2", quote_table(&collection.name), order_clause)
+    } else {
+        format!("SELECT * FROM {} {} {} LIMIT ?1 OFFSET ?2", quote_table(&collection.name), where_clause, order_clause)
+    };
+
     let mut stmt = conn.prepare(&sql).map_err(|e| ApiError::internal(format!("prepare failed: {e}")))?;
-    let rows = stmt.query(rusqlite::params![per_page, offset]).map_err(|e| ApiError::internal(format!("query failed: {e}")))?;
+    // Combine filter params + pagination params
+    let mut all_params: Vec<rusqlite::types::Value> = filter_params.iter().map(json_to_sqlite).collect();
+    all_params.push(rusqlite::types::Value::Integer(per_page));
+    all_params.push(rusqlite::types::Value::Integer(offset));
+    let mut rows = stmt.query(rusqlite::params_from_iter(all_params)).map_err(|e| ApiError::internal(format!("query failed: {e}")))?;
     let mut records = Vec::new();
-    let mut rows = rows;
     while let Some(row) = rows.next().map_err(|e| ApiError::internal(format!("row failed: {e}")))? {
         let rec = Record::from_row(&collection, row).map_err(|e| ApiError::internal(format!("from_row failed: {e}")))?;
         records.push(rec.to_api_json());

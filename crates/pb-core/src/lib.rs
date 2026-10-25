@@ -16,6 +16,7 @@ pub mod ids;
 pub mod migrations;
 pub mod records;
 pub mod schema_sync;
+pub mod search;
 pub mod seed;
 pub mod settings;
 pub mod superusers;
