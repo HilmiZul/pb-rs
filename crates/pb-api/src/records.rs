@@ -341,6 +341,7 @@ pub struct RecordsListParams {
     #[serde(rename = "skipTotal")]
     pub skip_total: Option<String>,
     pub expand: Option<String>,
+    pub fields: Option<String>,
 }
 
 fn parse_page(raw: Option<&str>) -> i64 {
@@ -597,6 +598,31 @@ pub async fn list(
         out.insert("totalItems".into(), Value::Number(total.into()));
         out.insert("totalPages".into(), Value::Number(total_pages.into()));
     }
+    // Fields projection.
+    let fields_param = params.fields.clone().unwrap_or_default();
+    if !fields_param.is_empty() {
+        let wanted: Vec<&str> = fields_param.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let mut projected: Vec<Value> = Vec::with_capacity(records.len());
+        for rec in &records {
+            let mut obj = Map::new();
+            if let Some(r) = rec.as_object() {
+                // always include these
+                for k in ["collectionId", "collectionName", "id", "expand"] {
+                    if let Some(v) = r.get(k) {
+                        obj.insert(k.to_string(), v.clone());
+                    }
+                }
+                for w in &wanted {
+                    if let Some(v) = r.get(*w) {
+                        obj.insert(w.to_string(), v.clone());
+                    }
+                }
+            }
+            projected.push(Value::Object(obj));
+        }
+        records = projected;
+    }
+
     out.insert("items".into(), Value::Array(records));
     Ok(Json(Value::Object(out)))
 }
