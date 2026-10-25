@@ -9,6 +9,9 @@
 
 use std::fmt;
 
+// Record type alias for auth context
+use crate::records::Record as PbRecord;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
@@ -20,6 +23,8 @@ pub enum Expr {
         right: Box<Expr>,
     },
     Field(String),
+    AuthField(String),
+    Now,
     Literal(Literal),
     Func {
         name: String,
@@ -327,6 +332,15 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.advance();
+                if name == "@now" {
+                    return Ok(Expr::Now);
+                }
+                if let Some(rest) = name.strip_prefix("@request.auth.") {
+                    return Ok(Expr::AuthField(rest.to_string()));
+                }
+                if name == "@request.auth" {
+                    return Ok(Expr::AuthField("id".to_string()));
+                }
                 // function call?
                 if matches!(self.peek(), Tok::LParen) {
                     self.advance();
@@ -387,9 +401,18 @@ pub struct SqlFilter {
 /// Build a SQL WHERE clause from a filter expression.
 /// `allowed_fields` is the set of valid field names (for validation).
 pub fn build_sql(expr: &Expr, allowed_fields: &[String]) -> Result<SqlFilter, ParseError> {
+    build_sql_with_auth(expr, allowed_fields, None)
+}
+
+pub fn build_sql_with_auth(
+    expr: &Expr,
+    allowed_fields: &[String],
+    auth: Option<&PbRecord>,
+) -> Result<SqlFilter, ParseError> {
     let mut ctx = BuildCtx {
         params: Vec::new(),
         allowed: allowed_fields,
+        auth,
     };
     let sql = build_expr(expr, &mut ctx)?;
     Ok(SqlFilter { sql, params: ctx.params })
@@ -398,6 +421,7 @@ pub fn build_sql(expr: &Expr, allowed_fields: &[String]) -> Result<SqlFilter, Pa
 struct BuildCtx<'a> {
     params: Vec<serde_json::Value>,
     allowed: &'a [String],
+    auth: Option<&'a PbRecord>,
 }
 
 fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
@@ -424,6 +448,15 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
             // quote identifier
             Ok(format!("\"{}\"", name.replace('"', "\"\"")))
         }
+        Expr::AuthField(path) => {
+            let val = ctx
+                .auth
+                .and_then(|a| a.data.get(path.as_str()).cloned())
+                .unwrap_or(serde_json::Value::Null);
+            ctx.params.push(val);
+            Ok("?".into())
+        }
+        Expr::Now => Ok("datetime('now')".into()),
         Expr::Literal(lit) => match lit {
             Literal::Null => Ok("NULL".into()),
             Literal::Bool(b) => {

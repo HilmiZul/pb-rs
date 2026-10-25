@@ -384,9 +384,39 @@ pub async fn list(
 
     // Filter
     let filter = params.filter.clone().unwrap_or_default();
-    let (where_clause, filter_params) = if filter.trim().is_empty() {
+
+    // Apply collection list rule for non-superusers.
+    let auth = load_auth(&db, &headers);
+    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+    let mut rule_filter = String::new();
+    let mut rule_params: Vec<serde_json::Value> = Vec::new();
+    if !is_superuser {
+        if let Some(rule) = &collection.list_rule {
+            if !rule.is_empty() {
+                let allowed: Vec<String> = collection
+                    .field_list()
+                    .items()
+                    .iter()
+                    .map(|f| pb_core::fields::field_name(f).to_string())
+                    .chain(std::iter::once("id".to_string()))
+                    .collect();
+                if let Ok(expr) = search::parse(rule) {
+                    if let Ok(sf) = search::build_sql_with_auth(&expr, &allowed, auth.as_ref().map(|a| &a.record)) {
+                        rule_filter = sf.sql;
+                        rule_params = sf.params;
+                    }
+                }
+            }
+        }
+    }
+
+    let (where_clause, filter_params) = if filter.trim().is_empty() && rule_filter.is_empty() {
         (String::new(), Vec::new())
-    } else {
+    } else if filter.trim().is_empty() {
+        // only rule filter
+        (format!("WHERE {}", rule_filter), rule_params)
+    } else if rule_filter.is_empty() {
+        // only user filter
         let allowed: Vec<String> = collection
             .field_list()
             .items()
@@ -395,10 +425,24 @@ pub async fn list(
             .chain(std::iter::once("id".to_string()))
             .collect();
         let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        let sf = search::build_sql(&expr, &allowed).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        let mut sql = format!("WHERE {}", sf.sql);
-        // bind params via ? placeholders already in sql; store them
-        (sql, sf.params)
+        let auth_record = load_auth(&db, &headers).map(|a| a.record);
+        let sf = search::build_sql_with_auth(&expr, &allowed, auth_record.as_ref())
+            .map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
+        (format!("WHERE {}", sf.sql), sf.params)
+    } else {
+        // both
+        let allowed: Vec<String> = collection
+            .field_list()
+            .items()
+            .iter()
+            .map(|f| pb_core::fields::field_name(f).to_string())
+            .chain(std::iter::once("id".to_string()))
+            .collect();
+        let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
+        let auth_record = load_auth(&db, &headers).map(|a| a.record);
+        let sf = search::build_sql_with_auth(&expr, &allowed, auth_record.as_ref())
+            .map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
+        (format!("WHERE {} AND ({})", rule_filter, sf.sql), [rule_params, sf.params].concat())
     };
 
     let total_sql = if where_clause.is_empty() {
