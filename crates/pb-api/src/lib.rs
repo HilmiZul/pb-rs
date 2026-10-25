@@ -63,6 +63,7 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             "/collections",
             get(collections::list).post(collections::create),
         )
+        .route("/collections/import", axum::routing::put(collections::import))
         // Static `meta` routes must be declared before the `:collection`
         // wildcard; matchit prefers static segments regardless of order, but
         // keeping them together documents the relationship.

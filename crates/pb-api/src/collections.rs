@@ -374,6 +374,63 @@ pub async fn update(
     }
 }
 
+#[derive(Deserialize)]
+struct ImportForm {
+    collections: Option<Vec<Value>>,
+    #[serde(rename = "deleteMissing")]
+    delete_missing: Option<bool>,
+}
+
+/// `PUT /api/collections/import`
+pub async fn import(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_superuser(&db, &headers)?;
+
+    let payload = match crate::body::bind_json(&headers, &body) {
+        Ok(Some(value)) => value,
+        Ok(None) => Value::Null,
+        Err(()) => return Err(submitted_load_error()),
+    };
+
+    let form: ImportForm = serde_json::from_value(payload).map_err(|_| submitted_load_error())?;
+    let collections = form.collections.unwrap_or_default();
+    if collections.is_empty() {
+        let mut errs = validation::Errors::new();
+        errs.insert(
+            "collections".into(),
+            validation::required(),
+        );
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "An error occurred while validating the submitted data.",
+            validation::errors_to_value(&errs),
+        ));
+    }
+    let delete_missing = form.delete_missing.unwrap_or(false);
+
+    let mut conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+
+    match collection_write::import_collections(&mut conn, &collections, delete_missing) {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(collection_write::SaveError::Validation(errors)) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Failed to import collections.",
+            validation::errors_to_value(&errors),
+        )),
+        Err(collection_write::SaveError::NotFound) => {
+            Err(ApiError::not_found("The requested resource wasn't found."))
+        }
+        Err(collection_write::SaveError::Raw(message)) => Err(ApiError::bad_request(format!(
+            "Failed to import collections. (raw: {message})"
+        ))),
+    }
+}
+
 /// `DELETE /api/collections/{collection}`
 pub async fn delete(
     State(db): State<Db>,

@@ -91,11 +91,20 @@ single↔multiple normalization, index sync, auth option merge, system-field and
 rule guards. Gate: `tools/gate_m2.sh` (m2d scenario, 27 requests, DB rows +
 schema identical).
 
-### M2e — collections list `filter`, import/export, dry-run-view  ← next
+### M2e — collections import  ✅ done (partial)
 
-Scope: `GET /api/collections?filter=...`, `POST /api/collections/import`,
-`GET /api/collections/{id}/export`, `POST /api/collections/meta/dry-run-view`,
-and `CreateViewFields` (identifier parser, `_clone_` ids).
+Scope: `PUT /api/collections/import` (upsert by id/name, deleteMissing). Gate:
+`m2e-import` (5 requests, DB rows + schema identical).
+
+Remaining in M2e: collections list `filter`, `dry-run-view`, `CreateViewFields`
+(identifier parser, `_clone_` ids) — pending M3 (they share the filter/SQL
+introspection subsystem).
+
+### M3 — Records CRUD, filter/sort/expand, rules  ← next
+
+Scope: record list/view/create/update/delete, `filter`/`sort`/`expand`/`fields`,
+collection rules (`@request.auth`, `@collection.*`), rate limits, plus the
+collection-level `filter` and `dry-run-view` deferred from M2e.
 
 ## M3 — Records CRUD, filter/sort/expand, rules
 

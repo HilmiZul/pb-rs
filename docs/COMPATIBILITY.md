@@ -117,8 +117,9 @@ evaluates the filter against the whitelisted collection fields.
 
 *Why:* the filter expression parser is a whole subsystem and belongs with the
 records query work (M2b/M3).
-*Status:* pending M2b. The admin UI's collections page does not send a filter on
-load (it uses `page`/`perPage`/`skipTotal`), so the M2 gate is unaffected.
+*Status:* pending M3 (records/collections query work). The admin UI's collections
+page does not send a filter on load (it uses `page`/`perPage`/`skipTotal`), so
+the M2 gate is unaffected.
 
 ### D7 — JS migrations and hooks are not executed
 
