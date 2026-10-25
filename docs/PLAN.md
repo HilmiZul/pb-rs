@@ -20,20 +20,34 @@ Deliverables:
 **Gate (passed):** the harness records the oracle and self-diffs with 0 mismatches
 (9 responses), proving the recorder and normalizer are deterministic.
 
-## M1 — Bootstrap, schema, migration parity  ← next
+## M1 — Bootstrap, schema, migration parity  ✅ done
 
 Scope: CLI skeleton (`serve`, `version`), config/flag parsing identical to cobra's,
 SQLite open with the same pragmas, `_migrations` chain replay, `_params` seeding,
-`_collections` seeding for `_superusers` + `users`.
+`_collections` seeding for `_superusers` + `users`, installer superuser bootstrap.
 
-**Gate:**
-1. Point the Rust binary at a `pb_data/` created by the Go binary → it starts and
-   serves `/api/health`.
-2. `sqlite3 .schema` diff (both directions) is empty.
-3. `_migrations`, `_params`, `_collections` row dumps are identical after
-   Rust-then-Go and Go-then-Rust round trips.
+Deliverables:
+- `crates/pb-core` — `db` (pragma set from `core/db_connect.go`), `migrations`
+  (8-entry chain), `seed` (settings + 6 system collections), `superusers`
+  (`__pbinstaller@example.com`), `ids` (id/secret generation).
+- `crates/pb-api` — `/api/health`, JSON 404 envelope, `/_/` static serving.
+- `crates/pb-cli` — cobra-compatible flags, `serve`, `--version`.
+- `tools/gate_m1.sh` + `tools/gate_m1_compare.py` — the automated gate.
 
-## M2 — Collections, settings, superuser login
+**Gate (passed):** `tools/gate_m1.sh`, 24 checks in three phases:
+
+1. *Fresh install*: `data.db` schema identical modulo `sqlite_stat*`; `_migrations`
+   set identical (8); `_params.settings` **byte-identical**; `_collections` rows
+   identical modulo the per-install token secrets; secrets regenerated (50 chars);
+   installer superuser row matches (`email`/`verified`/`emailVisibility`, bcrypt
+   `$2a$10$` hash); JSON columns share SQLite storage classes (BLOB vs TEXT);
+   `auxiliary.db` schema identical; both write `types.d.ts`.
+2. *Drop-in*: the port opens an oracle-created install and changes no schema and no
+   row in either database.
+3. *Reverse drop-in*: the **oracle** opens a port-created install, starts, answers
+   `/api/health`, and does not re-run migrations or touch `data.db`.
+
+## M2 — Collections, settings, superuser login  ← next
 
 Scope: `_collections` CRUD, field builder validation, import/export, scaffolds,
 `/api/settings` read/write, superuser auth, `/_/` static serving.

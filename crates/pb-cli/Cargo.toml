@@ -1,0 +1,18 @@
+[package]
+name = "pb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pocketbase"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+pb-core = { path = "../pb-core" }
+pb-api = { path = "../pb-api" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
