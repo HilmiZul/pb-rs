@@ -734,7 +734,8 @@ pub async fn create(
             if !rule.is_empty() {
                 let mut data = payload.clone();
                 data.insert("id".into(), Value::String(id.clone()));
-                if !rule_passes(&conn, rule, &data, auth.as_ref().map(|a| &a.record)) {
+                let data_map: serde_json::Map<String, serde_json::Value> = data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
                     return Err(ApiError::bad_request("Failed to create record."));
                 }
             }
@@ -846,7 +847,8 @@ pub async fn update(
                 for (k, v) in &payload {
                     data.insert(k.clone(), v.clone());
                 }
-                if !rule_passes(&conn, rule, &data, auth.as_ref().map(|a| &a.record)) {
+                let data_map: serde_json::Map<String, serde_json::Value> = data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
                     return Err(ApiError::bad_request("Failed to update record."));
                 }
             }
@@ -909,7 +911,8 @@ pub async fn delete(
                 let existing = Record::find_by_id(&conn, &collection, &record_id)
                     .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
                     .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
-                if !rule_passes(&conn, rule, &existing.data, auth.as_ref().map(|a| &a.record)) {
+                let data_map: serde_json::Map<String, serde_json::Value> = existing.data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
                     return Err(ApiError::bad_request("Failed to delete record."));
                 }
             }
