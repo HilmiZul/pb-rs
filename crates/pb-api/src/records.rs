@@ -129,7 +129,192 @@ pub async fn methods(
     })))
 }
 
-/// `POST /api/collections/{collection}/auth-with-password`
+/// `POST /api/collections/{collection}/request-otp`
+pub async fn request_otp(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    let otp_config = collection
+        .options
+        .get("otp")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !otp_config
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::forbidden(
+            "The collection is not configured to allow OTP authentication.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let email = form.get("email").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    validate_required_string(form.get("email"), &mut errors, "email");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    // find the auth record by email (ignore not found)
+    let record = Record::find_by_email(&conn, &collection, email)
+        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?;
+
+    // enumeration protection: missing record still returns 200 with a dummy id
+    let Some(record) = record else {
+        return Ok(Json(json!({"otpId": pb_core::ids::default_random_id()})));
+    };
+
+    let length = otp_config
+        .get("length")
+        .and_then(Value::as_i64)
+        .unwrap_or(6) as usize;
+    let password = pb_core::ids::random_string_with_alphabet(length, "1234567890");
+
+    // hash the password via the _otps collection's password field (cost 10)
+    let otps_collection = Collection::find(&conn, "_otps")
+        .map_err(|e| ApiError::internal(format!("failed to load otps collection: {e}")))?
+        .ok_or_else(|| ApiError::internal("missing _otps collection"))?;
+
+    let hash = pb_core::record_upsert::hash_password(&password, 10);
+
+    // insert OTP row
+    conn.execute(
+        "INSERT INTO _otps (collectionRef, recordRef, password, sentTo, created, updated)
+         VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%d %H:%M:%fZ','now'), strftime('%Y-%m-%d %H:%M:%fZ','now'))",
+        rusqlite::params![collection.id, record.id(), hash, ""],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to create otp: {e}")))?;
+
+    let otp_id: String = conn
+        .query_row(
+            "SELECT id FROM _otps WHERE rowid = last_insert_rowid()",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| ApiError::internal(format!("failed to read otp id: {e}")))?;
+
+    // email sending stubbed (fire-and-forget no-op)
+    let _ = (otps_collection, email, password);
+
+    Ok(Json(json!({"otpId": otp_id})))
+}
+
+/// `POST /api/collections/{collection}/auth-with-otp`
+pub async fn auth_with_otp(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    let otp_config = collection
+        .options
+        .get("otp")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !otp_config
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::forbidden(
+            "The collection is not configured to allow OTP authentication.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let otp_id = form.get("otpId").and_then(Value::as_str).unwrap_or("");
+    let password = form.get("password").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    validate_required_string(form.get("otpId"), &mut errors, "otpId");
+    if let Some(p) = form.get("password").and_then(Value::as_str) {
+        if p.is_empty() {
+            errors.insert("password".into(), validation_required());
+        } else if p.chars().count() > 71 {
+            errors.insert("password".into(), validation_length(1, 71));
+        }
+    } else {
+        errors.insert("password".into(), validation_required());
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let otps_collection = Collection::find(&conn, "_otps")
+        .map_err(|e| ApiError::internal(format!("failed to load otps collection: {e}")))?
+        .ok_or_else(|| ApiError::internal("missing _otps collection"))?;
+
+    let otp_record = Record::find_by_id(&conn, &otps_collection, otp_id)
+        .map_err(|e| ApiError::internal(format!("failed to load otp: {e}")))?
+        .ok_or_else(|| ApiError::bad_request("Invalid or expired OTP"))?;
+
+    let otp_collection_ref = otp_record
+        .to_api_json()
+        .get("collectionRef")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if otp_collection_ref != collection.id {
+        return Err(ApiError::bad_request("Invalid or expired OTP"));
+    }
+
+    // expiry check
+    let duration = otp_config.get("duration").and_then(Value::as_i64).unwrap_or(0);
+    let expired: i64 = conn
+        .query_row(
+            "SELECT CASE WHEN datetime(created, '+' || ?2 || ' seconds') < datetime('now') THEN 1 ELSE 0 END FROM _otps WHERE id = ?1",
+            rusqlite::params![otp_id, duration],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if expired == 1 {
+        return Err(ApiError::bad_request("Invalid or expired OTP"));
+    }
+
+    let record_id = otp_record
+        .to_api_json()
+        .get("recordRef")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let record = Record::find_by_id(&conn, &collection, &record_id)
+        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?
+        .ok_or_else(|| ApiError::bad_request("Invalid or expired OTP"))?;
+
+    if !otp_record.validate_password(password) {
+        return Err(ApiError::bad_request("Invalid or expired OTP"));
+    }
+
+    // delete the OTP
+    conn.execute("DELETE FROM _otps WHERE id = ?1", [otp_id])
+        .map_err(|e| ApiError::internal(format!("failed to delete otp: {e}")))?;
+
+    // verified state update (only if sentTo matches email); sentTo is "" here so skip
+
+    let token = auth_token(&collection, &record, true)?;
+    Ok(Json(json!({
+        "record": record.to_api_json(),
+        "token": token,
+    })))
+}
+
 pub async fn with_password(
     State(db): State<Db>,
     headers: HeaderMap,

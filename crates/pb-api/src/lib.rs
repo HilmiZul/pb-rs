@@ -100,6 +100,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             post(records::with_password),
         )
         .route(
+            "/collections/:collection/request-otp",
+            post(records::request_otp),
+        )
+        .route(
+            "/collections/:collection/auth-with-otp",
+            post(records::auth_with_otp),
+        )
+        .route(
             "/collections/:collection/auth-refresh",
             post(records::refresh),
         );
