@@ -182,16 +182,59 @@ pub async fn file_download(
         .join(&record_id)
         .join(&filename);
 
-    let data = std::fs::read(&file_path)
+    let thumb_size = params.get("thumb").cloned().unwrap_or_default();
+
+    let mut served_path = file_path.clone();
+    let mut served_name = filename.clone();
+
+    if !thumb_size.is_empty() {
+        // check if image content type
+        let is_image = filename.ends_with(".png")
+            || filename.ends_with(".jpg")
+            || filename.ends_with(".jpeg")
+            || filename.ends_with(".gif")
+            || filename.ends_with(".webp");
+        if is_image {
+            let thumb_dir = storage_root
+                .join(&collection.id)
+                .join(&record_id)
+                .join(format!("thumbs_{}", filename));
+            let thumb_path = thumb_dir.join(format!("{}_{}", thumb_size, filename));
+            if !thumb_path.exists() {
+                // generate
+                let img = image::open(&file_path).ok();
+                if let Some(img) = img {
+                    // parse size
+                    let size_str = thumb_size.trim_end_matches(['t', 'b', 'f']);
+                    let parts: Vec<&str> = size_str.split('x').collect();
+                    if parts.len() == 2 {
+                        let w: u32 = parts[0].parse().unwrap_or(0);
+                        let h: u32 = parts[1].parse().unwrap_or(0);
+                        if w > 0 && h > 0 {
+                            let thumb = img.thumbnail(w, h);
+                            std::fs::create_dir_all(&thumb_dir).ok();
+                            let _ = thumb.save(&thumb_path);
+                        }
+                    }
+                }
+            }
+            if thumb_path.exists() {
+                served_path = thumb_path;
+                served_name = format!("{}_{}", thumb_size, filename);
+            }
+        }
+    }
+
+    let data = std::fs::read(&served_path)
         .map_err(|_| ApiError::not_found("The requested resource wasn't found."))?;
 
-    let content_type = if filename.ends_with(".png") {
+    let content_type = if served_name.ends_with(".png") {
         "image/png"
-    } else if filename.ends_with(".jpg") || filename.ends_with(".jpeg") {
+    } else if served_name.ends_with(".jpg") || served_name.ends_with(".jpeg") {
         "image/jpeg"
-    } else if filename.ends_with(".gif") {
+    } else if served_name.ends_with(".gif") {
         "image/gif"
-    } else if filename.ends_with(".webp") {
+    } else if served_name.ends_with(".webp") {
         "image/webp"
     } else {
         "application/octet-stream"
