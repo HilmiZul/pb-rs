@@ -1236,7 +1236,7 @@ fn unsupported_value_type() -> Node {
     leaf("validation_invalid_value", "Invalid value")
 }
 
-fn prepare_value(field: &Value, raw: Option<&Value>) -> FieldValue {
+pub(crate) fn prepare_value(field: &Value, raw: Option<&Value>) -> FieldValue {
     let null = Value::Null;
     let value = raw.unwrap_or(&null);
     match field_type(field) {

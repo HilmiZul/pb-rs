@@ -128,6 +128,11 @@ fn normalize(input: &str) -> String {
     // in the default index names. Only scaffold indexes have an empty table
     // name, so anchoring on `ON `` ` keeps real collection indexes untouched.
     let scaffold_index = Regex::new(r"idx_[A-Za-z0-9]+_[a-z0-9]{10}` ON ``").unwrap();
+    // View collections are generated from random temp names: the temp view
+    // name, its derived collection id and the cloned field ids are volatile.
+    let temp_view = Regex::new(r"temp_view_[A-Za-z0-9]{5}").unwrap();
+    let temp_pbc = Regex::new(r##"pbc_\d+(","collectionName":"temp_view_<random>")"##).unwrap();
+    let clone = Regex::new(r"_clone_[A-Za-z0-9]{4}").unwrap();
     // PocketBase record ids: 15 lowercase alphanumerics.
     let ids = Regex::new(r"\b[a-z0-9]{15}\b").unwrap();
     // RFC3339-ish timestamps, with or without fractional seconds.
@@ -136,6 +141,9 @@ fn normalize(input: &str) -> String {
     let out = jwt.replace_all(input, "<jwt>");
     let out = secret.replace_all(&out, "<secret>");
     let out = scaffold_index.replace_all(&out, "idx_<random>` ON ``");
+    let out = temp_view.replace_all(&out, "temp_view_<random>");
+    let out = temp_pbc.replace_all(&out, "pbc_<temp>$1");
+    let out = clone.replace_all(&out, "_clone_<random>");
     let out = ids.replace_all(&out, "<id>");
     ts.replace_all(&out, "<ts>").to_string()
 }

@@ -25,6 +25,7 @@ pub mod superusers;
 pub mod tokens;
 pub mod validation;
 pub mod validators;
+pub mod view;
 
 /// API version reported to clients. Must match the oracle, because the admin UI
 /// and SDKs gate features on it.

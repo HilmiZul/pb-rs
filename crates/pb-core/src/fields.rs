@@ -939,10 +939,10 @@ fn validate_name(field: &Value) -> Option<Node> {
         return Some(err);
     }
     if !is_word(name) {
-        return Some(leaf("validation_match_invalid", "Must be in a valid format."));
+        return Some(leaf("validation_match_invalid", "must be in a valid format"));
     }
     if EXCLUDED_NAMES.contains(&name) {
-        return Some(leaf("validation_not_in_invalid", "Must not be in list."));
+        return Some(leaf("validation_not_in_invalid", "must not be in list"));
     }
     if name.to_lowercase().contains("_via_") {
         return Some(leaf(
@@ -1456,13 +1456,13 @@ mod tests {
         let errs = validate_settings(&field, &base, &[]);
         assert_eq!(
             errs["name"],
-            leaf("validation_match_invalid", "Must be in a valid format.")
+            leaf("validation_match_invalid", "must be in a valid format")
         );
 
         let field = from_request(&json!({"name": "null", "type": "text"})).unwrap();
         assert_eq!(
             validate_settings(&field, &base, &[])["name"],
-            leaf("validation_not_in_invalid", "Must not be in list.")
+            leaf("validation_not_in_invalid", "must not be in list")
         );
 
         let field = from_request(&json!({"name": "a_via_b", "type": "text"})).unwrap();

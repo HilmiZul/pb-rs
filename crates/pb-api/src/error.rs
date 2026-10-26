@@ -18,9 +18,10 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>, data: Value) -> Self {
+        // `router.NewApiError`: `strings.TrimSpace(inflector.Sentenize(message))`.
         Self {
             status,
-            message: message.into(),
+            message: pb_core::validation::sentenize(&message.into()),
             data,
         }
     }

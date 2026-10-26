@@ -13,6 +13,7 @@ use axum::Json;
 use pb_core::collection_write::{self, SaveError};
 use pb_core::collections::Collection;
 use pb_core::validation;
+use pb_core::view;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -309,6 +310,75 @@ fn type_load_error() -> ApiError {
 /// `e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)`
 fn submitted_load_error() -> ApiError {
     ApiError::bad_request("Failed to load the submitted data due to invalid formatting.")
+}
+
+/// `POST /api/collections/meta/dry-run-view`
+pub async fn dry_run_view(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_superuser(&db, &headers)?;
+
+    let payload = match crate::body::bind_json(&headers, &body) {
+        Ok(Some(value)) => value,
+        Ok(None) => Value::Null,
+        Err(()) => {
+            return Err(ApiError::bad_request(
+                "An error occurred while loading the submitted data.",
+            ))
+        }
+    };
+
+    // `e.BindBody(&dryRunViewForm{})`: a JSON object binds `query` (null and
+    // missing values keep the zero value); any other JSON shape fails.
+    let query = match payload {
+        Value::Null => String::new(),
+        Value::Object(map) => match map.get("query") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(value)) => value.clone(),
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "An error occurred while loading the submitted data.",
+                ))
+            }
+        },
+        _ => {
+            return Err(ApiError::bad_request(
+                "An error occurred while loading the submitted data.",
+            ))
+        }
+    };
+
+    let mut errors = validation::Errors::new();
+    if query.is_empty() {
+        errors.insert("query".into(), validation::required());
+    } else if let Some(err) = validation::length(&query, 0, 5000) {
+        errors.insert("query".into(), err);
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "An error occurred while validating the submitted data.",
+            validation::errors_to_value(&errors),
+        ));
+    }
+
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+
+    match view::dry_run(&conn, &query, 10) {
+        Ok(result) => {
+            let mut out = serde_json::Map::new();
+            out.insert("fields".into(), result.fields.to_json());
+            out.insert("sample".into(), Value::Array(result.sample));
+            Ok(Json(Value::Object(out)).into_response())
+        }
+        Err(err) => Err(ApiError::bad_request(format!(
+            "Invalid view query. Raw error: \n{err}"
+        ))),
+    }
 }
 
 /// `POST /api/collections`

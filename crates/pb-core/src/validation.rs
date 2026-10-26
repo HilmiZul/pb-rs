@@ -53,7 +53,8 @@ pub fn leaf_with_params(code: &str, message: impl Into<String>, params: Value) -
 
 /// `validation.ErrRequired`.
 pub fn required() -> Node {
-    leaf("validation_required", "Cannot be blank.")
+    // ozzo's raw message; the API layer sentenizes it on output.
+    leaf("validation_required", "cannot be blank")
 }
 
 /// `validation.ErrInInvalid`.
@@ -139,6 +140,31 @@ pub fn branch(errs: Errors) -> Option<Node> {
     } else {
         Some(Node::Branch(errs))
     }
+}
+
+/// `validation.Errors.Error()`: sorted keys joined with `"; "`, branches
+/// rendered as `key: (nested)` and leaves interpolated without sentenizing.
+pub fn errors_display(errors: &Errors) -> String {
+    let mut out = String::new();
+    for (i, (key, node)) in errors.iter().enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        match node {
+            Node::Branch(inner) => {
+                out.push_str(key);
+                out.push_str(": (");
+                out.push_str(&errors_display(inner));
+                out.push(')');
+            }
+            Node::Leaf(error) => {
+                out.push_str(key);
+                out.push_str(": ");
+                out.push_str(&interpolate(&error.message, error.params.as_ref()));
+            }
+        }
+    }
+    out
 }
 
 /// Serialize an error tree.

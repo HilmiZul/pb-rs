@@ -69,6 +69,10 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
         // keeping them together documents the relationship.
         .route("/collections/meta/scaffolds", get(collections::scaffolds))
         .route(
+            "/collections/meta/dry-run-view",
+            axum::routing::post(collections::dry_run_view),
+        )
+        .route(
             "/collections/meta/oauth2-providers",
             get(collections::oauth2_providers),
         )
