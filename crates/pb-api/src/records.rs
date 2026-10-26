@@ -725,13 +725,237 @@ pub async fn confirm_email_change(
 }
 
 pub async fn auth_with_oauth2(
-    State(_db): State<Db>,
-    _headers: HeaderMap,
-    Path(_id_or_name): Path<String>,
-    _body: Bytes,
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    Err(ApiError::internal("OAuth2 authentication is not yet implemented."))
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    let oauth2_config = collection
+        .options
+        .get("oauth2")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !oauth2_config
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::forbidden(
+            "The collection is not configured to allow OAuth2 authentication.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let provider_name = form.get("provider").and_then(Value::as_str).unwrap_or("");
+    let code = form.get("code").and_then(Value::as_str).unwrap_or("");
+    let code_verifier = form.get("codeVerifier").and_then(Value::as_str).unwrap_or("");
+    let redirect_url = form
+        .get("redirectURL")
+        .or_else(|| form.get("redirectUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if provider_name.is_empty() || code.is_empty() {
+        let mut errors = Map::new();
+        if provider_name.is_empty() {
+            errors.insert("provider".into(), validation_required());
+        }
+        if code.is_empty() {
+            errors.insert("code".into(), validation_required());
+        }
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let providers = oauth2_config
+        .get("providers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let provider_config = providers
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(provider_name))
+        .cloned()
+        .ok_or_else(|| ApiError::internal("Missing or invalid provider config."))?;
+
+    let client_id = provider_config.get("clientId").and_then(Value::as_str).unwrap_or("");
+    let client_secret = provider_config.get("clientSecret").and_then(Value::as_str).unwrap_or("");
+    let token_url = provider_config.get("tokenURL").and_then(Value::as_str).unwrap_or("");
+    let user_info_url = provider_config.get("userInfoURL").and_then(Value::as_str).unwrap_or("");
+
+    let body_str = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}",
+        urlencoding::encode(code),
+        urlencoding::encode(&redirect_url),
+        urlencoding::encode(client_id),
+        urlencoding::encode(client_secret)
+    );
+    let body_str = if !code_verifier.is_empty() {
+        format!("{}&code_verifier={}", body_str, urlencoding::encode(code_verifier))
+    } else {
+        body_str
+    };
+
+    let mut resp = ureq::post(token_url)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send(&body_str)
+        .map_err(|e| ApiError::bad_request(format!("Failed to fetch OAuth2 token: {e}")))?;
+    let token_text = resp.body_mut().read_to_string().map_err(|e| ApiError::bad_request(format!("Failed to fetch OAuth2 token: {e}")))?;
+    let token_json: Value = serde_json::from_str(&token_text)
+        .map_err(|e| ApiError::bad_request(format!("Failed to fetch OAuth2 token: {e}")))?;
+    let access_token = token_json
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if access_token.is_empty() {
+        return Err(ApiError::bad_request("Failed to fetch OAuth2 token."));
+    }
+
+    let mut user_resp = ureq::get(user_info_url)
+        .header("Authorization", &format!("Bearer {}", access_token))
+        .call()
+        .map_err(|e| ApiError::bad_request(format!("Failed to fetch OAuth2 user: {e}")))?;
+    let user_text = user_resp.body_mut().read_to_string().map_err(|e| ApiError::bad_request(format!("Failed to fetch OAuth2 user: {e}")))?;
+    let user_json: Value = serde_json::from_str(&user_text)
+        .map_err(|e| ApiError::bad_request(format!("Failed to fetch OAuth2 user: {e}")))?;
+
+    let provider_user_id = user_json
+        .get("id")
+        .or_else(|| user_json.get("sub"))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    let email = user_json.get("email").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = user_json
+        .get("name")
+        .or_else(|| user_json.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let mut record_ref: Option<String> = None;
+    let ext_sql = "SELECT recordRef FROM _externalAuths WHERE collectionRef = ?1 AND provider = ?2 AND providerId = ?3 LIMIT 1";
+    if let Ok(rr) = conn.query_row(
+        ext_sql,
+        rusqlite::params![collection.id, provider_name, provider_user_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        record_ref = Some(rr);
+    }
+
+    let mut auth_record: Option<Record> = None;
+    if let Some(rr) = &record_ref {
+        auth_record = Record::find_by_id(&conn, &collection, rr)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+
+    if auth_record.is_none() {
+        if let Some(auth) = crate::auth::load_auth(&db, &headers) {
+            if auth.collection.id == collection.id {
+                auth_record = Some(auth.record);
+            }
+        }
+    }
+
+    if auth_record.is_none() && !email.is_empty() {
+        auth_record = Record::find_by_email(&conn, &collection, &email)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+
+    let is_new = auth_record.is_none();
+
+    if auth_record.is_none() {
+        let id = pb_core::ids::default_random_id();
+        let mut cols = vec!["id".to_string()];
+        let mut placeholders = vec!["?1".to_string()];
+        let mut params: Vec<Value> = vec![Value::String(id.clone())];
+
+        let create_data = form.get("createData").cloned().unwrap_or(Value::Null);
+        let mut fields = Map::new();
+        if let Some(obj) = create_data.as_object() {
+            for (k, v) in obj {
+                fields.insert(k.clone(), v.clone());
+            }
+        }
+        if !email.is_empty() {
+            fields.insert("email".into(), Value::String(email.clone()));
+        }
+        if !name.is_empty() {
+            for key in ["name", "username"] {
+                if collection.field_list().items().iter().any(|f| pb_core::fields::field_name(f) == key) {
+                    fields.entry(key.to_string()).or_insert(Value::String(name.clone()));
+                }
+            }
+        }
+
+        for (k, v) in &fields {
+            cols.push(k.clone());
+            placeholders.push(format!("?{}", params.len() + 1));
+            params.push(v.clone());
+        }
+        if collection.field_list().items().iter().any(|f| pb_core::fields::field_name(f) == "tokenKey") {
+            cols.push("tokenKey".into());
+            placeholders.push(format!("?{}", params.len() + 1));
+            params.push(Value::String(pb_core::ids::random_string(50)));
+        }
+        if collection.field_list().items().iter().any(|f| pb_core::fields::field_name(f) == "verified") {
+            cols.push("verified".into());
+            placeholders.push(format!("?{}", params.len() + 1));
+            params.push(Value::Bool(true));
+        }
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            pb_core::records::quote_ident(&collection.name),
+            cols.iter().map(|c| pb_core::records::quote_ident(c)).collect::<Vec<_>>().join(", "),
+            placeholders.join(", ")
+        );
+        let sql_params: Vec<rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
+        conn.execute(&sql, rusqlite::params_from_iter(sql_params))
+            .map_err(|e| ApiError::internal(format!("failed to create record: {e}")))?;
+
+        auth_record = Record::find_by_id(&conn, &collection, &id)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+
+    let auth_record = auth_record.ok_or_else(|| ApiError::internal("failed to resolve auth record"))?;
+
+    if is_new {
+        let ext_id = pb_core::ids::default_random_id();
+        conn.execute(
+            "INSERT INTO _externalAuths (id, collectionRef, recordRef, provider, providerId, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%d %H:%M:%fZ','now'), strftime('%Y-%m-%d %H:%M:%fZ','now'))",
+            rusqlite::params![ext_id, collection.id, auth_record.id(), provider_name, provider_user_id],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to create external auth: {e}")))?;
+    }
+
+    let mut meta = Map::new();
+    meta.insert("isNew".into(), Value::Bool(is_new));
+    if let Some(obj) = user_json.as_object() {
+        for (k, v) in obj {
+            meta.insert(k.clone(), v.clone());
+        }
+    }
+
+    let token = auth_token(&collection, &auth_record, true)?;
+    Ok(Json(json!({
+        "record": auth_record.to_api_json(),
+        "token": token,
+        "meta": meta,
+    })))
 }
+
 
 pub async fn with_password(
     State(db): State<Db>,
