@@ -13,6 +13,7 @@ use rusqlite::{Connection, Row};
 use serde_json::{Map, Value};
 
 use crate::collections::Collection;
+use crate::tokens;
 
 #[derive(Clone, Debug)]
 pub struct Record {
@@ -22,6 +23,57 @@ pub struct Record {
 }
 
 impl Record {
+    pub fn find_auth_record_by_token(
+        conn: &Connection,
+        token: &str,
+        valid_types: &[&str],
+    ) -> Result<Option<Self>, String> {
+        if token.is_empty() {
+            return Err("missing token".into());
+        }
+        let claims = tokens::parse_unverified(token).map_err(|e| e.to_string())?;
+        if claims.id.is_empty() || claims.collection_id.is_empty() || claims.kind.is_empty() {
+            return Err("missing or invalid token claims".into());
+        }
+        if !valid_types.is_empty() && !valid_types.contains(&claims.kind.as_str()) {
+            return Err(format!(
+                "invalid token type {:?}, expects {:?}",
+                claims.kind, valid_types
+            ));
+        }
+
+        let collection = Collection::find(conn, &claims.collection_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "missing collection".to_string())?;
+        if !collection.is_auth() {
+            return Err("the token is not associated to an auth collection record".into());
+        }
+
+        let record = Self::find_by_id(conn, &collection, &claims.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "missing record".to_string())?;
+
+        let base_secret = match claims.kind.as_str() {
+            tokens::TYPE_AUTH => collection.token_secret("authToken").unwrap_or("").to_string(),
+            tokens::TYPE_FILE => collection.token_secret("fileToken").unwrap_or("").to_string(),
+            tokens::TYPE_VERIFICATION => {
+                collection.token_secret("verificationToken").unwrap_or("").to_string()
+            }
+            tokens::TYPE_PASSWORD_RESET => {
+                collection.token_secret("passwordResetToken").unwrap_or("").to_string()
+            }
+            tokens::TYPE_EMAIL_CHANGE => {
+                collection.token_secret("emailChangeToken").unwrap_or("").to_string()
+            }
+            _ => return Err(format!("unknown token type {}", claims.kind)),
+        };
+
+        let signing_key = tokens::signing_key(record.token_key(), &base_secret);
+        tokens::parse_jwt(token, &signing_key).map_err(|e| e.to_string())?;
+
+        Ok(Some(record))
+    }
+
     pub fn id(&self) -> &str {
         self.data
             .get("id")

@@ -315,6 +315,140 @@ pub async fn auth_with_otp(
     })))
 }
 
+pub async fn request_password_reset(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    let password_auth = collection
+        .options
+        .get("passwordAuth")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !password_auth
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::bad_request(
+            "The collection is not configured to allow password authentication.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let email = form.get("email").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    validate_required_string(form.get("email"), &mut errors, "email");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let record = Record::find_by_email(&conn, &collection, email)
+        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?;
+
+    if record.is_none() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn confirm_password_reset(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let token = form.get("token").and_then(Value::as_str).unwrap_or("");
+    let password = form.get("password").and_then(Value::as_str).unwrap_or("");
+    let password_confirm = form.get("passwordConfirm").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    if token.is_empty() {
+        errors.insert("token".into(), validation_required());
+    }
+    if password.is_empty() {
+        errors.insert("password".into(), validation_required());
+    } else if password.chars().count() > 255 {
+        errors.insert("password".into(), validation_length(1, 255));
+    }
+    if password_confirm.is_empty() {
+        errors.insert("passwordConfirm".into(), validation_required());
+    } else if password_confirm != password {
+        errors.insert(
+            "passwordConfirm".into(),
+            json!({"code": "validation_values_mismatch", "message": "The values do not match."}),
+        );
+    }
+    let mut token_record: Option<pb_core::records::Record> = None;
+    if !token.is_empty() {
+        match pb_core::records::Record::find_auth_record_by_token(&conn, token, &["passwordReset"]) {
+            Ok(Some(r)) => {
+                if r.collection.id != collection.id {
+                    errors.insert(
+                        "token".into(),
+                        json!({"code": "validation_token_collection_mismatch", "message": "The provided token is for different auth collection."}),
+                    );
+                } else {
+                    token_record = Some(r);
+                }
+            }
+            _ => {
+                errors.insert(
+                    "token".into(),
+                    json!({"code": "validation_invalid_token", "message": "Invalid or expired token."}),
+                );
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let record = token_record
+        .ok_or_else(|| ApiError::bad_request("Invalid or expired password reset token."))?;
+    let hash = pb_core::record_upsert::hash_password(password, 10);
+
+    let mut new_verified = record.to_api_json().get("verified").and_then(Value::as_bool).unwrap_or(false);
+    if !new_verified {
+        if let Ok(claims) = pb_core::tokens::parse_unverified(token) {
+            if let Some(email_claim) = claims.email {
+    let rec_email = record.to_api_json();
+    let rec_email = rec_email.get("email").and_then(Value::as_str).unwrap_or("");
+    if rec_email == email_claim {
+                    new_verified = true;
+                }
+            }
+        }
+    }
+
+    conn.execute(
+        &format!(
+            "UPDATE {} SET password = ?1, verified = ?2 WHERE id = ?3",
+            pb_core::records::quote_ident(&collection.name)
+        ),
+        rusqlite::params![hash, new_verified as i64, record.id()],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update password: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn with_password(
     State(db): State<Db>,
     headers: HeaderMap,

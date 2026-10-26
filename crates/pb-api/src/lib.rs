@@ -108,6 +108,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             post(records::auth_with_otp),
         )
         .route(
+            "/collections/:collection/request-password-reset",
+            post(records::request_password_reset),
+        )
+        .route(
+            "/collections/:collection/confirm-password-reset",
+            post(records::confirm_password_reset),
+        )
+        .route(
             "/collections/:collection/auth-refresh",
             post(records::refresh),
         );
