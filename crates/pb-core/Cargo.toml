@@ -7,9 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 rand = "0.8"
 regex = "1"
 bcrypt = "0.15"
 jsonwebtoken = "9"
 rusqlite = { version = "0.32", features = ["bundled"] }
+regex-syntax = "0.8"

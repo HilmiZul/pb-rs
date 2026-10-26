@@ -8,7 +8,7 @@ license.workspace = true
 bcrypt = "0.15"
 anyhow.workspace = true
 serde.workspace = true
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 pb-core = { path = "../pb-core" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 axum = "0.7"

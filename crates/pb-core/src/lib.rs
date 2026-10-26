@@ -12,8 +12,10 @@ pub mod collection_write;
 pub mod collections;
 pub mod db;
 pub mod fields;
+pub mod go_json;
 pub mod ids;
 pub mod migrations;
+pub mod record_upsert;
 pub mod records;
 pub mod schema_sync;
 pub mod search;
@@ -22,6 +24,7 @@ pub mod settings;
 pub mod superusers;
 pub mod tokens;
 pub mod validation;
+pub mod validators;
 
 /// API version reported to clients. Must match the oracle, because the admin UI
 /// and SDKs gate features on it.

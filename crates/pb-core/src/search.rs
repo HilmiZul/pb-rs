@@ -479,6 +479,178 @@ pub struct RelationInfo {
     pub multiple: bool,
 }
 
+/// The request data that `@request.*` filter fields resolve against.
+///
+/// Mirrors `core.RequestInfo`: `Body` holds the already normalized record data
+/// (modifiers resolved), `Query` the URL query values and `Headers` the HTTP
+/// request headers (lowercased keys, like Go's `http.Header` canonical form).
+#[derive(Clone, Debug, Default)]
+pub struct RequestData {
+    pub body: serde_json::Map<String, serde_json::Value>,
+    pub query: std::collections::HashMap<String, String>,
+    pub headers: std::collections::HashMap<String, String>,
+    pub method: String,
+    pub context: String,
+}
+
+/// Field metadata used by `@request.*` resolution (numeric strings are cast).
+#[derive(Clone, Debug, Default)]
+pub struct RequestFieldTypes {
+    pub numbers: std::collections::HashSet<String>,
+}
+
+/// Replace `@request.*` identifiers with literals.
+///
+/// The filter parser keeps unknown `@request.*` names as [`Expr::Field`]; the
+/// record field resolver turns them into bound parameters. This pre-pass does
+/// the same after the parser, so both the list filter builder and the rule
+/// evaluator see plain literals.
+pub fn resolve_request_fields(
+    expr: &Expr,
+    request: &RequestData,
+    types: &RequestFieldTypes,
+) -> Result<Expr, ParseError> {
+    Ok(match expr {
+        Expr::Field(name) if name.starts_with("@request.") => {
+            let value = request_field_value(name, request, types)?;
+            match value {
+                serde_json::Value::Null => Expr::Literal(Literal::Null),
+                serde_json::Value::Bool(b) => Expr::Literal(Literal::Bool(b)),
+                serde_json::Value::Number(n) => {
+                    Expr::Literal(Literal::Number(n.as_f64().unwrap_or(0.0)))
+                }
+                serde_json::Value::String(s) => Expr::Literal(Literal::String(s)),
+                other => Expr::Literal(Literal::String(crate::go_json::marshal(&other))),
+            }
+        }
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(resolve_request_fields(a, request, types)?),
+            Box::new(resolve_request_fields(b, request, types)?),
+        ),
+        Expr::And(a, b) => Expr::And(
+            Box::new(resolve_request_fields(a, request, types)?),
+            Box::new(resolve_request_fields(b, request, types)?),
+        ),
+        Expr::Not(e) => Expr::Not(Box::new(resolve_request_fields(e, request, types)?)),
+        Expr::Cmp { left, op, right } => Expr::Cmp {
+            left: Box::new(resolve_request_fields(left, request, types)?),
+            op: *op,
+            right: Box::new(resolve_request_fields(right, request, types)?),
+        },
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| resolve_request_fields(a, request, types))
+                .collect::<Result<_, _>>()?,
+        },
+        other => other.clone(),
+    })
+}
+
+fn request_field_value(
+    name: &str,
+    request: &RequestData,
+    types: &RequestFieldTypes,
+) -> Result<serde_json::Value, ParseError> {
+    let path = name.trim_start_matches("@request.");
+    let (head, rest) = path
+        .split_once('.')
+        .ok_or_else(|| ParseError(format!("invalid request field: {name}")))?;
+    let (raw_path, modifier) = split_request_modifier(rest)?;
+
+    let found = match head {
+        "method" => Some(serde_json::Value::String(request.method.clone())),
+        "context" => Some(serde_json::Value::String(request.context.clone())),
+        "body" => extract_nested(&serde_json::Value::Object(request.body.clone()), &raw_path),
+        "query" => extract_nested_string_map(&request.query, &raw_path),
+        "headers" => {
+            let lower = raw_path.to_lowercase();
+            request
+                .headers
+                .get(&lower)
+                .map(|s| serde_json::Value::String(s.clone()))
+        }
+        _ => None,
+    };
+
+    match modifier.as_str() {
+        "isset" => return Ok(serde_json::Value::Bool(found.is_some())),
+        "lower" => {
+            let value = found.unwrap_or(serde_json::Value::Null);
+            return Ok(match value {
+                serde_json::Value::String(s) => serde_json::Value::String(s.to_lowercase()),
+                other => other,
+            });
+        }
+        "length" => {
+            let value = found.unwrap_or(serde_json::Value::Null);
+            let len = match &value {
+                serde_json::Value::String(s) => s.chars().count(),
+                serde_json::Value::Array(items) => items.len(),
+                serde_json::Value::Object(map) => map.len(),
+                _ => 0,
+            };
+            return Ok(serde_json::Value::from(len));
+        }
+        "each" => {
+            return Err(ParseError(
+                "@request.*:each is not supported in this context".into(),
+            ))
+        }
+        "" => {}
+        other => return Err(ParseError(format!("unknown modifier: {other}"))),
+    }
+
+    let Some(mut value) = found else {
+        return Ok(serde_json::Value::Null);
+    };
+
+    // numeric strings coming from form data are cast for number fields
+    if let serde_json::Value::String(s) = &value {
+        if types.numbers.contains(&raw_path) {
+            if let Ok(n) = s.parse::<f64>() {
+                value = serde_json::Value::from(n);
+            }
+        }
+    }
+
+    Ok(value)
+}
+
+fn split_request_modifier(path: &str) -> Result<(String, String), ParseError> {
+    match path.split_once(':') {
+        None => Ok((path.to_string(), String::new())),
+        Some((key, modifier)) => match modifier {
+            "isset" | "each" | "length" | "lower" | "changed" => {
+                Ok((key.to_string(), modifier.to_string()))
+            }
+            other => Err(ParseError(format!("unknown modifier: {other}"))),
+        },
+    }
+}
+
+fn extract_nested(value: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    let mut current = value;
+    for key in path.split('.') {
+        match current {
+            serde_json::Value::Object(map) => current = map.get(key)?,
+            _ => return None,
+        }
+    }
+    Some(current.clone())
+}
+
+fn extract_nested_string_map(
+    map: &std::collections::HashMap<String, String>,
+    path: &str,
+) -> Option<serde_json::Value> {
+    // URL query maps in Go are `map[string][]string`; `RequestInfo.Query` uses
+    // the first value, so a plain lookup is enough here.
+    map.get(path)
+        .map(|s| serde_json::Value::String(s.clone()))
+}
+
 /// Metadata for a collection referenced through `@collection.*`.
 #[derive(Clone, Debug, Default)]
 pub struct CollectionInfo {
@@ -1097,17 +1269,30 @@ pub fn transform_eval(
 
 /// Build a SQL expression for rule evaluation: transforms field refs to literals
 /// and returns the SQL + params. The caller executes `SELECT 1 WHERE <sql>`.
+/// Build a SQL expression for rule evaluation: substitutes `@request.*` fields,
+/// transforms record field refs to literals and returns the SQL + params.
+///
+/// The caller executes `SELECT 1 WHERE <sql>`. Parse/build failures are
+/// returned so the API layer can pick the oracle's status code.
 pub fn build_rule_sql(
     rule: &str,
     record_data: &serde_json::Map<String, serde_json::Value>,
     auth: Option<&crate::records::Record>,
-) -> Option<(String, Vec<serde_json::Value>)> {
+    request: &RequestData,
+    types: &RequestFieldTypes,
+) -> Result<Option<(String, Vec<serde_json::Value>)>, ParseError> {
     if rule.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let expr = parse(rule).ok()?;
+    let expr = parse(rule)?;
+    let expr = resolve_request_fields(&expr, request, types)?;
     let transformed = transform_eval(&expr, record_data, auth);
     let allowed: Vec<String> = Vec::new();
-    let sf = build_sql_with_auth_and_relations(&transformed, &allowed, auth, &std::collections::HashMap::new()).ok()?;
-    Some((sf.sql, sf.params))
+    let sf = build_sql_with_auth_and_relations(
+        &transformed,
+        &allowed,
+        auth,
+        &std::collections::HashMap::new(),
+    )?;
+    Ok(Some((sf.sql, sf.params)))
 }

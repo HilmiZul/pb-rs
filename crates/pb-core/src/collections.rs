@@ -98,6 +98,11 @@ impl Collection {
         self.kind == TYPE_VIEW
     }
 
+    /// `Collection.ManageRule` (auth collections only; stored in `options`).
+    pub fn manage_rule(&self) -> Option<&str> {
+        self.options.get("manageRule").and_then(Value::as_str)
+    }
+
     /// The stored `fields` array as a `FieldsList`.
     pub fn field_list(&self) -> crate::fields::FieldsList {
         crate::fields::FieldsList::from_stored(&self.fields)

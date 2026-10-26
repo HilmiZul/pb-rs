@@ -578,6 +578,312 @@ pub fn date_instant(value: &str) -> Option<i64> {
     parse_date_parts(value).map(|(instant, _)| instant)
 }
 
+// ---------------------------------------------------------------------------
+// Go `cast` / `list` helpers used by record normalization
+// ---------------------------------------------------------------------------
+
+/// `strconv.FormatFloat(f, 'f', -1, 64)` (never exponent notation).
+pub fn format_float_fixed(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_negative() { "-Inf" } else { "+Inf" }.to_string();
+    }
+    format!("{f}")
+}
+
+/// `cast.ToString` for the values that come out of a JSON body.
+pub fn cast_to_string(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.as_f64().map(format_float_fixed).unwrap_or_default(),
+        Value::String(s) => s.clone(),
+        // Go's cast returns an error for arrays/maps, which callers ignore.
+        Value::Array(_) | Value::Object(_) => String::new(),
+    }
+}
+
+/// `cast.ToFloat64`.
+pub fn cast_to_f64(value: &Value) -> f64 {
+    match value {
+        Value::Null => 0.0,
+        Value::Bool(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(s) => {
+            if s.is_empty() {
+                0.0
+            } else {
+                s.parse::<f64>().unwrap_or(0.0)
+            }
+        }
+        Value::Array(_) | Value::Object(_) => 0.0,
+    }
+}
+
+/// `cast.ToBool`.
+pub fn cast_to_bool(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => matches!(
+            s.as_str(),
+            "1" | "t" | "T" | "TRUE" | "true" | "True" | "0" | "f" | "F" | "FALSE" | "false"
+                | "False"
+        ) && !matches!(s.as_str(), "0" | "f" | "F" | "FALSE" | "false" | "False"),
+        Value::Array(_) | Value::Object(_) => false,
+    }
+}
+
+/// `list.ToUniqueStringSlice` (non-zero unique, order preserved).
+pub fn unique_string_slice(value: &Value) -> Vec<String> {
+    let raw: Vec<String> = match value {
+        Value::Null => Vec::new(),
+        Value::String(s) => {
+            if s.is_empty() {
+                Vec::new()
+            } else if s.contains('[') {
+                match serde_json::from_str::<Vec<String>>(s) {
+                    Ok(items) => items,
+                    Err(_) => vec![s.clone()],
+                }
+            } else {
+                vec![s.clone()]
+            }
+        }
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                if matches!(item, Value::Array(_) | Value::Object(_)) {
+                    // `cast.ToStringSlice` fails as a whole.
+                    return Vec::new();
+                }
+                out.push(cast_to_string(item));
+            }
+            out
+        }
+        Value::Object(_) => Vec::new(),
+        other => vec![cast_to_string(other)],
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect()
+}
+
+/// `FileField.toSliceValue`: flatten one-element nested arrays.
+pub fn file_slice_value(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                let casted = file_slice_value(item);
+                if casted.len() == 1 {
+                    out.push(casted[0].clone());
+                }
+            }
+            out
+        }
+        other => unique_string_slice(other),
+    }
+}
+
+/// `strconv.Quote` (used by `JSONField.PrepareValue`).
+pub fn go_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x0b' => out.push_str("\\v"),
+            c if is_go_print(c) => out.push(c),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Approximation of Go's `strconv.IsPrint`.
+fn is_go_print(ch: char) -> bool {
+    if ch == ' ' {
+        return true;
+    }
+    if ch.is_ascii() {
+        return ch.is_ascii_graphic();
+    }
+    !ch.is_control()
+}
+
+/// `is.JSON.Validate`: `json.Unmarshal` into a `RawMessage`.
+pub fn is_valid_json(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_ok()
+}
+
+/// `JSONField.PrepareValue` -> `types.JSONRaw` text.
+pub fn prepare_json_raw(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(s) => {
+            if s.is_empty() {
+                go_quote(s)
+            } else if s == "null" || s == "true" || s == "false" {
+                s.clone()
+            } else {
+                let first = s.chars().next().unwrap_or('\0');
+                let json_like = first.is_ascii_digit()
+                    || first == '-'
+                    || first == '"'
+                    || first == '['
+                    || first == '{';
+                if json_like && is_valid_json(s) {
+                    s.clone()
+                } else {
+                    go_quote(s)
+                }
+            }
+        }
+        other => crate::go_json::marshal(other),
+    }
+}
+
+/// `GeoPoint.Scan`: only object notation with numeric (or missing) lon/lat is
+/// accepted; everything else collapses to the zero point.
+pub fn geo_point(value: &Value) -> (f64, f64) {
+    fn number(value: Option<&Value>) -> Option<f64> {
+        match value {
+            None | Some(Value::Null) => Some(0.0),
+            Some(Value::Number(n)) => n.as_f64(),
+            _ => None,
+        }
+    }
+
+    let object = match value {
+        Value::Object(obj) => obj,
+        Value::String(s) => {
+            if s.is_empty() {
+                return (0.0, 0.0);
+            }
+            match serde_json::from_str::<Value>(s) {
+                Ok(Value::Object(obj)) => {
+                    // Borrowed value cannot outlive this branch; handle below.
+                    let lon = number(obj.get("lon"));
+                    let lat = number(obj.get("lat"));
+                    return match (lon, lat) {
+                        (Some(lon), Some(lat)) => (lon, lat),
+                        _ => (0.0, 0.0),
+                    };
+                }
+                _ => return (0.0, 0.0),
+            }
+        }
+        _ => return (0.0, 0.0),
+    };
+
+    match (number(object.get("lon")), number(object.get("lat"))) {
+        (Some(lon), Some(lat)) => (lon, lat),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// Format milliseconds since the epoch as `types.DefaultDateLayout`.
+pub fn format_date_millis(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}Z",
+        y,
+        m,
+        d,
+        rem / 3_600_000,
+        (rem % 3_600_000) / 60_000,
+        (rem % 60_000) / 1_000,
+        rem % 1_000
+    )
+}
+
+/// `types.NowDateTime()`.
+pub fn now_date_time() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format_date_millis(now.as_millis() as i64)
+}
+
+/// Go's `time.Time.String()` in UTC (`2024-01-02 03:04:05.123 +0000 UTC`).
+pub fn go_time_string(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    let mut out = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3_600_000,
+        (rem % 3_600_000) / 60_000,
+        (rem % 60_000) / 1_000
+    );
+    let millis = rem % 1_000;
+    if millis != 0 {
+        let mut frac = format!("{millis:03}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        out.push('.');
+        out.push_str(&frac);
+    }
+    out.push_str(" +0000 UTC");
+    out
+}
+
+/// Go's `json.Marshal(time.Time)`: RFC3339 with trailing fractional zeros
+/// removed.
+pub fn go_time_rfc3339(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    let mut out = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3_600_000,
+        (rem % 3_600_000) / 60_000,
+        (rem % 60_000) / 1_000
+    );
+    let millis = rem % 1_000;
+    if millis != 0 {
+        let mut frac = format!("{millis:03}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        out.push('.');
+        out.push_str(&frac);
+    }
+    out.push('Z');
+    out
+}
+
 /// `Field.IsMultiple` for the multi-valued field types.
 pub fn is_multiple(field: &Value) -> bool {
     matches!(field_type(field), "select" | "file" | "relation") && field_i64(field, "maxSelect") > 1

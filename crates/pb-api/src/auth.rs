@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use crate::error::ApiError;
 
 /// Everything a handler needs about the authenticated record.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AuthContext {
     pub record: Record,
     pub collection: Collection,
