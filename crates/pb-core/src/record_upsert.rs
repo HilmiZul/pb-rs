@@ -506,7 +506,33 @@ impl RecordModel {
         for key in keys {
             if let Some(field_name) = record_copy.set_if_field_exists(key, &data[key]) {
                 data_copy.remove(key);
-                data_copy.insert(field_name.clone(), record_copy.get_json(&field_name));
+                // `Record.Get` returns `types.JSONRaw` for JSON fields and a
+                // plain `float64` for numbers; both must survive the roundtrip
+                // unchanged so that later `Load` sees the same raw value
+                // (JSON text whitespace is preserved, NaN/Inf stay invalid).
+                let value = match find_field(&self.collection, &field_name) {
+                    Some(field) if field_type(field) == "json" => {
+                        match record_copy.get_raw(&field_name) {
+                            Some(FieldValue::Json(raw)) if !raw.is_empty() => {
+                                Value::String(raw)
+                            }
+                            _ => Value::Null,
+                        }
+                    }
+                    Some(field) if field_type(field) == "number" => {
+                        match record_copy.get_raw(&field_name) {
+                            Some(FieldValue::Number(f)) if f.is_nan() => {
+                                Value::String("NaN".to_string())
+                            }
+                            Some(FieldValue::Number(f)) if f.is_infinite() => {
+                                Value::String(if f > 0.0 { "+Inf" } else { "-Inf" }.to_string())
+                            }
+                            _ => record_copy.get_json(&field_name),
+                        }
+                    }
+                    _ => record_copy.get_json(&field_name),
+                };
+                data_copy.insert(field_name, value);
             }
         }
         data_copy
