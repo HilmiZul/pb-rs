@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bcrypt = "0.15"
 anyhow.workspace = true
 serde.workspace = true
 serde_json = { version = "1", features = ["preserve_order"] }

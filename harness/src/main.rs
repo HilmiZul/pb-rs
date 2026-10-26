@@ -63,6 +63,11 @@ struct Request {
     path: String,
     #[serde(default)]
     body: Option<String>,
+    /// Query parameters, percent-encoded by the harness. Prefer this over
+    /// embedding `?filter=...` in `path`: filter expressions contain spaces
+    /// and `&` that must be encoded as a single value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: BTreeMap<String, String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     /// Extract values from the JSON response for use in later requests.
@@ -83,6 +88,37 @@ struct Recorded {
 ///
 /// Order matters: longer, more specific patterns first, so that e.g. a JWT is
 /// not partially rewritten by the id rule.
+/// JSON responses are re-serialized with sorted keys: Go map marshaling has a
+/// deliberately random key order, so raw byte comparison would be flaky.
+fn sort_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                let value = map.get(&key).cloned().unwrap_or(serde_json::Value::Null);
+                out.insert(key, sort_json(value));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sort_json).collect())
+        }
+        other => other,
+    }
+}
+
+fn normalize_body(raw: &str, content_type: &str) -> String {
+    let normalized = normalize(raw);
+    if content_type.split(';').next().unwrap_or("").trim() == "application/json" {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&normalized) {
+            return serde_json::to_string(&sort_json(value)).unwrap_or(normalized);
+        }
+    }
+    normalized
+}
+
 fn normalize(input: &str) -> String {
     // JWTs (`header.payload.signature`).
     let jwt = Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
@@ -121,6 +157,20 @@ fn lookup<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json
     Some(cur)
 }
 
+/// Percent-encode a query key or value (RFC 3986 unreserved characters kept).
+fn urlencode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn record(base: &str, scenario_path: &Path, out: &Path) -> Result<()> {
     let raw = fs::read_to_string(scenario_path)
         .with_context(|| format!("read scenario {}", scenario_path.display()))?;
@@ -133,7 +183,22 @@ fn record(base: &str, scenario_path: &Path, out: &Path) -> Result<()> {
 
     for req in &scenario.requests {
         let path = substitute(&req.path, &vars);
-        let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let mut url = format!("{}{}", base.trim_end_matches('/'), path);
+        if !req.query.is_empty() {
+            let qs: Vec<String> = req
+                .query
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        urlencode(&substitute(k, &vars)),
+                        urlencode(&substitute(v, &vars))
+                    )
+                })
+                .collect();
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str(&qs.join("&"));
+        }
         let mut call = ureq::request(&req.method, &url);
         for (k, v) in &req.headers {
             call = call.set(k, &substitute(v, &vars));
@@ -190,7 +255,7 @@ fn record(base: &str, scenario_path: &Path, out: &Path) -> Result<()> {
             },
             status,
             content_type: content_type.split(';').next().unwrap_or("").trim().to_string(),
-            body: normalize(&raw_body),
+            body: normalize_body(&raw_body, &content_type),
         };
         let file = dir.join(format!("{}.json", sanitize(&req.name)));
         fs::write(&file, serde_json::to_string_pretty(&recorded)?)?;

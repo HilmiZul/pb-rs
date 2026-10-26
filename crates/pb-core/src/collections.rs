@@ -172,7 +172,7 @@ impl Collection {
     }
 
     /// Field name -> field type, in declaration order.
-    pub fn field_types(&self) -> Vec<(String, String)> {
+    pub fn field_types(&self) -> Vec<(String, String, bool)> {
         self.fields
             .as_array()
             .map(|fields| {
@@ -182,6 +182,7 @@ impl Collection {
                         Some((
                             f.get("name")?.as_str()?.to_string(),
                             f.get("type")?.as_str()?.to_string(),
+                            crate::fields::is_multiple(f),
                         ))
                     })
                     .collect()

@@ -103,8 +103,7 @@ impl Record {
         collection: &Collection,
         email: &str,
     ) -> Result<Option<Self>> {
-        // The oracle lowercases emails on save and looks them up case-insensitively.
-        Self::find_one(conn, collection, "email", &email.to_lowercase())
+        Self::find_one(conn, collection, "email", email)
     }
 
     fn find_one(
@@ -159,14 +158,13 @@ impl Record {
 fn column_to_json(
     name: &str,
     raw: rusqlite::types::ValueRef<'_>,
-    types: &[(String, String)],
+    types: &[(String, String, bool)],
 ) -> Result<Value> {
     use rusqlite::types::ValueRef;
 
-    let field_type = types
-        .iter()
-        .find(|(field, _)| field == name)
-        .map(|(_, t)| t.as_str());
+    let field = types.iter().find(|(field, _, _)| field == name);
+    let field_type = field.map(|(_, t, _)| t.as_str());
+    let multiple = field.map(|(_, _, m)| *m).unwrap_or(false);
 
     let value = match raw {
         ValueRef::Null => Value::Null,
@@ -179,9 +177,16 @@ fn column_to_json(
             .unwrap_or(Value::Null),
         ValueRef::Text(bytes) => {
             let text = std::str::from_utf8(bytes).context("column is not valid utf-8")?;
-            match field_type {
-                Some("json") => serde_json::from_str(text).unwrap_or(Value::Null),
-                _ => Value::String(text.to_string()),
+            let is_json = matches!(field_type, Some("json") | Some("geoPoint"))
+                || (multiple
+                    && matches!(
+                        field_type,
+                        Some("select") | Some("file") | Some("relation")
+                    ));
+            if is_json {
+                serde_json::from_str(text).unwrap_or(Value::Null)
+            } else {
+                Value::String(text.to_string())
             }
         }
         ValueRef::Blob(bytes) => Value::String(hex(bytes)),
@@ -195,6 +200,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Quote a SQLite identifier.
+/// Mirrors `core.GenerateDefaultRandomId` (15 chars from `[a-z0-9]`).
+pub fn generate_id() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..15)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

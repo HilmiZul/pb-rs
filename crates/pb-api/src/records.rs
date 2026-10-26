@@ -6,7 +6,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
 use pb_core::collections::Collection;
 use pb_core::records::Record;
@@ -328,7 +328,6 @@ fn bearer(value: &str) -> Option<HeaderValue> {
 // ---------------------------------------------------------------------------
 
 use axum::extract::Query;
-use axum::http::StatusCode;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -427,12 +426,19 @@ pub async fn list(
         let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
         let auth_record = auth.as_ref().map(|a| a.record.clone());
         // Build relation field -> table name map for traversal.
-        let mut relations: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut relations: std::collections::HashMap<String, search::RelationInfo> =
+            std::collections::HashMap::new();
         for f in collection.field_list().items() {
             if pb_core::fields::field_type(f) == "relation" {
                 let coll_id = pb_core::fields::field_str(f, "collectionId");
                 if let Ok(Some(c)) = Collection::find(&conn, coll_id) {
-                    relations.insert(pb_core::fields::field_name(f).to_string(), c.name.clone());
+                    relations.insert(
+                        pb_core::fields::field_name(f).to_string(),
+                        search::RelationInfo {
+                            table: c.name.clone(),
+                            multiple: pb_core::fields::is_multiple(f),
+                        },
+                    );
                 }
             }
         }
@@ -451,12 +457,19 @@ pub async fn list(
         let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
         let auth_record = auth.as_ref().map(|a| a.record.clone());
         // Build relation field -> table name map for traversal.
-        let mut relations: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut relations: std::collections::HashMap<String, search::RelationInfo> =
+            std::collections::HashMap::new();
         for f in collection.field_list().items() {
             if pb_core::fields::field_type(f) == "relation" {
                 let coll_id = pb_core::fields::field_str(f, "collectionId");
                 if let Ok(Some(c)) = Collection::find(&conn, coll_id) {
-                    relations.insert(pb_core::fields::field_name(f).to_string(), c.name.clone());
+                    relations.insert(
+                        pb_core::fields::field_name(f).to_string(),
+                        search::RelationInfo {
+                            table: c.name.clone(),
+                            multiple: pb_core::fields::is_multiple(f),
+                        },
+                    );
                 }
             }
         }
@@ -496,107 +509,9 @@ pub async fn list(
         records.push(rec.to_api_json());
     }
 
-    // Expand: supports single and nested levels (author.posts.comments).
+    // Expand (single and nested levels).
     let expand_param = params.expand.clone().unwrap_or_default();
-    if !expand_param.is_empty() {
-        let expands: Vec<&str> = expand_param.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        // Build a tree: top-level field -> list of nested expand paths.
-        let mut tree: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-        for e in &expands {
-            let parts: Vec<&str> = e.split('.').collect();
-            let top = parts[0].to_string();
-            let rest = if parts.len() > 1 {
-                parts[1..].join(".")
-            } else {
-                String::new()
-            };
-            tree.entry(top.clone()).or_default();
-            if !rest.is_empty() {
-                tree.get_mut(&top).unwrap().push(rest);
-            }
-        }
-
-        fn expand_record(
-            conn: &rusqlite::Connection,
-            collection: &Collection,
-            rec: &mut Value,
-            tree: &std::collections::BTreeMap<String, Vec<String>>,
-        ) {
-            let mut expand_obj = Map::new();
-            if let Some(obj) = rec.as_object_mut() {
-                for (field_name, nested) in tree {
-                    let rel_field = {
-                        let fl = collection.field_list();
-                        fl.items().iter().find(|f| {
-                            pb_core::fields::field_name(f) == field_name
-                                && pb_core::fields::field_type(f) == "relation"
-                        }).cloned()
-                    };
-                    let rel_field = match rel_field {
-                        Some(f) => f,
-                        None => continue,
-                    };
-                    let coll_id = pb_core::fields::field_str(&rel_field, "collectionId");
-                    let rel_coll = match Collection::find(conn, coll_id) {
-                        Ok(Some(c)) => c,
-                        _ => continue,
-                    };
-                    let is_multiple = pb_core::fields::is_multiple(&rel_field);
-                    let val = obj.get(field_name).cloned().unwrap_or(Value::Null);
-
-                    // Build nested tree for children.
-                    let mut child_tree: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-                    for n in nested {
-                        let parts: Vec<&str> = n.split('.').collect();
-                        let top = parts[0].to_string();
-                        let rest = if parts.len() > 1 { parts[1..].join(".") } else { String::new() };
-                        child_tree.entry(top.clone()).or_default();
-                        if !rest.is_empty() {
-                            child_tree.get_mut(&top).unwrap().push(rest);
-                        }
-                    }
-
-                    if is_multiple {
-                        let ids: Vec<String> = val.as_array()
-                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                            .unwrap_or_default();
-                        let mut rels = Vec::new();
-                        for rid in &ids {
-                            if let Ok(Some(mut r)) = Record::find_by_id(conn, &rel_coll, rid) {
-                                let mut rv = r.to_api_json();
-                                if !child_tree.is_empty() {
-                                    expand_record(conn, &rel_coll, &mut rv, &child_tree);
-                                }
-                                rels.push(rv);
-                            }
-                        }
-                        expand_obj.insert(field_name.clone(), Value::Array(rels));
-                    } else if let Some(rid) = val.as_str() {
-                        if !rid.is_empty() {
-                            if let Ok(Some(mut r)) = Record::find_by_id(conn, &rel_coll, rid) {
-                                let mut rv = r.to_api_json();
-                                if !child_tree.is_empty() {
-                                    expand_record(conn, &rel_coll, &mut rv, &child_tree);
-                                }
-                                expand_obj.insert(field_name.clone(), rv);
-                            }
-                        }
-                    }
-                }
-                if !expand_obj.is_empty() {
-                    obj.insert("expand".into(), Value::Object(expand_obj));
-                }
-            }
-        }
-
-        let mut expanded: Vec<Value> = Vec::with_capacity(records.len());
-        for rec in &records {
-            let mut rec = rec.clone();
-            expand_record(&conn, &collection, &mut rec, &tree);
-            expanded.push(rec);
-        }
-        records = expanded;
-    }
+    apply_expand(&conn, &collection, &mut records, &expand_param);
 
     let total_pages = if per_page > 0 {
         (total + per_page - 1) / per_page
@@ -619,31 +534,143 @@ pub async fn list(
     }
     // Fields projection.
     let fields_param = params.fields.clone().unwrap_or_default();
-    if !fields_param.is_empty() {
-        let wanted: Vec<&str> = fields_param.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        let mut projected: Vec<Value> = Vec::with_capacity(records.len());
-        for rec in &records {
+    project_fields(&mut records, &fields_param);
+
+    out.insert("items".into(), Value::Array(records));
+    Ok(Json(Value::Object(out)))
+}
+
+
+/// Build a tree of expand paths (`author.mentor` -> {author: [mentor]}).
+fn build_expand_tree(expand: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut tree: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for e in expand.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = e.split('.').collect();
+        let top = parts[0].to_string();
+        let rest = if parts.len() > 1 {
+            parts[1..].join(".")
+        } else {
+            String::new()
+        };
+        tree.entry(top.clone()).or_default();
+        if !rest.is_empty() {
+            tree.get_mut(&top).unwrap().push(rest);
+        }
+    }
+    tree
+}
+
+fn expand_record(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    rec: &mut Value,
+    tree: &std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let mut expand_obj = Map::new();
+    let Some(obj) = rec.as_object_mut() else {
+        return;
+    };
+    for (field_name, nested) in tree {
+        let rel_field = {
+            let fl = collection.field_list();
+            fl.items()
+                .iter()
+                .find(|f| {
+                    pb_core::fields::field_name(f) == field_name
+                        && pb_core::fields::field_type(f) == "relation"
+                })
+                .cloned()
+        };
+        let Some(rel_field) = rel_field else {
+            continue;
+        };
+        let coll_id = pb_core::fields::field_str(&rel_field, "collectionId");
+        let Ok(Some(rel_coll)) = Collection::find(conn, coll_id) else {
+            continue;
+        };
+        let is_multiple = pb_core::fields::is_multiple(&rel_field);
+        let val = obj.get(field_name).cloned().unwrap_or(Value::Null);
+        let child_tree = build_expand_tree(&nested.join(","));
+
+        if is_multiple {
+            let ids: Vec<String> = val
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut rels = Vec::new();
+            for rid in &ids {
+                if let Ok(Some(r)) = Record::find_by_id(conn, &rel_coll, rid) {
+                    let mut rv = r.to_api_json();
+                    if !child_tree.is_empty() {
+                        expand_record(conn, &rel_coll, &mut rv, &child_tree);
+                    }
+                    rels.push(rv);
+                }
+            }
+            // An empty multi-relation produces no key at all (the oracle
+            // only adds the relation when at least one record resolved).
+            if !rels.is_empty() {
+                expand_obj.insert(field_name.clone(), Value::Array(rels));
+            }
+        } else if let Some(rid) = val.as_str() {
+            if !rid.is_empty() {
+                if let Ok(Some(r)) = Record::find_by_id(conn, &rel_coll, rid) {
+                    let mut rv = r.to_api_json();
+                    if !child_tree.is_empty() {
+                        expand_record(conn, &rel_coll, &mut rv, &child_tree);
+                    }
+                    expand_obj.insert(field_name.clone(), rv);
+                }
+            }
+        }
+    }
+    // The oracle always includes `expand` (even as `{}`) when expansion was
+    // requested for the record.
+    obj.insert("expand".into(), Value::Object(expand_obj));
+}
+
+fn apply_expand(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    records: &mut [Value],
+    expand: &str,
+) {
+    if expand.trim().is_empty() {
+        return;
+    }
+    let tree = build_expand_tree(expand);
+    for rec in records.iter_mut() {
+        expand_record(conn, collection, rec, &tree);
+    }
+}
+
+/// `fields` projection: return exactly the requested keys (including the
+/// `expand` pseudo-field only when explicitly listed).
+fn project_fields(records: &mut Vec<Value>, fields: &str) {
+    if fields.trim().is_empty() {
+        return;
+    }
+    let wanted: Vec<&str> = fields.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let projected: Vec<Value> = records
+        .iter()
+        .map(|rec| {
             let mut obj = Map::new();
             if let Some(r) = rec.as_object() {
-                // always include these
-                for k in ["collectionId", "collectionName", "id", "expand"] {
-                    if let Some(v) = r.get(k) {
-                        obj.insert(k.to_string(), v.clone());
-                    }
-                }
                 for w in &wanted {
                     if let Some(v) = r.get(*w) {
                         obj.insert(w.to_string(), v.clone());
                     }
                 }
             }
-            projected.push(Value::Object(obj));
-        }
-        records = projected;
-    }
-
-    out.insert("items".into(), Value::Array(records));
-    Ok(Json(Value::Object(out)))
+            Value::Object(obj)
+        })
+        .collect();
+    *records = projected;
 }
 
 fn quote_table(name: &str) -> String {
@@ -692,6 +719,7 @@ pub async fn view(
     State(db): State<Db>,
     headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
+    Query(params): Query<RecordsListParams>,
 ) -> Result<Json<Value>, ApiError> {
     let auth = load_auth(&db, &headers);
     let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
@@ -719,7 +747,15 @@ pub async fn view(
         }
     }
 
-    Ok(Json(record.to_api_json()))
+    let mut records = vec![record.to_api_json()];
+    apply_expand(
+        &conn,
+        &collection,
+        &mut records,
+        params.expand.as_deref().unwrap_or(""),
+    );
+    project_fields(&mut records, params.fields.as_deref().unwrap_or(""));
+    Ok(Json(records.pop().unwrap_or(Value::Null)))
 }
 
 
@@ -755,7 +791,11 @@ pub async fn create(
     let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
-    if !is_superuser && collection.update_rule.is_none() {
+    if collection.is_view() {
+        return Err(ApiError::bad_request("Unsupported collection type."));
+    }
+
+    if !is_superuser && collection.create_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
 
@@ -768,6 +808,28 @@ pub async fn create(
         }
     };
 
+    // Auth collections: validate and hash credentials (RecordUpsert).
+    let is_auth = collection.is_auth();
+    let mut password_hash: Option<String> = None;
+    let mut token_key: Option<String> = None;
+    if is_auth {
+        let mut errors = Map::new();
+        let email = payload.get("email").and_then(Value::as_str).unwrap_or("");
+        email_error(email, &mut errors);
+        let password = payload.get("password").and_then(Value::as_str).unwrap_or("");
+        let confirm = payload.get("passwordConfirm").and_then(Value::as_str);
+        password_errors(password, confirm, &mut errors);
+        if !errors.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Failed to create record.",
+                Value::Object(errors),
+            ));
+        }
+        password_hash = Some(hash_password(password));
+        token_key = Some(generate_token_key());
+    }
+
     // Build column list from collection fields + id
     let fields = collection.field_list();
     let mut columns: Vec<String> = Vec::new();
@@ -775,16 +837,11 @@ pub async fn create(
     let mut values: Vec<Value> = Vec::new();
 
     // id
-    let id = payload.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| {
-        // `r` + 14 hex chars (matches `DEFAULT ('r'||lower(hex(randomblob(7))))`).
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let mut out = String::from("r");
-        for _ in 0..14 {
-            out.push_str(&format!("{:x}", rng.gen_range(0..16u8)));
-        }
-        out
-    });
+    let id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(pb_core::records::generate_id);
 
     // Rule evaluation for non-superusers.
     if !is_superuser {
@@ -814,6 +871,21 @@ pub async fn create(
         if val.is_null() {
             val = field_default(field);
         }
+        if is_auth {
+            match name.as_str() {
+                "password" => {
+                    if let Some(hash) = &password_hash {
+                        val = Value::String(hash.clone());
+                    }
+                }
+                "tokenKey" => {
+                    if let Some(key) = &token_key {
+                        val = Value::String(key.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
         // Convert JSON to storage form
         let stored = json_to_column(&val, pb_core::fields::field_type(field));
         columns.push(name);
@@ -836,6 +908,80 @@ pub async fn create(
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::internal("created record is missing"))?;
     Ok(Json(record.to_api_json()))
+}
+
+fn valid_email(value: &str) -> bool {
+    let mut parts = value.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !value.chars().any(char::is_whitespace)
+}
+
+/// `security.PseudorandomStringWithAlphabet(50, "[a-zA-Z0-9]")`.
+fn generate_token_key() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..50)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+/// `PasswordField.Normalize` + `Set` (bcrypt, Go's `$2a$` format).
+fn hash_password(plain: &str) -> String {
+    bcrypt::hash_with_result(plain, 10)
+        .ok()
+        .map(|r| r.format_for_version(bcrypt::Version::TwoA))
+        .unwrap_or_default()
+}
+
+fn password_errors(password: &str, confirm: Option<&str>, errors: &mut Map<String, Value>) {
+    if password.is_empty() {
+        errors.insert("password".into(), validation_required());
+    } else if password.chars().count() < 8 {
+        errors.insert(
+            "password".into(),
+            json!({
+                "code": "validation_min_text_constraint",
+                "message": "Must be at least 8 character(s).",
+            }),
+        );
+    }
+    match confirm {
+        None | Some("") => {
+            errors.insert("passwordConfirm".into(), validation_required());
+        }
+        Some(value) if value != password => {
+            errors.insert(
+                "passwordConfirm".into(),
+                json!({
+                    "code": "validation_values_mismatch",
+                    "message": "Values don't match.",
+                }),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn email_error(email: &str, errors: &mut Map<String, Value>) {
+    if email.is_empty() {
+        errors.insert("email".into(), validation_required());
+    } else if !valid_email(email) {
+        errors.insert(
+            "email".into(),
+            json!({
+                "code": "validation_is_email",
+                "message": "Must be a valid email address.",
+            }),
+        );
+    }
 }
 
 fn field_default(field: &Value) -> Value {
@@ -891,6 +1037,10 @@ pub async fn update(
     let mut conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
+    if collection.is_view() {
+        return Err(ApiError::bad_request("Unsupported collection type."));
+    }
+
     if !is_superuser && collection.update_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
@@ -903,6 +1053,31 @@ pub async fn update(
             _ => return Err(ApiError::bad_request("Failed to load the submitted data due to invalid formatting.")),
         }
     };
+
+    // Auth collections: validate and hash credentials (RecordUpsert).
+    let is_auth = collection.is_auth();
+    let mut password_hash: Option<String> = None;
+    if is_auth {
+        let mut errors = Map::new();
+        if let Some(email) = payload.get("email").and_then(Value::as_str) {
+            email_error(email, &mut errors);
+        }
+        if let Some(password) = payload.get("password").and_then(Value::as_str) {
+            // An empty password on update means "leave unchanged".
+            if !password.is_empty() {
+                let confirm = payload.get("passwordConfirm").and_then(Value::as_str);
+                password_errors(password, confirm, &mut errors);
+                password_hash = Some(hash_password(password));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Failed to update record.",
+                Value::Object(errors),
+            ));
+        }
+    }
 
     // Build SET clause
     let fields = collection.field_list();
@@ -921,7 +1096,7 @@ pub async fn update(
                 }
                 let data_map: serde_json::Map<String, serde_json::Value> = data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
                 if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
-                    return Err(ApiError::bad_request("Failed to update record."));
+                    return Err(ApiError::not_found("The requested resource wasn't found."));
                 }
             }
         }
@@ -930,6 +1105,16 @@ pub async fn update(
     let mut values: Vec<Value> = Vec::new();
     for (key, val) in &payload {
         if key == "id" || key == "collectionId" || key == "collectionName" {
+            continue;
+        }
+        if is_auth && key == "password" {
+            if let Some(hash) = &password_hash {
+                sets.push(format!("{} = ?", quote_table(key)));
+                values.push(Value::String(hash.clone()));
+            }
+            continue;
+        }
+        if is_auth && key == "tokenKey" {
             continue;
         }
         // check field exists
@@ -988,6 +1173,10 @@ pub async fn delete(
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
 
+    if collection.is_view() {
+        return Err(ApiError::bad_request("Unsupported collection type."));
+    }
+
     if !is_superuser && collection.delete_rule.is_none() {
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
@@ -999,7 +1188,7 @@ pub async fn delete(
                     .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
                 let data_map: serde_json::Map<String, serde_json::Value> = existing.data.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
                 if !rule_passes(&conn, rule, &data_map, auth.as_ref().map(|a| &a.record)) {
-                    return Err(ApiError::bad_request("Failed to delete record."));
+                    return Err(ApiError::not_found("The requested resource wasn't found."));
                 }
             }
         }

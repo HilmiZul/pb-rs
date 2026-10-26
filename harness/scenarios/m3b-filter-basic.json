@@ -17,12 +17,12 @@
       "headers": {
         "authorization": "{{token}}"
       },
-      "body": "{\"type\": \"base\", \"name\": \"posts\", \"fields\": [{\"name\": \"title\", \"type\": \"text\"}, {\"name\": \"count\", \"type\": \"number\"}, {\"name\": \"active\", \"type\": \"bool\"}]}"
+      "body": "{\"type\": \"base\", \"name\": \"fposts\", \"fields\": [{\"name\": \"title\", \"type\": \"text\"}, {\"name\": \"count\", \"type\": \"number\"}, {\"name\": \"active\", \"type\": \"bool\"}]}"
     },
     {
       "name": "r1",
       "method": "POST",
-      "path": "/api/collections/posts/records",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
       },
@@ -31,7 +31,7 @@
     {
       "name": "r2",
       "method": "POST",
-      "path": "/api/collections/posts/records",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
       },
@@ -40,7 +40,7 @@
     {
       "name": "r3",
       "method": "POST",
-      "path": "/api/collections/posts/records",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
       },
@@ -49,129 +49,181 @@
     {
       "name": "f-eq",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count=5",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count=5"
       }
     },
     {
       "name": "f-ne",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count!=5",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count!=5"
       }
     },
     {
       "name": "f-gt",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count>5",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count>5"
       }
     },
     {
       "name": "f-gte",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count>=5",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count>=5"
       }
     },
     {
       "name": "f-lt",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count<10",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count<10"
       }
     },
     {
       "name": "f-lte",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count<=5",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count<=5"
       }
     },
     {
       "name": "f-contains",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=title~'ell'",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "title~'ell'"
       }
     },
     {
       "name": "f-notcontains",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=title!~'ell'",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "title!~'ell'"
       }
     },
     {
       "name": "f-and",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count=5 && active=true",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count=5 ",
+        " active": "true"
       }
     },
     {
       "name": "f-or",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=count=5 || count=10",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "count=5 || count=10"
       }
     },
     {
       "name": "f-paren",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=(count=5 || count=10) && active=true",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "(count=5 || count=10) ",
+        " active": "true"
       }
     },
     {
       "name": "f-null",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=title=null",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "title=null"
       }
     },
     {
       "name": "f-bool",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=active=true",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "active=true"
       }
     },
     {
       "name": "f-str",
       "method": "GET",
-      "path": "/api/collections/posts/records?filter=title='hello'",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "title='hello'"
       }
     },
     {
       "name": "f-sort",
       "method": "GET",
-      "path": "/api/collections/posts/records?sort=-count,title",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "sort": "-count,title"
       }
     },
     {
       "name": "f-paged",
       "method": "GET",
-      "path": "/api/collections/posts/records?page=1&perPage=2&sort=title",
+      "path": "/api/collections/fposts/records",
       "headers": {
         "authorization": "{{token}}"
+      },
+      "query": {
+        "page": "1",
+        "perPage": "2",
+        "sort": "title"
       }
     }
   ]

@@ -42,6 +42,37 @@ pub enum CmpOp {
     Lte,
     Contains,
     NotContains,
+    /// `?=` and friends: any-value match on multi-value fields.
+    AnyEq,
+    AnyNe,
+    AnyGt,
+    AnyGte,
+    AnyLt,
+    AnyLte,
+    AnyContains,
+    AnyNotContains,
+}
+
+impl CmpOp {
+    /// The underlying comparison for the `?` (any-match) variants.
+    pub fn base(self) -> CmpOp {
+        match self {
+            CmpOp::AnyEq => CmpOp::Eq,
+            CmpOp::AnyNe => CmpOp::Ne,
+            CmpOp::AnyGt => CmpOp::Gt,
+            CmpOp::AnyGte => CmpOp::Gte,
+            CmpOp::AnyLt => CmpOp::Lt,
+            CmpOp::AnyLte => CmpOp::Lte,
+            CmpOp::AnyContains => CmpOp::Contains,
+            CmpOp::AnyNotContains => CmpOp::NotContains,
+            other => other,
+        }
+    }
+
+    /// `?` operators skip the multi-match `NOT EXISTS` check.
+    pub fn is_any(self) -> bool {
+        self != self.base()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +94,14 @@ impl fmt::Display for CmpOp {
             CmpOp::Lte => "<=",
             CmpOp::Contains => "~",
             CmpOp::NotContains => "!~",
+            CmpOp::AnyEq => "?=",
+            CmpOp::AnyNe => "?!=",
+            CmpOp::AnyGt => "?>",
+            CmpOp::AnyGte => "?>=",
+            CmpOp::AnyLt => "?<",
+            CmpOp::AnyLte => "?<=",
+            CmpOp::AnyContains => "?~",
+            CmpOp::AnyNotContains => "?!~",
         };
         write!(f, "{}", s)
     }
@@ -119,6 +158,24 @@ fn lex(input: &str) -> Result<Vec<Tok>, ParseError> {
             continue;
         }
         // operators
+        if c == '?' {
+            let n = chars.get(pos + 1).copied();
+            let n2 = chars.get(pos + 2).copied();
+            let (op, len) = match (n, n2) {
+                (Some('='), _) => ("?=", 2),
+                (Some('!'), Some('=')) => ("?!=", 3),
+                (Some('!'), Some('~')) => ("?!~", 3),
+                (Some('>'), Some('=')) => ("?>=", 3),
+                (Some('>'), _) => ("?>", 2),
+                (Some('<'), Some('=')) => ("?<=", 3),
+                (Some('<'), _) => ("?<", 2),
+                (Some('~'), _) => ("?~", 2),
+                _ => return Err(ParseError("unexpected char: ?".into())),
+            };
+            out.push(Tok::Op(op.into()));
+            pos += len;
+            continue;
+        }
         if c == '!' {
             if pos + 1 < chars.len() && chars[pos + 1] == '=' {
                 out.push(Tok::Op("!=".into()));
@@ -305,6 +362,14 @@ impl Parser {
                 "<=" => Some(CmpOp::Lte),
                 "~" => Some(CmpOp::Contains),
                 "!~" => Some(CmpOp::NotContains),
+                "?=" => Some(CmpOp::AnyEq),
+                "?!=" => Some(CmpOp::AnyNe),
+                "?>" => Some(CmpOp::AnyGt),
+                "?>=" => Some(CmpOp::AnyGte),
+                "?<" => Some(CmpOp::AnyLt),
+                "?<=" => Some(CmpOp::AnyLte),
+                "?~" => Some(CmpOp::AnyContains),
+                "?!~" => Some(CmpOp::AnyNotContains),
                 _ => None,
             };
             if let Some(cmp) = cmp {
@@ -398,6 +463,13 @@ pub struct SqlFilter {
     pub params: Vec<serde_json::Value>,
 }
 
+/// Metadata for a relation field used by relation-path filters.
+#[derive(Clone, Debug)]
+pub struct RelationInfo {
+    pub table: String,
+    pub multiple: bool,
+}
+
 /// Build a SQL WHERE clause from a filter expression.
 /// `allowed_fields` is the set of valid field names (for validation).
 pub fn build_sql(expr: &Expr, allowed_fields: &[String]) -> Result<SqlFilter, ParseError> {
@@ -408,7 +480,7 @@ pub fn build_sql_with_auth_and_relations(
     expr: &Expr,
     allowed_fields: &[String],
     auth: Option<&PbRecord>,
-    relations: &std::collections::HashMap<String, String>,
+    relations: &std::collections::HashMap<String, RelationInfo>,
 ) -> Result<SqlFilter, ParseError> {
     let mut ctx = BuildCtx {
         params: Vec::new(),
@@ -432,7 +504,7 @@ struct BuildCtx<'a> {
     params: Vec<serde_json::Value>,
     allowed: &'a [String],
     auth: Option<&'a PbRecord>,
-    relations: &'a std::collections::HashMap<String, String>,
+    relations: &'a std::collections::HashMap<String, RelationInfo>,
 }
 
 fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
@@ -508,58 +580,249 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OperandKind {
+    Value,
+    EmptyString,
+    Null,
+}
+
+fn static_kind(expr: &Expr) -> OperandKind {
+    match expr {
+        Expr::Literal(Literal::Null) => OperandKind::Null,
+        Expr::Literal(Literal::String(s)) if s.is_empty() => OperandKind::EmptyString,
+        _ => OperandKind::Value,
+    }
+}
+
+/// Build an operand, remembering whether it is an empty-string/null literal so
+/// that `resolveEqualExpr`'s null-fallback rules can be reproduced.
+fn build_operand(
+    expr: &Expr,
+    ctx: &mut BuildCtx<'_>,
+) -> Result<(String, OperandKind), ParseError> {
+    let kind = static_kind(expr);
+    match kind {
+        OperandKind::Null => Ok(("NULL".into(), kind)),
+        OperandKind::EmptyString => {
+            ctx.params.push(serde_json::Value::String(String::new()));
+            Ok(("?".into(), kind))
+        }
+        OperandKind::Value => Ok((build_expr(expr, ctx)?, kind)),
+    }
+}
+
+/// `tools/search/filter.go` `resolveEqualExpr` + the simple operators.
+fn compare_sql(
+    left: &str,
+    left_kind: OperandKind,
+    op: CmpOp,
+    right: &str,
+    right_kind: OperandKind,
+) -> String {
+    let (equal_op, concat, null_expr) = match op {
+        CmpOp::Ne => ("IS NOT", "AND", "IS NOT NULL"),
+        _ => ("=", "OR", "IS NULL"),
+    };
+
+    match op {
+        CmpOp::Eq | CmpOp::Ne => match (left_kind, right_kind) {
+            (OperandKind::Null, _) | (_, OperandKind::Null) => {
+                let not = op == CmpOp::Ne;
+                if left_kind == OperandKind::Null && right_kind == OperandKind::Null {
+                    // `null = null` -> `NULL IS NULL`; `null != null` -> `NULL IS NOT NULL`.
+                    if not { "NULL IS NOT NULL".into() } else { "NULL IS NULL".into() }
+                } else if left_kind == OperandKind::Null {
+                    format!("NULL {null_expr}")
+                } else {
+                    format!("{left} {null_expr}")
+                }
+            }
+            (OperandKind::EmptyString, OperandKind::EmptyString) => {
+                format!("'' {equal_op} ''")
+            }
+            (OperandKind::EmptyString, _) => format!(
+                "('' {equal_op} {right} {concat} {right} {null_expr})"
+            ),
+            (_, OperandKind::EmptyString) => format!(
+                "({left} {equal_op} '' {concat} {left} {null_expr})"
+            ),
+            _ => format!("{left} {equal_op} {right}"),
+        },
+        CmpOp::Gt => format!("{left} > {right}"),
+        CmpOp::Gte => format!("{left} >= {right}"),
+        CmpOp::Lt => format!("{left} < {right}"),
+        CmpOp::Lte => format!("{left} <= {right}"),
+        // LIKE is built by `like_sql`.
+        CmpOp::Contains | CmpOp::NotContains => unreachable!(),
+        _ => unreachable!(),
+    }
+}
+
+/// `tools/search/filter.go` `containsUnescapedChar`.
+fn contains_unescaped_percent(s: &str) -> bool {
+    let mut prev = '\0';
+    for c in s.chars() {
+        if c == '%' && prev != '\\' {
+            return true;
+        }
+        if c == '\\' && prev == '\\' {
+            prev = '\0';
+        } else {
+            prev = c;
+        }
+    }
+    false
+}
+
+/// `tools/search/filter.go` `escapeUnescapedChars`.
+fn escape_unescaped_chars(s: &str, escape_chars: &[char]) -> String {
+    let rs: Vec<char> = s.chars().collect();
+    let mut result: Vec<char> = Vec::with_capacity(rs.len());
+    let mut matched = false;
+
+    for i in (0..rs.len()).rev() {
+        if matched {
+            if rs[i] != '\\' {
+                result.push('\\');
+            }
+            matched = false;
+        } else if escape_chars.contains(&rs[i]) {
+            matched = true;
+        }
+        result.push(rs[i]);
+        if i == 0 && matched {
+            result.push('\\');
+        }
+    }
+    result.reverse();
+    result.into_iter().collect()
+}
+
+/// `tools/search/filter.go` `wrapLikeParams`.
+fn wrap_like_param(s: &str) -> String {
+    if contains_unescaped_percent(s) {
+        s.to_string()
+    } else {
+        format!("%{}%", escape_unescaped_chars(s, &['\\', '%', '_']))
+    }
+}
+
+/// Build `left LIKE/Not LIKE right ESCAPE '\'` with PB's param wrapping.
+fn like_sql(
+    left: &str,
+    right: &Expr,
+    ctx: &mut BuildCtx<'_>,
+    negate: bool,
+) -> Result<String, ParseError> {
+    let before = ctx.params.len();
+    let r = build_expr(right, ctx)?;
+    let keyword = if negate { "NOT LIKE" } else { "LIKE" };
+    if ctx.params.len() > before {
+        for p in &mut ctx.params[before..] {
+            if let Some(text) = p.as_str() {
+                *p = serde_json::Value::String(wrap_like_param(text));
+            }
+        }
+        Ok(format!("{left} {keyword} {r} ESCAPE '\\'"))
+    } else {
+        Ok(format!("{left} {keyword} ('%' || {r} || '%') ESCAPE '\\'"))
+    }
+}
+
+/// Comparison of a related record's column (`__pb_rel.<sub>`).
+fn relation_cmp_sql(
+    rel_alias: &str,
+    sub: &str,
+    op: CmpOp,
+    right: &Expr,
+    ctx: &mut BuildCtx<'_>,
+) -> Result<String, ParseError> {
+    let left = format!("{}.{}", rel_alias, crate::records::quote_ident(sub));
+    match op {
+        CmpOp::Contains | CmpOp::NotContains => {
+            like_sql(&left, right, ctx, op == CmpOp::NotContains)
+        }
+        _ => {
+            let (r, kind) = build_operand(right, ctx)?;
+            Ok(compare_sql(&left, OperandKind::Value, op, &r, kind))
+        }
+    }
+}
+
 fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
+    let any = op.is_any();
+    let base = op.base();
+
     // Relation traversal: `relfield.subfield <op> value`.
     if let Expr::Field(name) = left {
         if let Some((field, sub)) = name.split_once('.') {
             if !ctx.allowed.iter().any(|f| f == field) && field != "id" {
                 return Err(ParseError(format!("unknown field: {name}")));
             }
-            if let Some(rel_table) = ctx.relations.get(field).cloned() {
-                let r = build_expr(right, ctx)?;
-                let cmp_expr = match op {
-                    CmpOp::Eq => format!("{} = {}", crate::records::quote_ident(sub), r),
-                    CmpOp::Ne => format!("{} != {}", crate::records::quote_ident(sub), r),
-                    CmpOp::Gt => format!("{} > {}", crate::records::quote_ident(sub), r),
-                    CmpOp::Gte => format!("{} >= {}", crate::records::quote_ident(sub), r),
-                    CmpOp::Lt => format!("{} < {}", crate::records::quote_ident(sub), r),
-                    CmpOp::Lte => format!("{} <= {}", crate::records::quote_ident(sub), r),
-                    CmpOp::Contains => format!(
-                        "{} LIKE '%' || {} || '%'",
-                        crate::records::quote_ident(sub),
-                        r
-                    ),
-                    CmpOp::NotContains => format!(
-                        "{} NOT LIKE '%' || {} || '%'",
-                        crate::records::quote_ident(sub),
-                        r
-                    ),
+            if let Some(info) = ctx.relations.get(field).cloned() {
+                // `rel.id` on a single relation is a direct column comparison.
+                if sub == "id" && !info.multiple {
+                    let left_sql = crate::records::quote_ident(field);
+                    let left_kind = OperandKind::Value;
+                    return match base {
+                        CmpOp::Contains | CmpOp::NotContains => {
+                            like_sql(&left_sql, right, ctx, base == CmpOp::NotContains)
+                        }
+                        _ => {
+                            let (r, kind) = build_operand(right, ctx)?;
+                            Ok(compare_sql(&left_sql, left_kind, base, &r, kind))
+                        }
+                    };
+                }
+
+                let from = if info.multiple {
+                    format!(
+                        "(SELECT 1) AS __pb_one LEFT JOIN json_each({field}) AS __pb_je ON 1 \
+                         LEFT JOIN {table} AS __pb_rel ON __pb_rel.id = __pb_je.value",
+                        field = crate::records::quote_ident(field),
+                        table = crate::records::quote_ident(&info.table),
+                    )
+                } else {
+                    format!(
+                        "(SELECT 1) AS __pb_one LEFT JOIN {table} AS __pb_rel ON __pb_rel.id = {field}",
+                        table = crate::records::quote_ident(&info.table),
+                        field = crate::records::quote_ident(field),
+                    )
                 };
-                return Ok(format!(
-                    "{} IN (SELECT id FROM {} WHERE {})",
-                    crate::records::quote_ident(field),
-                    crate::records::quote_ident(&rel_table),
-                    cmp_expr
-                ));
+
+                let outer_cmp = relation_cmp_sql("__pb_rel", sub, base, right, ctx)?;
+                let mut sql = format!("EXISTS (SELECT 1 FROM {from} WHERE {outer_cmp})");
+
+                // PB's multi-match check: no related value may fail the
+                // comparison. Only plain (non-`?`) operators get this.
+                if info.multiple && !any {
+                    let inner_cmp = relation_cmp_sql("__pb_rel2", sub, base, right, ctx)?;
+                    let from2 = format!(
+                        "(SELECT 1) AS __pb_one2 LEFT JOIN json_each({field}) AS __pb_je2 ON 1 \
+                         LEFT JOIN {table} AS __pb_rel2 ON __pb_rel2.id = __pb_je2.value",
+                        field = crate::records::quote_ident(field),
+                        table = crate::records::quote_ident(&info.table),
+                    );
+                    sql = format!(
+                        "({sql} AND NOT EXISTS (SELECT 1 FROM {from2} WHERE NOT ({inner_cmp})))"
+                    );
+                }
+                return Ok(sql);
             }
         }
     }
 
-    // Handle null comparisons
-    if let Expr::Literal(Literal::Null) = right {
-        let l = build_expr(left, ctx)?;
-        return Ok(match op {
-            CmpOp::Eq => format!("{} IS NULL", l),
-            CmpOp::Ne => format!("{} IS NOT NULL", l),
-            _ => format!("{} {} NULL", l, op),
-        });
-    }
+    let left_kind = static_kind(left);
     let l = build_expr(left, ctx)?;
-    let r = build_expr(right, ctx)?;
-    match op {
-        CmpOp::Contains => Ok(format!("{} LIKE '%' || {} || '%'", l, r)),
-        CmpOp::NotContains => Ok(format!("{} NOT LIKE '%' || {} || '%'", l, r)),
-        _ => Ok(format!("{} {} {}", l, op, r)),
+    match base {
+        CmpOp::Contains | CmpOp::NotContains => {
+            like_sql(&l, right, ctx, base == CmpOp::NotContains)
+        }
+        _ => {
+            let (r, kind) = build_operand(right, ctx)?;
+            Ok(compare_sql(&l, left_kind, base, &r, kind))
+        }
     }
 }
 
