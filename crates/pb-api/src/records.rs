@@ -359,6 +359,88 @@ fn find_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Coll
         .ok_or_else(|| ApiError::not_found("Missing collection context."))
 }
 
+/// Everything the filter SQL builder needs: allowed field names, relation
+/// targets of the base collection, and metadata for `@collection.*` references.
+struct FilterContext {
+    allowed: Vec<String>,
+    relations: std::collections::HashMap<String, search::RelationInfo>,
+    collections: std::collections::HashMap<String, search::CollectionInfo>,
+}
+
+fn filter_context(conn: &rusqlite::Connection, collection: &Collection) -> FilterContext {
+    use std::collections::HashMap;
+
+    let allowed: Vec<String> = collection
+        .field_list()
+        .items()
+        .iter()
+        .map(|f| pb_core::fields::field_name(f).to_string())
+        .chain(std::iter::once("id".to_string()))
+        .collect();
+
+    let all = Collection::load_all(conn).unwrap_or_default();
+    let by_id: HashMap<&str, &Collection> =
+        all.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let relations_for = |c: &Collection| {
+        let mut relations: HashMap<String, search::RelationInfo> = HashMap::new();
+        for f in c.field_list().items() {
+            if pb_core::fields::field_type(f) == "relation" {
+                let coll_id = pb_core::fields::field_str(f, "collectionId");
+                if let Some(target) = by_id.get(coll_id) {
+                    relations.insert(
+                        pb_core::fields::field_name(f).to_string(),
+                        search::RelationInfo {
+                            table: target.name.clone(),
+                            multiple: pb_core::fields::is_multiple(f),
+                        },
+                    );
+                }
+            }
+        }
+        relations
+    };
+
+    let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
+    for c in &all {
+        let info = search::CollectionInfo {
+            table: c.name.clone(),
+            fields: c
+                .field_list()
+                .items()
+                .iter()
+                .map(|f| pb_core::fields::field_name(f).to_string())
+                .collect(),
+            relations: relations_for(c),
+        };
+        collections.insert(c.name.clone(), info.clone());
+        collections.insert(c.id.clone(), info);
+    }
+
+    FilterContext {
+        allowed,
+        relations: relations_for(collection),
+        collections,
+    }
+}
+
+fn build_filter_sql(
+    ctx: &FilterContext,
+    filter: &str,
+    auth: Option<&Record>,
+) -> Result<search::SqlFilter, ApiError> {
+    let expr = search::parse(filter)
+        .map_err(|_| ApiError::bad_request("Something went wrong while processing your request."))?;
+    search::build_sql_full(
+        &expr,
+        &ctx.allowed,
+        auth,
+        &ctx.relations,
+        &ctx.collections,
+    )
+    .map_err(|_| ApiError::bad_request("Something went wrong while processing your request."))
+}
+
 /// `GET /api/collections/{collection}/records`
 pub async fn list(
     State(db): State<Db>,
@@ -383,99 +465,32 @@ pub async fn list(
     let sort = params.sort.clone().unwrap_or_default();
     let order_clause = build_order(&collection, &sort);
 
-    // Filter
+    // Filter + collection list rule.
     let filter = params.filter.clone().unwrap_or_default();
+    let auth_record = auth.as_ref().map(|a| a.record.clone());
+    let mut clauses: Vec<String> = Vec::new();
+    let mut filter_params: Vec<serde_json::Value> = Vec::new();
 
-    // Apply collection list rule for non-superusers.
-    let mut rule_filter = String::new();
-    let mut rule_params: Vec<serde_json::Value> = Vec::new();
     if !is_superuser {
         if let Some(rule) = &collection.list_rule {
             if !rule.is_empty() {
-                let allowed: Vec<String> = collection
-                    .field_list()
-                    .items()
-                    .iter()
-                    .map(|f| pb_core::fields::field_name(f).to_string())
-                    .chain(std::iter::once("id".to_string()))
-                    .collect();
-                if let Ok(expr) = search::parse(rule) {
-                    if let Ok(sf) = search::build_sql_with_auth(&expr, &allowed, auth.as_ref().map(|a| &a.record)) {
-                        rule_filter = sf.sql;
-                        rule_params = sf.params;
-                    }
-                }
+                let fctx = filter_context(&conn, &collection);
+                let sf = build_filter_sql(&fctx, rule, auth_record.as_ref())?;
+                clauses.push(sf.sql);
+                filter_params.extend(sf.params);
             }
         }
     }
-
-    let (where_clause, filter_params) = if filter.trim().is_empty() && rule_filter.is_empty() {
-        (String::new(), Vec::new())
-    } else if filter.trim().is_empty() {
-        // only rule filter
-        (format!("WHERE {}", rule_filter), rule_params)
-    } else if rule_filter.is_empty() {
-        // only user filter
-        let allowed: Vec<String> = collection
-            .field_list()
-            .items()
-            .iter()
-            .map(|f| pb_core::fields::field_name(f).to_string())
-            .chain(std::iter::once("id".to_string()))
-            .collect();
-        let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        let auth_record = auth.as_ref().map(|a| a.record.clone());
-        // Build relation field -> table name map for traversal.
-        let mut relations: std::collections::HashMap<String, search::RelationInfo> =
-            std::collections::HashMap::new();
-        for f in collection.field_list().items() {
-            if pb_core::fields::field_type(f) == "relation" {
-                let coll_id = pb_core::fields::field_str(f, "collectionId");
-                if let Ok(Some(c)) = Collection::find(&conn, coll_id) {
-                    relations.insert(
-                        pb_core::fields::field_name(f).to_string(),
-                        search::RelationInfo {
-                            table: c.name.clone(),
-                            multiple: pb_core::fields::is_multiple(f),
-                        },
-                    );
-                }
-            }
-        }
-        let sf = search::build_sql_with_auth_and_relations(&expr, &allowed, auth_record.as_ref(), &relations)
-            .map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        (format!("WHERE {}", sf.sql), sf.params)
+    if !filter.trim().is_empty() {
+        let fctx = filter_context(&conn, &collection);
+        let sf = build_filter_sql(&fctx, &filter, auth_record.as_ref())?;
+        clauses.push(format!("({})", sf.sql));
+        filter_params.extend(sf.params);
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
     } else {
-        // both
-        let allowed: Vec<String> = collection
-            .field_list()
-            .items()
-            .iter()
-            .map(|f| pb_core::fields::field_name(f).to_string())
-            .chain(std::iter::once("id".to_string()))
-            .collect();
-        let expr = search::parse(&filter).map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        let auth_record = auth.as_ref().map(|a| a.record.clone());
-        // Build relation field -> table name map for traversal.
-        let mut relations: std::collections::HashMap<String, search::RelationInfo> =
-            std::collections::HashMap::new();
-        for f in collection.field_list().items() {
-            if pb_core::fields::field_type(f) == "relation" {
-                let coll_id = pb_core::fields::field_str(f, "collectionId");
-                if let Ok(Some(c)) = Collection::find(&conn, coll_id) {
-                    relations.insert(
-                        pb_core::fields::field_name(f).to_string(),
-                        search::RelationInfo {
-                            table: c.name.clone(),
-                            multiple: pb_core::fields::is_multiple(f),
-                        },
-                    );
-                }
-            }
-        }
-        let sf = search::build_sql_with_auth_and_relations(&expr, &allowed, auth_record.as_ref(), &relations)
-            .map_err(|e| ApiError::bad_request(format!("invalid filter: {e}")))?;
-        (format!("WHERE {} AND ({})", rule_filter, sf.sql), [rule_params, sf.params].concat())
+        format!("WHERE {}", clauses.join(" AND "))
     };
 
     let total_sql = if where_clause.is_empty() {

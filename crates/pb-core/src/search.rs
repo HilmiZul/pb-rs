@@ -23,6 +23,8 @@ pub enum Expr {
         right: Box<Expr>,
     },
     Field(String),
+    /// `@collection.<nameOrId>[:alias].<field>[.<sub>]`.
+    CollectionField(String),
     AuthField(String),
     Now,
     Literal(Literal),
@@ -273,7 +275,11 @@ fn lex(input: &str) -> Result<Vec<Tok>, ParseError> {
         if c.is_alphabetic() || c == '_' || c == '@' {
             let start = pos;
             while pos < chars.len()
-                && (chars[pos].is_alphanumeric() || chars[pos] == '_' || chars[pos] == '.' || chars[pos] == '@')
+                && (chars[pos].is_alphanumeric()
+                    || chars[pos] == '_'
+                    || chars[pos] == '.'
+                    || chars[pos] == '@'
+                    || chars[pos] == ':')
             {
                 pos += 1;
             }
@@ -400,6 +406,9 @@ impl Parser {
                 if name == "@now" {
                     return Ok(Expr::Now);
                 }
+                if let Some(rest) = name.strip_prefix("@collection.") {
+                    return Ok(Expr::CollectionField(rest.to_string()));
+                }
                 if let Some(rest) = name.strip_prefix("@request.auth.") {
                     return Ok(Expr::AuthField(rest.to_string()));
                 }
@@ -470,6 +479,14 @@ pub struct RelationInfo {
     pub multiple: bool,
 }
 
+/// Metadata for a collection referenced through `@collection.*`.
+#[derive(Clone, Debug, Default)]
+pub struct CollectionInfo {
+    pub table: String,
+    pub fields: Vec<String>,
+    pub relations: std::collections::HashMap<String, RelationInfo>,
+}
+
 /// Build a SQL WHERE clause from a filter expression.
 /// `allowed_fields` is the set of valid field names (for validation).
 pub fn build_sql(expr: &Expr, allowed_fields: &[String]) -> Result<SqlFilter, ParseError> {
@@ -482,11 +499,29 @@ pub fn build_sql_with_auth_and_relations(
     auth: Option<&PbRecord>,
     relations: &std::collections::HashMap<String, RelationInfo>,
 ) -> Result<SqlFilter, ParseError> {
+    build_sql_full(
+        expr,
+        allowed_fields,
+        auth,
+        relations,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Full builder: relation traversal plus `@collection.*` references.
+pub fn build_sql_full(
+    expr: &Expr,
+    allowed_fields: &[String],
+    auth: Option<&PbRecord>,
+    relations: &std::collections::HashMap<String, RelationInfo>,
+    collections: &std::collections::HashMap<String, CollectionInfo>,
+) -> Result<SqlFilter, ParseError> {
     let mut ctx = BuildCtx {
         params: Vec::new(),
         allowed: allowed_fields,
         auth,
         relations,
+        collections,
     };
     let sql = build_expr(expr, &mut ctx)?;
     Ok(SqlFilter { sql, params: ctx.params })
@@ -505,6 +540,7 @@ struct BuildCtx<'a> {
     allowed: &'a [String],
     auth: Option<&'a PbRecord>,
     relations: &'a std::collections::HashMap<String, RelationInfo>,
+    collections: &'a std::collections::HashMap<String, CollectionInfo>,
 }
 
 fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
@@ -524,6 +560,10 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
             Ok(format!("NOT ({})", inner))
         }
         Expr::Cmp { left, op, right } => build_cmp(left, *op, right, ctx),
+        Expr::CollectionField(path) => {
+            let (from, col) = collection_from(path, ctx)?;
+            Ok(format!("EXISTS (SELECT 1 FROM {from} WHERE {col})"))
+        }
         Expr::Field(name) => {
             if name.contains('.') {
                 let first = name.split('.').next().unwrap_or(name);
@@ -730,6 +770,99 @@ fn like_sql(
     }
 }
 
+/// Resolve `@collection.<name[:alias]>.<field>[.<sub>]` into a FROM clause and
+/// the final column expression. The FROM always yields at least one row, so an
+/// empty referenced collection behaves like PB's `LEFT JOIN` (NULL columns).
+fn collection_from(
+    path: &str,
+    ctx: &mut BuildCtx<'_>,
+) -> Result<(String, String), ParseError> {
+    let (head, rest) = path
+        .split_once('.')
+        .ok_or_else(|| ParseError(format!("invalid @collection field path: {path}")))?;
+    let (name, alias) = match head.split_once(':') {
+        Some((n, a)) => (n, Some(a)),
+        None => (head, None),
+    };
+    let (field, sub) = match rest.split_once('.') {
+        Some((f, s)) => (f, Some(s)),
+        None => (rest, None),
+    };
+    if let Some(sub) = sub {
+        if sub.contains('.') {
+            return Err(ParseError(format!(
+                "nested @collection path is not supported: {path}"
+            )));
+        }
+    }
+    let info = ctx
+        .collections
+        .get(name)
+        .ok_or_else(|| ParseError(format!("unknown collection: {name}")))?;
+    if !info.fields.iter().any(|f| f == field) && field != "id" {
+        return Err(ParseError(format!("unknown field: {field}")));
+    }
+    let alias = alias.unwrap_or(name);
+    let alias_sql = format!(
+        "__pc_{}",
+        alias.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+    );
+    let table = crate::records::quote_ident(&info.table);
+
+    match sub {
+        None => Ok((
+            format!("(SELECT 1) AS __pb_one LEFT JOIN {table} AS {alias_sql} ON 1"),
+            format!("{alias_sql}.{}", crate::records::quote_ident(field)),
+        )),
+        Some(sub) => {
+            let rel = info
+                .relations
+                .get(field)
+                .ok_or_else(|| ParseError(format!("field {field} is not a relation")))?;
+            let rel_table = crate::records::quote_ident(&rel.table);
+            if rel.multiple {
+                let je = format!("{alias_sql}_je");
+                Ok((
+                    format!(
+                        "(SELECT 1) AS __pb_one LEFT JOIN {table} AS {alias_sql} ON 1 \
+                         LEFT JOIN json_each({alias_sql}.{field}) AS {je} ON 1 \
+                         LEFT JOIN {rel_table} AS __pc_rel ON __pc_rel.id = {je}.value",
+                        field = crate::records::quote_ident(field),
+                    ),
+                    format!("__pc_rel.{}", crate::records::quote_ident(sub)),
+                ))
+            } else {
+                Ok((
+                    format!(
+                        "(SELECT 1) AS __pb_one LEFT JOIN {table} AS {alias_sql} ON 1 \
+                         LEFT JOIN {rel_table} AS __pc_rel ON __pc_rel.id = {alias_sql}.{field}",
+                        field = crate::records::quote_ident(field),
+                    ),
+                    format!("__pc_rel.{}", crate::records::quote_ident(sub)),
+                ))
+            }
+        }
+    }
+}
+
+/// Compare a raw column expression against the right operand.
+fn column_cmp_sql(
+    left: &str,
+    op: CmpOp,
+    right: &Expr,
+    ctx: &mut BuildCtx<'_>,
+) -> Result<String, ParseError> {
+    match op {
+        CmpOp::Contains | CmpOp::NotContains => {
+            like_sql(left, right, ctx, op == CmpOp::NotContains)
+        }
+        _ => {
+            let (r, kind) = build_operand(right, ctx)?;
+            Ok(compare_sql(left, OperandKind::Value, op, &r, kind))
+        }
+    }
+}
+
 /// Comparison of a related record's column (`__pb_rel.<sub>`).
 fn relation_cmp_sql(
     rel_alias: &str,
@@ -753,6 +886,58 @@ fn relation_cmp_sql(
 fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
     let any = op.is_any();
     let base = op.base();
+
+    // `@collection.<name>.<field> <op> value`.
+    if let Expr::CollectionField(path) = left {
+        let (from, col) = collection_from(path, ctx)?;
+        let outer_cmp = column_cmp_sql(&col, base, right, ctx)?;
+        let mut sql = format!("EXISTS (SELECT 1 FROM {from} WHERE {outer_cmp})");
+        if !any {
+            let (from2, col2) = collection_from(path, ctx)?;
+            let inner_cmp = column_cmp_sql(&col2, base, right, ctx)?;
+            sql = format!(
+                "({sql} AND NOT EXISTS (SELECT 1 FROM {from2} WHERE NOT ({inner_cmp})))"
+            );
+        }
+        return Ok(sql);
+    }
+
+    // `value <op> @collection.<name>.<field>` (collection on the right).
+    if let Expr::CollectionField(path) = right {
+        if matches!(left, Expr::Field(n) if n.contains('.')) {
+            return Err(ParseError(
+                "@collection on the right of a relation path is not supported".into(),
+            ));
+        }
+        let (from, col) = collection_from(path, ctx)?;
+        let left_kind = static_kind(left);
+        let cmp_sql = |col: &str, ctx: &mut BuildCtx<'_>| -> Result<String, ParseError> {
+            match base {
+                CmpOp::Contains => {
+                    let l = build_expr(left, ctx)?;
+                    Ok(format!("{l} LIKE ('%' || {col} || '%') ESCAPE '\\'"))
+                }
+                CmpOp::NotContains => {
+                    let l = build_expr(left, ctx)?;
+                    Ok(format!("{l} NOT LIKE ('%' || {col} || '%') ESCAPE '\\'"))
+                }
+                _ => {
+                    let l = build_expr(left, ctx)?;
+                    Ok(compare_sql(&l, left_kind, base, col, OperandKind::Value))
+                }
+            }
+        };
+        let outer_cmp = cmp_sql(&col, ctx)?;
+        let mut sql = format!("EXISTS (SELECT 1 FROM {from} WHERE {outer_cmp})");
+        if !any {
+            let (from2, col2) = collection_from(path, ctx)?;
+            let inner_cmp = cmp_sql(&col2, ctx)?;
+            sql = format!(
+                "({sql} AND NOT EXISTS (SELECT 1 FROM {from2} WHERE NOT ({inner_cmp})))"
+            );
+        }
+        return Ok(sql);
+    }
 
     // Relation traversal: `relfield.subfield <op> value`.
     if let Expr::Field(name) = left {
