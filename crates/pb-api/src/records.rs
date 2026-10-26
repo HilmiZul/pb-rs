@@ -724,6 +724,15 @@ pub async fn confirm_email_change(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn auth_with_oauth2(
+    State(_db): State<Db>,
+    _headers: HeaderMap,
+    Path(_id_or_name): Path<String>,
+    _body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    Err(ApiError::internal("OAuth2 authentication is not yet implemented."))
+}
+
 pub async fn with_password(
     State(db): State<Db>,
     headers: HeaderMap,

@@ -108,6 +108,10 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             post(records::auth_with_otp),
         )
         .route(
+            "/collections/:collection/auth-with-oauth2",
+            post(records::auth_with_oauth2),
+        )
+        .route(
             "/collections/:collection/request-password-reset",
             post(records::request_password_reset),
         )
