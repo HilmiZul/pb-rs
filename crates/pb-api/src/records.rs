@@ -590,6 +590,140 @@ pub async fn confirm_verification(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn request_email_change(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let auth: crate::auth::AuthContext = crate::auth::load_auth(&db, &headers)
+        .ok_or_else(|| ApiError::unauthorized("The request requires valid record authorization token."))?;
+
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    if collection.name == "_superusers" {
+        return Err(ApiError::bad_request(
+            "All superusers can change their emails directly.",
+        ));
+    }
+    if auth.collection.id != collection.id {
+        return Err(ApiError::forbidden(format!(
+            "The request requires auth record from {} collection.",
+            collection.name
+        )));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let new_email = form.get("newEmail").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    validate_required_string(form.get("newEmail"), &mut errors, "newEmail");
+    // email validation basic
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    // email sending stubbed (no-op)
+    let _ = new_email;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn confirm_email_change(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    if collection.name == "_superusers" {
+        return Err(ApiError::bad_request(
+            "All superusers can change their emails directly.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let token = form.get("token").and_then(Value::as_str).unwrap_or("");
+    let password = form.get("password").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    if token.is_empty() {
+        errors.insert("token".into(), validation_required());
+    }
+    if password.is_empty() {
+        errors.insert("password".into(), validation_required());
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    // parse token
+    let claims = pb_core::tokens::parse_unverified(token).ok();
+    let new_email = claims.as_ref().and_then(|c| c.new_email.clone()).unwrap_or_default();
+    if new_email.is_empty() {
+        errors.insert(
+            "token".into(),
+            json!({"code": "validation_invalid_token_payload", "message": "Invalid token payload - newEmail must be set."}),
+        );
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let record = pb_core::records::Record::find_auth_record_by_token(&conn, token, &["emailChange"])
+        .map_err(|_| ApiError::bad_request("Invalid or expired token."))?
+        .ok_or_else(|| ApiError::bad_request("Invalid or expired token."))?;
+
+    if record.collection.id != collection.id {
+        errors.insert(
+            "token".into(),
+            json!({"code": "validation_token_collection_mismatch", "message": "The provided token is for different auth collection."}),
+        );
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    // check password
+    if !record.validate_password(password) {
+        errors.insert(
+            "password".into(),
+            json!({"code": "validation_invalid_password", "message": "Missing or invalid auth record password."}),
+        );
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    // check if new email already used
+    if Record::find_by_email(&conn, &collection, &new_email)
+        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?
+        .is_some()
+    {
+        errors.insert(
+            "token".into(),
+            json!({"code": "validation_invalid_token_email", "message": "The new email address is invalid."}),
+        );
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    // update record
+    let hash_check = record.to_api_json().get("password").and_then(Value::as_str).unwrap_or("").to_string();
+    let _ = hash_check;
+    conn.execute(
+        &format!(
+            "UPDATE {} SET email = ?1, verified = 1 WHERE id = ?2",
+            pb_core::records::quote_ident(&collection.name)
+        ),
+        rusqlite::params![new_email, record.id()],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update record: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn with_password(
     State(db): State<Db>,
     headers: HeaderMap,

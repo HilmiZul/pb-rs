@@ -124,6 +124,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             post(records::confirm_verification),
         )
         .route(
+            "/collections/:collection/request-email-change",
+            post(records::request_email_change),
+        )
+        .route(
+            "/collections/:collection/confirm-email-change",
+            post(records::confirm_email_change),
+        )
+        .route(
             "/collections/:collection/auth-refresh",
             post(records::refresh),
         );
