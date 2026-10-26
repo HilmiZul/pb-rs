@@ -20,6 +20,7 @@ use crate::collections::{Collection, TYPE_AUTH, TYPE_BASE, TYPE_VIEW, AUTH_OPTIO
 use crate::fields::{self, BindError, FieldsList};
 use crate::ids;
 use crate::schema_sync;
+use crate::search;
 use crate::validation::{self, Errors, Node};
 use crate::view;
 
@@ -1158,6 +1159,32 @@ fn validate_inner(
                         Some(validation::leaf(
                             "validation_collection_system_rule_change",
                             "System collection API rule cannot be changed.",
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    // API rules: validate each non-empty rule expression against the collection
+    // schema (mirrors `collectionValidator.checkRule`).
+    let rules_to_check = [
+        ("listRule", &c.list_rule),
+        ("viewRule", &c.view_rule),
+        ("createRule", &c.create_rule),
+        ("updateRule", &c.update_rule),
+        ("deleteRule", &c.delete_rule),
+    ];
+    for (key, rule) in rules_to_check {
+        if let Some(rule) = rule {
+            if !rule.trim().is_empty() {
+                if let Err(err) = validate_rule(c, rule, all) {
+                    validation::push(
+                        &mut errs,
+                        key,
+                        Some(validation::leaf(
+                            "validation_invalid_rule",
+                            format!("Invalid rule. Raw error: {err}"),
                         )),
                     );
                 }
@@ -2581,6 +2608,72 @@ pub fn truncate(conn: &mut Connection, collection: &Collection) -> Result<(), St
     }
 
     schema_sync::truncate(conn, collection).map_err(|e| e.to_string())
+}
+
+/// `collectionValidator.checkRule`: ensure a rule expression parses and every
+/// referenced field resolves against the collection schema.
+fn validate_rule(
+    c: &Collection,
+    rule: &str,
+    all: &[Collection],
+) -> Result<(), String> {
+    use std::collections::HashMap;
+
+    let by_id: HashMap<&str, &Collection> = all.iter().map(|col| (col.id.as_str(), col)).collect();
+
+    let relations_for = |col: &Collection| -> HashMap<String, search::RelationInfo> {
+        let mut relations = HashMap::new();
+        for f in col.field_list().items() {
+            if fields::field_type(f) == "relation" {
+                let coll_id = fields::field_str(f, "collectionId");
+                if let Some(target) = by_id.get(coll_id) {
+                    relations.insert(
+                        fields::field_name(f).to_string(),
+                        search::RelationInfo {
+                            table: target.name.clone(),
+                            multiple: fields::is_multiple(f),
+                        },
+                    );
+                }
+            }
+        }
+        relations
+    };
+
+    let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
+    for col in all {
+        let info = search::CollectionInfo {
+            table: col.name.clone(),
+            fields: col
+                .field_list()
+                .items()
+                .iter()
+                .map(|f| fields::field_name(f).to_string())
+                .chain(std::iter::once("id".to_string()))
+                .collect(),
+            relations: relations_for(col),
+        };
+        collections.insert(col.name.clone(), info.clone());
+        collections.insert(col.id.clone(), info);
+    }
+
+    let relations = relations_for(c);
+    let allowed: Vec<String> = c
+        .field_list()
+        .items()
+        .iter()
+        .map(|f| fields::field_name(f).to_string())
+        .chain(std::iter::once("id".to_string()))
+        .collect();
+
+    let empty_request = search::RequestData::default();
+    let types = search::RequestFieldTypes::default();
+
+    let expr = search::parse(rule).map_err(|e| e.0)?;
+    let expr = search::resolve_request_fields(&expr, &empty_request, &types).map_err(|e| e.0)?;
+    search::build_sql_full(&expr, &allowed, None, &relations, &collections)
+        .map(|_| ())
+        .map_err(|e| e.0)
 }
 
 #[cfg(test)]
