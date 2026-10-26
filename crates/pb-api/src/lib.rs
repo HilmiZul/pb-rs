@@ -55,9 +55,12 @@ async fn not_found() -> impl IntoResponse {
 ///
 /// `ui_dir` is the mirrored admin UI directory (`ui/_`); when present it is
 /// served under `/_/` with SPA fallback, exactly like the embedded FS.
-pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Router {
+pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_conn: Option<Connection>) -> Router {
     if let Some(dir) = data_dir {
         let _ = records::DATA_DIR.set(dir);
+    }
+    if let Some(ac) = aux_conn {
+        let _ = records::AUX_DB.set(std::sync::Arc::new(std::sync::Mutex::new(ac)));
     }
     let api = Router::new()
         .route("/health", get(health))
@@ -146,7 +149,10 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
         .route(
             "/files/:collection/:recordId/:filename",
             get(records::file_download),
-        );
+        )
+        .route("/logs", get(records::logs_list).delete(records::logs_truncate))
+        .route("/logs/stats", get(records::logs_stats))
+        .route("/logs/:id", get(records::logs_view));
 
     let mut app = Router::new().nest("/api", api);
 

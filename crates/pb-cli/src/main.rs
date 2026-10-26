@@ -171,12 +171,15 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
         .enable_all()
         .build()?;
 
+    let aux_db = pb_core::db::open(&global.dir.join(pb_core::AUX_DB))?;
+    pb_core::migrations::migrate_aux(&aux_db)?;
+
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
         println!("Server started at http://{addr}");
-        pb_api::axum::serve(listener, pb_api::router(data_db, ui_dir, Some(global.dir.clone())))
+        pb_api::axum::serve(listener, pb_api::router(data_db, ui_dir, Some(global.dir.clone()), Some(aux_db)))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("http server")?;

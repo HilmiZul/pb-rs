@@ -19,6 +19,7 @@ use crate::auth::{load_auth, AuthContext, Db};
 use crate::error::{validation_length, validation_required, ApiError};
 
 pub static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+pub static AUX_DB: OnceLock<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> = OnceLock::new();
 
 /// `findAuthCollection`: 404 when the collection is missing or not an auth one.
 fn find_auth_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {
@@ -2494,4 +2495,118 @@ fn check_mfa(
     }
     conn.execute("DELETE FROM _mfas WHERE id = ?1", [requested_mfa_id]).ok();
     Ok(None)
+}
+
+pub async fn logs_list(
+    State(_db): State<Db>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let aux = AUX_DB
+        .get()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("aux db not available"))?;
+    let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
+
+    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let per_page: i64 = params.get("perPage").and_then(|s| s.parse().ok()).unwrap_or(30).clamp(1, 500);
+    let offset = (page - 1) * per_page;
+
+    let total: i64 = conn
+        .query_row("SELECT count(*) FROM _logs", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    let mut stmt = conn
+        .prepare("SELECT id, level, message, data, created FROM _logs ORDER BY created DESC LIMIT ?1 OFFSET ?2")
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![per_page, offset], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "level": r.get::<_, i64>(1)?,
+                "message": r.get::<_, String>(2)?,
+                "data": serde_json::from_str::<Value>(&r.get::<_, String>(3)?).unwrap_or(Value::Object(Map::new())),
+                "created": r.get::<_, String>(4)?,
+            }))
+        })
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|e| ApiError::internal(e.to_string()))?);
+    }
+
+    let total_pages = if total == 0 { 0 } else { (total + per_page - 1) / per_page };
+    Ok(Json(json!({
+        "items": items,
+        "page": page,
+        "perPage": per_page,
+        "totalItems": total,
+        "totalPages": total_pages,
+    })))
+}
+
+pub async fn logs_view(
+    State(_db): State<Db>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let aux = AUX_DB
+        .get()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("aux db not available"))?;
+    let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
+    let mut stmt = conn
+        .prepare("SELECT id, level, message, data, created FROM _logs WHERE id = ?1")
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let row = stmt
+        .query_row([id], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "level": r.get::<_, i64>(1)?,
+                "message": r.get::<_, String>(2)?,
+                "data": serde_json::from_str::<Value>(&r.get::<_, String>(3)?).unwrap_or(Value::Object(Map::new())),
+                "created": r.get::<_, String>(4)?,
+            }))
+        })
+        .map_err(|_| ApiError::not_found("The requested resource wasn't found."))?;
+    Ok(Json(row))
+}
+
+pub async fn logs_stats(
+    State(_db): State<Db>,
+) -> Result<Json<Value>, ApiError> {
+    let aux = AUX_DB
+        .get()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("aux db not available"))?;
+    let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
+    // simple stats: count by level
+    let mut stmt = conn
+        .prepare("SELECT level, count(*) FROM _logs GROUP BY level")
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut by_level = Map::new();
+    let mut total = 0i64;
+    for row in rows {
+        let (level, count) = row.map_err(|e| ApiError::internal(e.to_string()))?;
+        by_level.insert(level.to_string(), json!(count));
+        total += count;
+    }
+    Ok(Json(json!({
+        "total": total,
+        "byLevel": by_level,
+    })))
+}
+
+pub async fn logs_truncate(
+    State(_db): State<Db>,
+) -> Result<StatusCode, ApiError> {
+    let aux = AUX_DB
+        .get()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("aux db not available"))?;
+    let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
+    conn.execute("DELETE FROM _logs", [])
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
