@@ -116,6 +116,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
             post(records::confirm_password_reset),
         )
         .route(
+            "/collections/:collection/request-verification",
+            post(records::request_verification),
+        )
+        .route(
+            "/collections/:collection/confirm-verification",
+            post(records::confirm_verification),
+        )
+        .route(
             "/collections/:collection/auth-refresh",
             post(records::refresh),
         );

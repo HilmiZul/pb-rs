@@ -449,6 +449,147 @@ pub async fn confirm_password_reset(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn request_verification(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    if collection.name == "_superusers" {
+        return Err(ApiError::bad_request(
+            "All superusers are verified by default.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let email = form.get("email").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    validate_required_string(form.get("email"), &mut errors, "email");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let record = Record::find_by_email(&conn, &collection, email)
+        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?;
+
+    if record.is_none() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    let record = record.unwrap();
+    if record.to_api_json().get("verified").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // email sending stubbed (no-op)
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn confirm_verification(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = find_auth_collection(&conn, &id_or_name)?;
+
+    if collection.name == "_superusers" {
+        return Err(ApiError::bad_request(
+            "All superusers are verified by default.",
+        ));
+    }
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let token = form.get("token").and_then(Value::as_str).unwrap_or("");
+
+    let mut errors = Map::new();
+    if token.is_empty() {
+        errors.insert("token".into(), validation_required());
+    } else {
+        // checkToken logic
+        let claims = pb_core::tokens::parse_unverified(token).ok();
+        let email_claim = claims.as_ref().and_then(|c| c.email.clone()).unwrap_or_default();
+        if email_claim.is_empty() {
+            errors.insert(
+                "token".into(),
+                json!({"code": "validation_invalid_token_claims", "message": "Missing email token claim."}),
+            );
+        } else {
+            match pb_core::records::Record::find_auth_record_by_token(&conn, token, &["verification"]) {
+                Ok(Some(r)) => {
+                    if r.collection.id != collection.id {
+                        errors.insert(
+                            "token".into(),
+                            json!({"code": "validation_token_collection_mismatch", "message": "The provided token is for different auth collection."}),
+                        );
+                    } else {
+                        let rec_json = r.to_api_json();
+                        let rec_email = rec_json.get("email").and_then(Value::as_str).unwrap_or("");
+                        if rec_email != email_claim {
+                            errors.insert(
+                                "token".into(),
+                                json!({"code": "validation_token_email_mismatch", "message": "The record email doesn't match with the requested token claims."}),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    errors.insert(
+                        "token".into(),
+                        json!({"code": "validation_invalid_token", "message": "Invalid or expired token."}),
+                    );
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::validation(Value::Object(errors)));
+    }
+
+    let record = pb_core::records::Record::find_auth_record_by_token(&conn, token, &["verification"])
+        .map_err(|_| ApiError::bad_request("Invalid or expired verification token."))?
+        .ok_or_else(|| ApiError::bad_request("Invalid or expired verification token."))?;
+
+    let was_verified = record.to_api_json().get("verified").and_then(Value::as_bool).unwrap_or(false);
+
+    if !was_verified {
+        let hash = record.to_api_json().get("password").and_then(Value::as_str).unwrap_or("").to_string();
+        // set verified=true; password unchanged (unless password auth disabled, then random password)
+        let password_auth_enabled = collection
+            .options
+            .get("passwordAuth")
+            .and_then(|o| o.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let new_password = if !password_auth_enabled {
+            pb_core::record_upsert::hash_password(&pb_core::ids::random_string(30), 10)
+        } else {
+            hash
+        };
+        conn.execute(
+            &format!(
+                "UPDATE {} SET verified = 1, password = ?1 WHERE id = ?2",
+                pb_core::records::quote_ident(&collection.name)
+            ),
+            rusqlite::params![new_password, record.id()],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to update record: {e}")))?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn with_password(
     State(db): State<Db>,
     headers: HeaderMap,
