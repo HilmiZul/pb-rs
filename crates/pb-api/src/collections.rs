@@ -143,6 +143,22 @@ fn apply_sort(items: &mut [Collection], fields: &[SortField]) {
     });
 }
 
+fn json_to_sqlite(value: &Value) -> rusqlite::types::Value {
+    match value {
+        Value::Null => rusqlite::types::Value::Null,
+        Value::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rusqlite::types::Value::Integer(i)
+            } else {
+                rusqlite::types::Value::Real(n.as_f64().unwrap_or_default())
+            }
+        }
+        Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+        other => rusqlite::types::Value::Text(other.to_string()),
+    }
+}
+
 /// `GET /api/collections`
 pub async fn list(
     State(db): State<Db>,
@@ -167,16 +183,6 @@ pub async fn list(
     let sort = params.sort.as_deref().map(parse_sort).unwrap_or_default();
     validate_sort(&sort)?;
 
-    // Filters are not implemented yet (M2b): reject them instead of silently
-    // returning an unfiltered list.
-    if params
-        .filter
-        .as_deref()
-        .is_some_and(|f| !f.is_empty())
-    {
-        return Err(search_error());
-    }
-
     // `Provider.Exec` normalization.
     if page <= 0 {
         page = 1;
@@ -192,6 +198,31 @@ pub async fn list(
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let mut collections = Collection::load_all(&conn)
         .map_err(|e| ApiError::internal(format!("failed to load collections: {e}")))?;
+
+    // `filter` is resolved by `search.NewSimpleFieldResolver(...)` against the
+    // `_collections` table itself.
+    if let Some(filter) = params.filter.as_deref().filter(|f| !f.trim().is_empty()) {
+        let allowed: Vec<String> = SORT_FIELDS.iter().map(|f| f.to_string()).collect();
+        let expr = pb_core::search::parse(filter).map_err(|_| search_error())?;
+        let sf = pb_core::search::build_sql_full(
+            &expr,
+            &allowed,
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .map_err(|_| search_error())?;
+        let sql = format!("SELECT id FROM _collections WHERE {}", sf.sql);
+        let sql_params: Vec<rusqlite::types::Value> =
+            sf.params.iter().map(json_to_sqlite).collect();
+        let mut stmt = conn.prepare(&sql).map_err(|_| search_error())?;
+        let ids: std::collections::HashSet<String> = stmt
+            .query_map(rusqlite::params_from_iter(sql_params), |r| r.get::<_, String>(0))
+            .map_err(|_| search_error())?
+            .filter_map(Result::ok)
+            .collect();
+        collections.retain(|c| ids.contains(&c.id));
+    }
     drop(conn);
 
     apply_sort(&mut collections, &sort);

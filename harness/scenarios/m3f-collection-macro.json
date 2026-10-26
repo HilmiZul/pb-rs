@@ -185,6 +185,66 @@
       "query": {
         "filter": "title="
       }
+    },
+    {
+      "name": "collections-filter-name",
+      "method": "GET",
+      "path": "/api/collections",
+      "headers": {
+        "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "name ~ 'post'",
+        "sort": "name"
+      }
+    },
+    {
+      "name": "collections-filter-system",
+      "method": "GET",
+      "path": "/api/collections",
+      "headers": {
+        "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "system = false",
+        "sort": "name"
+      }
+    },
+    {
+      "name": "collections-filter-type",
+      "method": "GET",
+      "path": "/api/collections",
+      "headers": {
+        "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "type = 'auth'",
+        "sort": "name"
+      }
+    },
+    {
+      "name": "collections-filter-bad",
+      "method": "GET",
+      "path": "/api/collections",
+      "headers": {
+        "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "nope = 1",
+        "sort": "name"
+      }
+    },
+    {
+      "name": "collections-filter-parens",
+      "method": "GET",
+      "path": "/api/collections",
+      "headers": {
+        "authorization": "{{token}}"
+      },
+      "query": {
+        "filter": "(system = false && name ~ 'e') || name = '_superusers'",
+        "sort": "name"
+      }
     }
   ]
 }
