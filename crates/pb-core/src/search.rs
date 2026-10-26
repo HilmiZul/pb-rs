@@ -458,7 +458,7 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
                 if !ctx.allowed.iter().any(|f| f == first) && first != "id" {
                     return Err(ParseError(format!("unknown field: {}", name)));
                 }
-                return Ok(format!("__FIELD__{}", name));
+                return Ok(crate::records::quote_ident(name));
             }
             if !ctx.allowed.iter().any(|f| f == name) && name != "id" {
                 return Err(ParseError(format!("unknown field: {}", name)));
@@ -509,33 +509,36 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
 }
 
 fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
-    // Relation traversal: left is __FIELD__field.sub
+    // Relation traversal: `relfield.subfield <op> value`.
     if let Expr::Field(name) = left {
-        if let Some(rest) = name.strip_prefix("__FIELD__") {
-            let parts: Vec<&str> = rest.splitn(2, '.').collect();
-            let field = parts[0];
-            let sub = parts[1];
+        if let Some((field, sub)) = name.split_once('.') {
+            if !ctx.allowed.iter().any(|f| f == field) && field != "id" {
+                return Err(ParseError(format!("unknown field: {name}")));
+            }
             if let Some(rel_table) = ctx.relations.get(field).cloned() {
                 let r = build_expr(right, ctx)?;
-                let sql_op = match op {
-                    CmpOp::Eq => "=",
-                    CmpOp::Ne => "!=",
-                    CmpOp::Gt => ">",
-                    CmpOp::Gte => ">=",
-                    CmpOp::Lt => "<",
-                    CmpOp::Lte => "<=",
-                    CmpOp::Contains => "LIKE",
-                    CmpOp::NotContains => "NOT LIKE",
-                };
-                let cmp_expr = if matches!(op, CmpOp::Contains | CmpOp::NotContains) {
-                    format!("{} {} '%' || {} || '%'", sub, sql_op, r)
-                } else {
-                    format!("{} {} {}", sub, sql_op, r)
+                let cmp_expr = match op {
+                    CmpOp::Eq => format!("{} = {}", crate::records::quote_ident(sub), r),
+                    CmpOp::Ne => format!("{} != {}", crate::records::quote_ident(sub), r),
+                    CmpOp::Gt => format!("{} > {}", crate::records::quote_ident(sub), r),
+                    CmpOp::Gte => format!("{} >= {}", crate::records::quote_ident(sub), r),
+                    CmpOp::Lt => format!("{} < {}", crate::records::quote_ident(sub), r),
+                    CmpOp::Lte => format!("{} <= {}", crate::records::quote_ident(sub), r),
+                    CmpOp::Contains => format!(
+                        "{} LIKE '%' || {} || '%'",
+                        crate::records::quote_ident(sub),
+                        r
+                    ),
+                    CmpOp::NotContains => format!(
+                        "{} NOT LIKE '%' || {} || '%'",
+                        crate::records::quote_ident(sub),
+                        r
+                    ),
                 };
                 return Ok(format!(
-                    "{} IN (SELECT id FROM \"{}\" WHERE {})",
+                    "{} IN (SELECT id FROM {} WHERE {})",
                     crate::records::quote_ident(field),
-                    rel_table,
+                    crate::records::quote_ident(&rel_table),
                     cmp_expr
                 ));
             }

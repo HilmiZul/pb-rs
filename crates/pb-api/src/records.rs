@@ -388,8 +388,6 @@ pub async fn list(
     let filter = params.filter.clone().unwrap_or_default();
 
     // Apply collection list rule for non-superusers.
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     let mut rule_filter = String::new();
     let mut rule_params: Vec<serde_json::Value> = Vec::new();
     if !is_superuser {
@@ -481,9 +479,9 @@ pub async fn list(
     .map_err(|e| ApiError::internal(format!("count failed: {e}")))?;
 
     let sql = if where_clause.is_empty() {
-        format!("SELECT * FROM {} {} LIMIT ?1 OFFSET ?2", quote_table(&collection.name), order_clause)
+        format!("SELECT * FROM {} {} LIMIT ? OFFSET ?", quote_table(&collection.name), order_clause)
     } else {
-        format!("SELECT * FROM {} {} {} LIMIT ?1 OFFSET ?2", quote_table(&collection.name), where_clause, order_clause)
+        format!("SELECT * FROM {} {} {} LIMIT ? OFFSET ?", quote_table(&collection.name), where_clause, order_clause)
     };
 
     let mut stmt = conn.prepare(&sql).map_err(|e| ApiError::internal(format!("prepare failed: {e}")))?;
@@ -710,8 +708,6 @@ pub async fn view(
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
 
     // View rule evaluation for non-superusers.
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser {
         if let Some(rule) = &collection.view_rule {
             if !rule.is_empty() {
@@ -791,8 +787,6 @@ pub async fn create(
     });
 
     // Rule evaluation for non-superusers.
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser {
         if let Some(rule) = &collection.create_rule {
             if !rule.is_empty() {
@@ -815,7 +809,11 @@ pub async fn create(
         if name == "id" {
             continue;
         }
-        let val = payload.get(&name).cloned().unwrap_or(Value::Null);
+        let mut val = payload.get(&name).cloned().unwrap_or(Value::Null);
+        // Go's JSON binder turns `null`/missing into the field zero value.
+        if val.is_null() {
+            val = field_default(field);
+        }
         // Convert JSON to storage form
         let stored = json_to_column(&val, pb_core::fields::field_type(field));
         columns.push(name);
@@ -838,6 +836,17 @@ pub async fn create(
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::internal("created record is missing"))?;
     Ok(Json(record.to_api_json()))
+}
+
+fn field_default(field: &Value) -> Value {
+    match pb_core::fields::field_type(field) {
+        "number" => json!(0),
+        "bool" => json!(false),
+        "json" => Value::Null,
+        "geoPoint" => json!({"lon": 0, "lat": 0}),
+        "select" | "file" | "relation" if pb_core::fields::is_multiple(field) => json!([]),
+        _ => json!(""),
+    }
 }
 
 fn json_to_column(value: &Value, field_type: &str) -> Value {
@@ -899,8 +908,6 @@ pub async fn update(
     let fields = collection.field_list();
     let mut sets = Vec::new();
     // Rule evaluation for non-superusers.
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser {
         if let Some(rule) = &collection.update_rule {
             if !rule.is_empty() {
@@ -955,8 +962,6 @@ pub async fn update(
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
 
     // View rule evaluation for non-superusers.
-    let auth = load_auth(&db, &headers);
-    let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
     if !is_superuser {
         if let Some(rule) = &collection.view_rule {
             if !rule.is_empty() {
