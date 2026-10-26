@@ -308,6 +308,14 @@ pub async fn auth_with_otp(
 
     // verified state update (only if sentTo matches email); sentTo is "" here so skip
 
+    let mfa_id_req = form.get("mfaId").and_then(Value::as_str).unwrap_or("").to_string();
+    match check_mfa(&conn, &collection, &record, "otp", &mfa_id_req)? {
+        Some(mfa_id) => {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "", json!({"mfaId": mfa_id})));
+        }
+        None => {}
+    }
+
     let token = auth_token(&collection, &record, true)?;
     Ok(Json(json!({
         "record": record.to_api_json(),
@@ -989,6 +997,7 @@ pub async fn with_password(
     let identity = form.get("identity").and_then(Value::as_str).unwrap_or("");
     let password = form.get("password").and_then(Value::as_str).unwrap_or("");
     let identity_field = form.get("identityField").and_then(Value::as_str);
+    let mfa_id_req = form.get("mfaId").and_then(Value::as_str).unwrap_or("").to_string();
 
     let mut errors = Map::new();
     validate_required_string(form.get("identity"), &mut errors, "identity");
@@ -1055,6 +1064,16 @@ pub async fn with_password(
             ))
         }
     }
+
+    // MFA check
+    match check_mfa(&conn, &collection, &record, "password", &mfa_id_req)? {
+        Some(mfa_id) => {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "", json!({"mfaId": mfa_id})));
+        }
+        None => {}
+    }
+    // MFA requires 401 status; adjust by returning unauthorized with body
+    let _ = ();
 
     let token = auth_token(&collection, &record, true)?;
     Ok(Json(json!({
@@ -2295,4 +2314,66 @@ fn random_string(length: usize) -> String {
     (0..length)
         .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
         .collect()
+}
+
+fn check_mfa(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    auth_record: &Record,
+    current_method: &str,
+    requested_mfa_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let mfa_config = collection
+        .options
+        .get("mfa")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !mfa_config.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(None);
+    }
+    let mfas_collection = Collection::find(conn, "_mfas")
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::internal("missing _mfas collection"))?;
+    let duration = mfa_config.get("duration").and_then(Value::as_i64).unwrap_or(0);
+
+    if requested_mfa_id.is_empty() {
+        let mfa_id = pb_core::ids::default_random_id();
+        conn.execute(
+            "INSERT INTO _mfas (id, collectionRef, recordRef, method, created, updated) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%d %H:%M:%fZ','now'), strftime('%Y-%m-%d %H:%M:%fZ','now'))",
+            rusqlite::params![mfa_id, collection.id, auth_record.id(), current_method],
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        let _ = mfas_collection;
+        let _ = duration;
+        return Ok(Some(mfa_id));
+    }
+
+    let mfa = Record::find_by_id(conn, &mfas_collection, requested_mfa_id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let Some(mfa) = mfa else {
+        return Err(ApiError::bad_request("Invalid or expired MFA session."));
+    };
+    let mfa_json = mfa.to_api_json();
+    let mfa_collection_ref = mfa_json.get("collectionRef").and_then(Value::as_str).unwrap_or("");
+    let mfa_record_ref = mfa_json.get("recordRef").and_then(Value::as_str).unwrap_or("");
+    let mfa_method = mfa_json.get("method").and_then(Value::as_str).unwrap_or("");
+    if mfa_collection_ref != collection.id || mfa_record_ref != auth_record.id() {
+        return Err(ApiError::bad_request("Invalid MFA session."));
+    }
+    let expired: i64 = conn
+        .query_row(
+            "SELECT CASE WHEN datetime(created, '+' || ?2 || ' seconds') < datetime('now') THEN 1 ELSE 0 END FROM _mfas WHERE id = ?1",
+            rusqlite::params![requested_mfa_id, duration],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if expired == 1 {
+        conn.execute("DELETE FROM _mfas WHERE id = ?1", [requested_mfa_id]).ok();
+        return Err(ApiError::bad_request("Invalid or expired MFA session."));
+    }
+    if mfa_method == current_method {
+        return Err(ApiError::bad_request("A different authentication method is required."));
+    }
+    conn.execute("DELETE FROM _mfas WHERE id = ?1", [requested_mfa_id]).ok();
+    Ok(None)
 }
