@@ -5,6 +5,7 @@
 //! later milestones.
 
 use axum::body::Bytes;
+use std::sync::OnceLock;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
@@ -16,6 +17,8 @@ use serde_json::{json, Map, Value};
 
 use crate::auth::{load_auth, AuthContext, Db};
 use crate::error::{validation_length, validation_required, ApiError};
+
+pub static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 /// `findAuthCollection`: 404 when the collection is missing or not an auth one.
 fn find_auth_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {
@@ -130,6 +133,78 @@ pub async fn methods(
 }
 
 /// `POST /api/collections/{collection}/request-otp`
+pub async fn file_token(
+    State(db): State<Db>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = crate::auth::load_auth(&db, &headers)
+        .ok_or_else(|| ApiError::unauthorized("Missing auth context."))?;
+    let file_token = pb_core::tokens::new_jwt(
+        &pb_core::tokens::RecordClaims {
+            kind: pb_core::tokens::TYPE_FILE.into(),
+            id: auth.record.id().to_string(),
+            collection_id: auth.collection.id.clone(),
+            refreshable: None,
+            email: None,
+            new_email: None,
+            exp: 0,
+        },
+        &pb_core::tokens::signing_key(auth.record.token_key(), auth.collection.token_secret("fileToken").unwrap_or("")),
+        auth.collection.token_duration("fileToken"),
+    )
+    .map_err(|e| ApiError::internal(format!("Failed to generate file token: {e}")))?;
+    Ok(Json(json!({"token": file_token})))
+}
+
+pub async fn file_download(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path((collection_name, record_id, filename)): Path<(String, String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = Collection::find(&conn, &collection_name)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+    let record = Record::find_by_id(&conn, &collection, &record_id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+    drop(conn);
+
+    let storage_root = DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("pb_data"))
+        .join("storage");
+    let file_path = storage_root
+        .join(&collection.id)
+        .join(&record_id)
+        .join(&filename);
+
+    let data = std::fs::read(&file_path)
+        .map_err(|_| ApiError::not_found("The requested resource wasn't found."))?;
+
+    let content_type = if filename.ends_with(".png") {
+        "image/png"
+    } else if filename.ends_with(".jpg") || filename.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if filename.ends_with(".gif") {
+        "image/gif"
+    } else if filename.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    };
+
+    let resp = axum::response::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(axum::body::Body::from(data))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(resp)
+}
+
 pub async fn request_otp(
     State(db): State<Db>,
     headers: HeaderMap,

@@ -55,7 +55,10 @@ async fn not_found() -> impl IntoResponse {
 ///
 /// `ui_dir` is the mirrored admin UI directory (`ui/_`); when present it is
 /// served under `/_/` with SPA fallback, exactly like the embedded FS.
-pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
+pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Router {
+    if let Some(dir) = data_dir {
+        let _ = records::DATA_DIR.set(dir);
+    }
     let api = Router::new()
         .route("/health", get(health))
         .route("/settings", get(settings::list).patch(settings::set))
@@ -138,6 +141,11 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>) -> Router {
         .route(
             "/collections/:collection/auth-refresh",
             post(records::refresh),
+        )
+        .route("/files/token", post(records::file_token))
+        .route(
+            "/files/:collection/:recordId/:filename",
+            get(records::file_download),
         );
 
     let mut app = Router::new().nest("/api", api);

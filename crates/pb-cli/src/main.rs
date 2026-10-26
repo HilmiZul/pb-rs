@@ -176,7 +176,7 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         println!("Server started at http://{addr}");
-        pb_api::axum::serve(listener, pb_api::router(data_db, ui_dir))
+        pb_api::axum::serve(listener, pb_api::router(data_db, ui_dir, Some(global.dir.clone())))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("http server")?;
