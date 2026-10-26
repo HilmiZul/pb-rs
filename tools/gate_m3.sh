@@ -21,7 +21,7 @@ GO_PORT="${GO_PORT:-18122}"
 RS_PORT="${RS_PORT:-18123}"
 EMAIL="admin@example.com"
 PASSWORD="pass12345678"
-SCENARIOS="harness/scenarios/m3-records-basic.json harness/scenarios/m3b-filter-basic.json harness/scenarios/m3c-expand-fields.json harness/scenarios/m3d-rules.json harness/scenarios/m3e-readonly.json harness/scenarios/m3f-collection-macro.json harness/scenarios/m3g-fields.json"
+SCENARIOS="harness/scenarios/m3-records-basic.json harness/scenarios/m3b-filter-basic.json harness/scenarios/m3c-expand-fields.json harness/scenarios/m3d-rules.json harness/scenarios/m3e-readonly.json harness/scenarios/m3f-collection-macro.json harness/scenarios/m3g-fields.json harness/scenarios/m3h-auth-visibility.json"
 
 status=0
 
