@@ -2264,6 +2264,8 @@ pub async fn create(
         }
     }
 
+    broadcast_record(&conn, &collection, &record, "create");
+
     let mut records = vec![enrich_record(&conn, &collection, &record, &request)];
     project_fields(
         &mut records,
@@ -2344,6 +2346,8 @@ pub async fn update(
         }
     }
 
+    broadcast_record(&conn, &collection, &record, "update");
+
     let mut records = vec![enrich_record(&conn, &collection, &record, &request)];
     project_fields(
         &mut records,
@@ -2373,12 +2377,11 @@ pub async fn delete(
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
 
-    if RecordModel::find_by_id(&conn, &collection, &record_id)
+    let Some(record) = RecordModel::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
-        .is_none()
-    {
+    else {
         return Err(ApiError::not_found(NOT_FOUND_MESSAGE));
-    }
+    };
 
     if !request.is_superuser() {
         if let Some(rule) = collection.delete_rule.as_deref() {
@@ -2402,6 +2405,7 @@ pub async fn delete(
                 "Failed to delete record. Make sure that the record is not part of a required relation reference.",
             )
         })?;
+    broadcast_record(&conn, &collection, &record, "delete");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2609,4 +2613,249 @@ pub async fn logs_truncate(
     conn.execute("DELETE FROM _logs", [])
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+struct RealtimeGuard(String);
+
+impl Drop for RealtimeGuard {
+    fn drop(&mut self) {
+        crate::realtime::broker().unregister(&self.0);
+    }
+}
+
+pub async fn realtime_connect(
+    State(_db): State<Db>,
+    headers: HeaderMap,
+) -> axum::response::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, axum::BoxError>>,
+> {
+    use futures_util::stream;
+    use std::time::Duration;
+
+    let client_id = pb_core::ids::default_random_id();
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let rx = crate::realtime::broker().register(&client_id, &ip);
+    let connect_data = format!(r#"{{"clientId":"{client_id}"}}"#);
+    let guard = RealtimeGuard(client_id);
+
+    let stream = stream::unfold((Some(rx), guard, false), move |(rx_opt, guard, sent)| {
+        let connect_data = connect_data.clone();
+        async move {
+            if !sent {
+                let ev = axum::response::sse::Event::default()
+                    .event("PB_CONNECT")
+                    .data(connect_data);
+                return Some((Ok(ev), (rx_opt, guard, true)));
+            }
+            let mut rx = rx_opt?;
+            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let ev = axum::response::sse::Event::default()
+                        .event(msg.name)
+                        .data(msg.data);
+                    Some((Ok(ev), (Some(rx), guard, true)))
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    let ev = axum::response::sse::Event::default().comment("ping");
+                    Some((Ok(ev), (Some(rx), guard, true)))
+                }
+            }
+        }
+    });
+    axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+pub async fn realtime_subscribe(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+
+    let client_id = form.get("clientId").and_then(Value::as_str).unwrap_or("");
+    if client_id.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "",
+            json!({"clientId": validation_required()}),
+        ));
+    }
+    if client_id.chars().count() > 255 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "",
+            json!({"clientId": validation_length(1, 255)}),
+        ));
+    }
+
+    let mut subscriptions: Vec<String> = Vec::new();
+    if let Some(raw) = form.get("subscriptions") {
+        match raw {
+            Value::Array(items) => {
+                for item in items {
+                    let Some(text) = item.as_str() else {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "",
+                            json!({"subscriptions": {"code": "validation_invalid_type", "message": "Invalid value."}}),
+                        ));
+                    };
+                    subscriptions.push(text.to_string());
+                }
+            }
+            Value::Null => {}
+            _ => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "",
+                    json!({"subscriptions": {"code": "validation_invalid_type", "message": "Invalid value."}}),
+                ));
+            }
+        }
+    }
+    if subscriptions.len() > 1000 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "",
+            json!({"subscriptions": validation_length(0, 1000)}),
+        ));
+    }
+    if subscriptions.iter().any(|s| s.chars().count() > 2500) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "",
+            json!({"subscriptions": validation_length(0, 2500)}),
+        ));
+    }
+
+    let broker = crate::realtime::broker();
+    let Some((_stored_ip, stored_auth)) = broker.client_state(client_id) else {
+        return Err(ApiError::not_found("Missing or invalid client id."));
+    };
+
+    let current_auth = load_auth(&db, &headers)
+        .map(|auth| (auth.collection.id.clone(), auth.record.id().to_string()));
+
+    // Only guest -> auth upgrades are allowed; any other auth change is forbidden.
+    if let Some(existing) = &stored_auth {
+        if current_auth.as_ref() != Some(existing) {
+            return Err(ApiError::forbidden(
+                "The current and the previous request authorization don't match.",
+            ));
+        }
+    }
+
+    broker.set_subscriptions(client_id, subscriptions, current_auth);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Broadcasts a record change to every subscribed realtime client, applying
+/// the collection view/list API rule and the per-subscription `filter`.
+fn broadcast_record(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    record: &pb_core::record_upsert::RecordModel,
+    action: &str,
+) {
+    let clients = crate::realtime::broker().snapshot();
+    if clients.is_empty() {
+        return;
+    }
+
+    let record_id = record.id().to_string();
+    let record_data = record.to_rule_data();
+
+    for client in clients {
+        let auth = match &client.auth {
+            Some((collection_id, record_id)) => Collection::find(conn, collection_id)
+                .ok()
+                .flatten()
+                .and_then(|auth_collection| {
+                    Record::find_by_id(conn, &auth_collection, record_id)
+                        .ok()
+                        .flatten()
+                        .map(|rec| AuthContext {
+                            record: rec,
+                            collection: auth_collection,
+                        })
+                }),
+            None => None,
+        };
+        let is_superuser = auth.as_ref().map(|a| a.is_superuser()).unwrap_or(false);
+
+        for topic in &client.subscriptions {
+            let Some(specific) = crate::realtime::topic_matches(
+                topic,
+                &collection.id,
+                &collection.name,
+                &record_id,
+            ) else {
+                continue;
+            };
+
+            let rule = if specific {
+                collection.view_rule.as_deref()
+            } else {
+                collection.list_rule.as_deref()
+            };
+
+            let allowed = if is_superuser {
+                true
+            } else {
+                match rule {
+                    None => false,
+                    Some("") => true,
+                    Some(rule) => {
+                        let request = RequestInfo {
+                            auth: auth.clone(),
+                            body: Map::new(),
+                            query: HashMap::new(),
+                            headers: HashMap::new(),
+                            method: "GET".to_string(),
+                            context: "realtime".to_string(),
+                        };
+                        let ctx = filter_context(conn, collection, is_superuser);
+                        rule_matches_data(conn, rule, &record_data, &request, &ctx).unwrap_or(false)
+                    }
+                }
+            };
+            if !allowed {
+                continue;
+            }
+
+            let mut payload = json!({
+                "action": action,
+                "record": record.to_api_json(),
+            });
+            // Optional `fields` projection from the subscription options.
+            if let Some(options) = topic.split_once("options=").map(|(_, v)| v) {
+                if let Ok(Value::Object(opts)) = serde_json::from_str::<Value>(
+                    &urlencoding::decode(options).unwrap_or_else(|_| options.into()),
+                ) {
+                    if let Some(fields) = opts
+                        .get("query")
+                        .and_then(|q| q.get("fields"))
+                        .and_then(Value::as_str)
+                    {
+                        let mut records = vec![payload["record"].clone()];
+                        project_fields(&mut records, fields);
+                        payload["record"] = records.pop().unwrap_or(Value::Null);
+                    }
+                }
+            }
+
+            let _ = client.sender.send(crate::realtime::Event {
+                name: crate::realtime::subscription_topic(topic).to_string(),
+                data: payload.to_string(),
+            });
+        }
+    }
 }

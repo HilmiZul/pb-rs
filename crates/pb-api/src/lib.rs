@@ -19,6 +19,7 @@ pub mod auth;
 pub mod body;
 pub mod collections;
 pub mod error;
+pub mod realtime;
 pub mod records;
 pub mod settings;
 
@@ -152,7 +153,8 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
         )
         .route("/logs", get(records::logs_list).delete(records::logs_truncate))
         .route("/logs/stats", get(records::logs_stats))
-        .route("/logs/:id", get(records::logs_view));
+        .route("/logs/:id", get(records::logs_view))
+        .route("/realtime", get(records::realtime_connect).post(records::realtime_subscribe));
 
     let mut app = Router::new().nest("/api", api);
 
