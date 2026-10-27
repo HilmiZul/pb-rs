@@ -2502,9 +2502,11 @@ fn check_mfa(
 }
 
 pub async fn logs_list(
-    State(_db): State<Db>,
+    State(db): State<Db>,
+    headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::auth::require_superuser(&db, &headers)?;
     let aux = AUX_DB
         .get()
         .cloned()
@@ -2549,9 +2551,11 @@ pub async fn logs_list(
 }
 
 pub async fn logs_view(
-    State(_db): State<Db>,
+    State(db): State<Db>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::auth::require_superuser(&db, &headers)?;
     let aux = AUX_DB
         .get()
         .cloned()
@@ -2575,8 +2579,10 @@ pub async fn logs_view(
 }
 
 pub async fn logs_stats(
-    State(_db): State<Db>,
+    State(db): State<Db>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    crate::auth::require_superuser(&db, &headers)?;
     let aux = AUX_DB
         .get()
         .cloned()
@@ -2603,8 +2609,10 @@ pub async fn logs_stats(
 }
 
 pub async fn logs_truncate(
-    State(_db): State<Db>,
+    State(db): State<Db>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
+    crate::auth::require_superuser(&db, &headers)?;
     let aux = AUX_DB
         .get()
         .cloned()

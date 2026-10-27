@@ -16,6 +16,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub use axum;
 
 pub mod auth;
+pub mod backups;
 pub mod batch;
 pub mod body;
 pub mod collections;
@@ -156,7 +157,14 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
         .route("/logs/stats", get(records::logs_stats))
         .route("/logs/:id", get(records::logs_view))
         .route("/realtime", get(records::realtime_connect).post(records::realtime_subscribe))
-        .route("/batch", post(batch::batch_transaction));
+        .route("/batch", post(batch::batch_transaction))
+        .route("/backups", get(backups::list).post(backups::create))
+        .route("/backups/upload", post(backups::upload))
+        .route(
+            "/backups/:key",
+            get(backups::download).delete(backups::delete),
+        )
+        .route("/backups/:key/restore", post(backups::restore));
 
     let mut app = Router::new().nest("/api", api);
 
