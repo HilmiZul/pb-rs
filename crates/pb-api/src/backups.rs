@@ -545,3 +545,45 @@ fn restore_zip(path: &FsPath, data: &FsPath) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Runs a backup immediately (used by the `__pbAutoBackup__` cron job).
+pub fn create_backup_now(db: &Db, name: &str) -> Result<(), String> {
+    let data = data_dir();
+    let dir = backups_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    *active().lock().map_err(|_| "lock poisoned".to_string())? = Some(name.to_string());
+    let result = (|| {
+        let conn = db.lock().map_err(|_| "database lock poisoned".to_string())?;
+        let aux_guard = crate::records::AUX_DB
+            .get()
+            .and_then(|aux| aux.lock().ok());
+        create_zip(
+            &data,
+            &dir.join(name),
+            &conn,
+            aux_guard.as_deref(),
+        )
+    })();
+    *active().lock().map_err(|_| "lock poisoned".to_string())? = None;
+    result
+}
+
+/// Deletes the oldest `@auto_pb_backup_*` archives, keeping `max_keep`.
+pub fn prune_auto_backups(max_keep: usize) {
+    let dir = backups_dir();
+    let Ok(read) = fs::read_dir(&dir) else {
+        return;
+    };
+    let mut names: Vec<String> = read
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (name.starts_with("@auto_pb_backup_") && name.ends_with(".zip")).then_some(name)
+        })
+        .collect();
+    names.sort();
+    while names.len() > max_keep {
+        let oldest = names.remove(0);
+        let _ = fs::remove_file(dir.join(oldest));
+    }
+}

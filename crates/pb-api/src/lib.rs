@@ -18,6 +18,7 @@ pub use axum;
 pub mod auth;
 pub mod backups;
 pub mod batch;
+pub mod crons;
 pub mod body;
 pub mod collections;
 pub mod error;
@@ -164,7 +165,9 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
             "/backups/:key",
             get(backups::download).delete(backups::delete),
         )
-        .route("/backups/:key/restore", post(backups::restore));
+        .route("/backups/:key/restore", post(backups::restore))
+        .route("/crons", get(crons::list))
+        .route("/crons/:id", post(crons::run));
 
     let mut app = Router::new().nest("/api", api);
 
