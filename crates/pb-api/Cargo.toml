@@ -6,11 +6,12 @@ license.workspace = true
 
 [dependencies]
 bcrypt = "0.15"
+jsonwebtoken = "9"
 anyhow.workspace = true
 serde.workspace = true
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 pb-core = { path = "../pb-core" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.5", features = ["fs"] }
 oauth2 = "5"

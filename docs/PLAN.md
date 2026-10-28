@@ -100,7 +100,7 @@ Remaining in M2e: collections list `filter`, `dry-run-view`, `CreateViewFields`
 (identifier parser, `_clone_` ids) — pending M3 (they share the filter/SQL
 introspection subsystem).
 
-### M3 — Records CRUD, filter/sort/expand, rules  ← next
+### M3 — Records CRUD, filter/sort/expand, rules  ✅ done
 
 Scope: record list/view/create/update/delete, `filter`/`sort`/`expand`/`fields`,
 collection rules (`@request.auth`, `@collection.*`), rate limits, plus the
@@ -114,7 +114,7 @@ collection rules (`@request.auth`, `@collection.*`), rate limits.
 **Gate:** differential filter fuzz (generated expressions over a fixed dataset) with
 zero semantic differences; expand output byte-identical after normalization.
 
-## M4 — Auth, files, tokens
+## M4 — Auth, files, tokens  ✅ done (core auth, files, tokens, impersonate, OAuth2 redirect broker):
 
 Scope: password, OTP, OAuth2, MFA, email change/verification/password reset,
 `_externalAuths`, `_authOrigins`, file tokens, thumbnails incl.
@@ -123,7 +123,7 @@ Scope: password, OTP, OAuth2, MFA, email change/verification/password reset,
 **Gate:** cross-implementation token acceptance in both directions; bcrypt
 verification of hashes produced by the oracle.
 
-## M5 — Realtime, batch, backups, logs, crons
+## M5 — Realtime, batch, backups, logs, crons  ✅ done
 
 **Gate:** an official SDK client connects over SSE and receives identical events;
 batch transaction semantics match under partial failure.

@@ -21,7 +21,7 @@ GO_PORT="${GO_PORT:-18122}"
 RS_PORT="${RS_PORT:-18123}"
 EMAIL="admin@example.com"
 PASSWORD="pass12345678"
-SCENARIOS="harness/scenarios/m3-records-basic.json harness/scenarios/m3b-filter-basic.json harness/scenarios/m3c-expand-fields.json harness/scenarios/m3d-rules.json harness/scenarios/m3e-readonly.json harness/scenarios/m3f-collection-macro.json harness/scenarios/m3g-fields.json harness/scenarios/m3h-auth-visibility.json harness/scenarios/m3i-views.json harness/scenarios/m3j-filter-errors.json harness/scenarios/m4-auth.json harness/scenarios/m5-logs.json harness/scenarios/m5-rate-limits.json harness/scenarios/m5-batch.json harness/scenarios/m5-crons.json harness/scenarios/m5-backups.json harness/scenarios/m5-cron-scheduler.json harness/scenarios/m5-restore.json harness/scenarios/m5-error-details.json harness/scenarios/m5-record-delete.json"
+SCENARIOS="harness/scenarios/m3-records-basic.json harness/scenarios/m3b-filter-basic.json harness/scenarios/m3c-expand-fields.json harness/scenarios/m3d-rules.json harness/scenarios/m3e-readonly.json harness/scenarios/m3f-collection-macro.json harness/scenarios/m3g-fields.json harness/scenarios/m3h-auth-visibility.json harness/scenarios/m3i-views.json harness/scenarios/m3j-filter-errors.json harness/scenarios/m4-auth.json harness/scenarios/m5-logs.json harness/scenarios/m5-rate-limits.json harness/scenarios/m5-batch.json harness/scenarios/m5-crons.json harness/scenarios/m5-backups.json harness/scenarios/m5-cron-scheduler.json harness/scenarios/m5-restore.json harness/scenarios/m5-error-details.json harness/scenarios/m5-record-delete.json harness/scenarios/m4b-impersonate.json harness/scenarios/m5-sql.json harness/scenarios/m5-settings-tools.json harness/scenarios/m5-oauth2-redirect.json"
 
 status=0
 

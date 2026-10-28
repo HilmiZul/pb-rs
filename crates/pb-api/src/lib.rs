@@ -20,12 +20,14 @@ pub mod backups;
 pub mod batch;
 pub mod crons;
 pub mod body;
+pub mod oauth2_redirect;
 pub mod collections;
 pub mod error;
 pub mod rate_limit;
 pub mod realtime;
 pub mod records;
 pub mod settings;
+pub mod sql;
 
 use auth::Db;
 
@@ -74,6 +76,12 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
     let api = Router::new()
         .route("/health", get(health))
         .route("/settings", get(settings::list).patch(settings::set))
+        .route("/settings/test/email", post(settings::test_email))
+        .route("/settings/test/s3", post(settings::test_s3))
+        .route(
+            "/settings/apple/generate-client-secret",
+            post(settings::apple_client_secret),
+        )
         .route(
             "/collections",
             get(collections::list).post(collections::create),
@@ -154,6 +162,10 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
             "/collections/:collection/auth-refresh",
             post(records::refresh),
         )
+        .route(
+            "/collections/:collection/impersonate/:id",
+            post(records::impersonate),
+        )
         .route("/files/token", post(records::file_token))
         .route(
             "/files/:collection/:recordId/:filename",
@@ -172,7 +184,12 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
         )
         .route("/backups/:key/restore", post(backups::restore))
         .route("/crons", get(crons::list))
-        .route("/crons/:id", post(crons::run));
+        .route("/crons/:id", post(crons::run))
+        .route("/sql", post(sql::run))
+        .route(
+            "/oauth2-redirect",
+            get(oauth2_redirect::oauth2_redirect).post(oauth2_redirect::oauth2_redirect),
+        );
 
     // PocketBase's router has no method-specific 405: an unmatched
     // method+path combination falls through to the 404 handler.

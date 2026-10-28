@@ -37,7 +37,7 @@ fn find_auth_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result
 }
 
 /// Reject non-JSON bodies the way `e.BindBody` does.
-fn require_json(headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn require_json(headers: &HeaderMap) -> Result<(), ApiError> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -55,7 +55,7 @@ fn require_json(headers: &HeaderMap) -> Result<(), ApiError> {
     Err(ApiError::bad_request("Unsupported Content-Type."))
 }
 
-fn parse_json_body(body: &Bytes) -> Result<Map<String, Value>, ApiError> {
+pub(crate) fn parse_json_body(body: &Bytes) -> Result<Map<String, Value>, ApiError> {
     if body.is_empty() {
         return Ok(Map::new());
     }
@@ -1220,6 +1220,84 @@ pub async fn with_password(
     let _ = ();
 
     let token = auth_token(&collection, &record, true)?;
+    Ok(Json(json!({
+        "record": record.to_api_json(),
+        "token": token,
+    })))
+}
+
+/// `POST /api/collections/{collection}/impersonate/{id}`
+///
+/// Superuser-only. Generates a non-refreshable static auth token for the target
+/// record, with an optional custom duration in seconds.
+pub async fn impersonate(
+    State(db): State<Db>,
+    headers: HeaderMap,
+    Path((id_or_name, record_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let auth = load_auth(&db, &headers).ok_or_else(|| {
+        ApiError::unauthorized("The request requires valid record authorization token.")
+    })?;
+    if !auth.is_superuser() {
+        return Err(ApiError::forbidden(
+            "The authorized record is not allowed to perform this action.",
+        ));
+    }
+
+    let conn = db
+        .lock()
+        .map_err(|_| ApiError::internal("database lock poisoned"))?;
+    let collection = match Collection::find(&conn, &id_or_name)
+        .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
+    {
+        Some(collection) if collection.is_auth() => collection,
+        _ => {
+            return Err(ApiError::not_found(
+                "Missing or invalid auth collection context.",
+            ))
+        }
+    };
+    let record = Record::find_by_id(&conn, &collection, &record_id)
+        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?
+        .ok_or_else(|| {
+            ApiError::not_found("The requested resource wasn't found.")
+                .with_raw_data(json!("sql: no rows in result set"))
+        })?;
+
+    require_json(&headers)?;
+    let form = parse_json_body(&body)?;
+    let duration = match form.get("duration") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Number(n)) => n.as_i64().ok_or_else(ApiError::body_load)?,
+        Some(_) => return Err(ApiError::body_load()),
+    };
+    if duration < 0 {
+        return Err(ApiError::validation(json!({
+            "duration": {
+                "code": "validation_min_greater_equal_than_required",
+                "message": "must be no less than 0",
+                "params": {"threshold": 0}
+            }
+        })));
+    }
+
+    let secret = collection
+        .token_secret("authToken")
+        .ok_or_else(|| ApiError::internal("Failed to create auth token."))?;
+    let key = tokens::signing_key(record.token_key(), secret);
+    let token_duration = if duration > 0 {
+        duration
+    } else {
+        collection.token_duration("authToken")
+    };
+    let token = tokens::new_jwt(
+        &RecordClaims::auth(record.id(), &collection.id, false),
+        &key,
+        token_duration,
+    )
+    .map_err(|e| ApiError::internal(format!("Failed to create auth token: {e}")))?;
+
     Ok(Json(json!({
         "record": record.to_api_json(),
         "token": token,

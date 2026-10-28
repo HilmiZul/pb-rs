@@ -1640,6 +1640,7 @@ dependencies = [
  "bcrypt",
  "futures-util",
  "image",
+ "jsonwebtoken",
  "oauth2",
  "pb-core",
  "rand 0.8.8",

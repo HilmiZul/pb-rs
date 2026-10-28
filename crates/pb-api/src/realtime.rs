@@ -97,6 +97,33 @@ impl Broker {
             .map(|c| (c.ip.clone(), c.auth.clone()))
     }
 
+    pub fn subscriptions(&self, id: &str) -> Option<Vec<String>> {
+        let clients = self.clients.lock().ok()?;
+        clients.get(id).map(|c| c.subscriptions.clone())
+    }
+
+    pub fn has_subscription(&self, id: &str, topic: &str) -> bool {
+        self.subscriptions(id)
+            .map(|subs| subs.iter().any(|s| subscription_topic(s) == topic))
+            .unwrap_or(false)
+    }
+
+    pub fn unsubscribe(&self, id: &str, topic: &str) {
+        if let Ok(mut clients) = self.clients.lock() {
+            if let Some(client) = clients.get_mut(id) {
+                client.subscriptions.retain(|s| subscription_topic(s) != topic);
+            }
+        }
+    }
+
+    pub fn send(&self, id: &str, event: Event) {
+        if let Ok(clients) = self.clients.lock() {
+            if let Some(client) = clients.get(id) {
+                let _ = client.sender.send(event);
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<ClientHandle> {
         let Ok(clients) = self.clients.lock() else {
             return Vec::new();
