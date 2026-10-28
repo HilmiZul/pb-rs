@@ -1769,6 +1769,178 @@ fn bind_body(headers: &HeaderMap, body: &Bytes) -> Result<Map<String, Value>, Ap
     }
 }
 
+struct UploadedFile {
+    original_name: String,
+    data: Vec<u8>,
+}
+
+fn is_multipart(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("multipart/form-data"))
+        .unwrap_or(false)
+}
+
+fn parse_multipart(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(Map<String, Value>, std::collections::HashMap<String, Vec<UploadedFile>>), ApiError> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .ok_or_else(|| ApiError::bad_request("Unsupported Content-Type."))?;
+
+    let delim = format!("--{}", boundary);
+    let delim_bytes = delim.as_bytes();
+    let mut fields: Map<String, Value> = Map::new();
+    let mut files: std::collections::HashMap<String, Vec<UploadedFile>> =
+        std::collections::HashMap::new();
+
+    // split body by boundary
+    // find all boundary positions
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut search_start = 0;
+    while let Some(idx) = find_bytes(body, delim_bytes, search_start) {
+        if search_start > 0 {
+            parts.push(&body[search_start..idx]);
+        }
+        search_start = idx + delim_bytes.len();
+        // skip CRLF after boundary
+        if search_start + 2 <= body.len() && &body[search_start..search_start + 2] == b"\r\n" {
+            search_start += 2;
+        }
+    }
+    // last part after final boundary not needed
+
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        // remove leading CRLF
+        let part = part.strip_prefix(b"\r\n").unwrap_or(part);
+        let Some(sep_idx) = find_bytes(part, b"\r\n\r\n", 0) else {
+            continue;
+        };
+        let headers_bytes = &part[..sep_idx];
+        let mut value = &part[sep_idx + 4..];
+        // trim trailing CRLF
+        if value.ends_with(b"\r\n") {
+            value = &value[..value.len() - 2];
+        }
+        // if final part has -- 
+        if value.ends_with(b"--") {
+            value = &value[..value.len() - 2];
+            if value.ends_with(b"\r\n") {
+                value = &value[..value.len() - 2];
+            }
+        }
+
+        let headers_str = String::from_utf8_lossy(headers_bytes);
+        let mut name: Option<String> = None;
+        let mut filename: Option<String> = None;
+        for line in headers_str.lines() {
+            if line.to_lowercase().starts_with("content-disposition") {
+                for seg in line.split(';') {
+                    let seg = seg.trim();
+                    if let Some(rest) = seg.strip_prefix("name=") {
+                        name = Some(rest.trim_matches('"').to_string());
+                    } else if let Some(rest) = seg.strip_prefix("filename=") {
+                        filename = Some(rest.trim_matches('"').to_string());
+                    }
+                }
+            }
+        }
+        let Some(name) = name else { continue; };
+
+        if let Some(fname) = filename {
+            if fname.is_empty() {
+                continue;
+            }
+            files.entry(name).or_default().push(UploadedFile {
+                original_name: fname,
+                data: value.to_vec(),
+            });
+        } else {
+            let text = String::from_utf8_lossy(value).to_string();
+            let existing = fields.get(&name).cloned();
+            match existing {
+                Some(Value::Array(mut arr)) => {
+                    arr.push(Value::String(text));
+                    fields.insert(name, Value::Array(arr));
+                }
+                Some(Value::String(s)) => {
+                    fields.insert(
+                        name,
+                        Value::Array(vec![Value::String(s), Value::String(text)]),
+                    );
+                }
+                _ => {
+                    fields.insert(name, Value::String(text));
+                }
+            }
+        }
+    }
+
+    Ok((fields, files))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(start);
+    }
+    let mut i = start;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn normalize_upload_name(original: &str) -> String {
+    let ext = std::path::Path::new(original)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let clean_ext = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{}", ext.to_lowercase())
+    };
+    let stem = std::path::Path::new(original)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    format!("{}_{}{}", stem, pb_core::ids::random_string(10), clean_ext)
+}
+
+fn save_uploaded_file(
+    collection_id: &str,
+    record_id: &str,
+    filename: &str,
+    data: &[u8],
+) -> Result<(), ApiError> {
+    let root = crate::records::DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("pb_data"))
+        .join("storage")
+        .join(collection_id)
+        .join(record_id);
+    std::fs::create_dir_all(&root)
+        .map_err(|e| ApiError::internal(format!("create storage dir failed: {e}")))?;
+    std::fs::write(root.join(filename), data)
+        .map_err(|e| ApiError::internal(format!("write uploaded file failed: {e}")))?;
+    Ok(())
+}
+
 /// `strconv.Atoi` for a query parameter.
 fn parse_int_param(
     query: &HashMap<String, String>,
@@ -2530,16 +2702,53 @@ pub(crate) async fn create_inner(
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
 
-    let body = bind_body(&headers, &body)?;
+    let (body, forced_id, uploaded_names) = if is_multipart(&headers) {
+        let (mut fields, files) = parse_multipart(&headers, &body)?;
+        // generate record id up front so uploaded files can be stored
+        let rid = pb_core::ids::default_random_id();
+        let mut uploaded_names: Vec<String> = Vec::new();
+        for (key, uploaded) in files {
+            let base = key
+                .trim_start_matches('+')
+                .trim_end_matches('+')
+                .trim_end_matches('-')
+                .to_string();
+            let mut names: Vec<String> = Vec::new();
+            for f in uploaded {
+                let fname = normalize_upload_name(&f.original_name);
+                save_uploaded_file(&collection.id, &rid, &fname, &f.data)?;
+                names.push(fname.clone());
+                uploaded_names.push(fname);
+            }
+            // merge with any submitted existing values (no modifier)
+            let mut merged: Vec<Value> = Vec::new();
+            if let Some(existing) = fields.get(&base) {
+                merged.extend(
+                    pb_core::fields::file_slice_value(existing)
+                        .into_iter()
+                        .map(Value::String),
+                );
+            }
+            merged.extend(names.into_iter().map(Value::String));
+            fields.insert(base, Value::Array(merged));
+        }
+        (fields, Some(rid), uploaded_names)
+    } else {
+        (bind_body(&headers, &body)?, None, Vec::new())
+    };
     let mut request = RequestInfo { body, ..request };
 
     let mut record = RecordModel::new(&collection);
+    if let Some(id) = &forced_id {
+        record.set_id(id.clone());
+    }
     if is_superuser {
         record.grant_access(AccessLevel::Superuser);
     }
     let data = record_data_from_request(&record, &request, is_superuser);
     request.body = data.clone();
     record.load(&data);
+    record.uploaded_files = uploaded_names.clone();
 
     // `pbSuperusersRecordSaveExec` always marks superusers as verified.
     if collection.name == pb_core::superusers::COLLECTION_NAME_SUPERUSERS {
@@ -2673,7 +2882,37 @@ pub(crate) async fn update_inner(
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE).with_raw_data(json!("sql: no rows in result set")))?;
 
-    let body = bind_body(&headers, &body)?;
+    let (body, uploaded_names) = if is_multipart(&headers) {
+        let (mut fields, files) = parse_multipart(&headers, &body)?;
+        let mut uploaded_names: Vec<String> = Vec::new();
+        for (key, uploaded) in files {
+            let base = key
+                .trim_start_matches('+')
+                .trim_end_matches('+')
+                .trim_end_matches('-')
+                .to_string();
+            let mut names: Vec<String> = Vec::new();
+            for f in uploaded {
+                let fname = normalize_upload_name(&f.original_name);
+                save_uploaded_file(&collection.id, &record_id, &fname, &f.data)?;
+                names.push(fname.clone());
+                uploaded_names.push(fname);
+            }
+            let mut merged: Vec<Value> = Vec::new();
+            if let Some(existing) = fields.get(&base) {
+                merged.extend(
+                    pb_core::fields::file_slice_value(existing)
+                        .into_iter()
+                        .map(Value::String),
+                );
+            }
+            merged.extend(names.into_iter().map(Value::String));
+            fields.insert(base, Value::Array(merged));
+        }
+        (fields, uploaded_names)
+    } else {
+        (bind_body(&headers, &body)?, Vec::new())
+    };
     let mut request = RequestInfo { body, ..request };
 
     // Modifiers are resolved against the eager-fetched stored record.
@@ -2695,6 +2934,7 @@ pub(crate) async fn update_inner(
         record.grant_access(AccessLevel::Superuser);
     }
     record.load(&data);
+    record.uploaded_files = uploaded_names.clone();
 
     // `pbSuperusersRecordSaveExec` always marks superusers as verified.
     if collection.name == pb_core::superusers::COLLECTION_NAME_SUPERUSERS {

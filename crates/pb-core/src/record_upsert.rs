@@ -183,6 +183,8 @@ pub struct RecordModel {
     password_confirm: String,
     old_password: String,
     disable_password_validations: bool,
+    // uploaded file names (multipart) that should bypass the "invalid new file" check
+    pub uploaded_files: Vec<String>,
 }
 
 impl RecordModel {
@@ -208,6 +210,7 @@ impl RecordModel {
             password_confirm: String::new(),
             old_password: String::new(),
             disable_password_validations: false,
+            uploaded_files: Vec::new(),
         }
     }
 
@@ -1068,7 +1071,7 @@ impl RecordModel {
 
         let added: Vec<String> = files
             .iter()
-            .filter(|file| !old_files.contains(file))
+            .filter(|file| !old_files.contains(file) && !self.uploaded_files.contains(file))
             .cloned()
             .collect();
         if !added.is_empty() {
