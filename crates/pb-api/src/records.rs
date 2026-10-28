@@ -2741,6 +2741,7 @@ pub(crate) async fn create_inner(
     let mut record = RecordModel::new(&collection);
     if let Some(id) = &forced_id {
         record.set_id(id.clone());
+        record.set_raw("id", pb_core::record_upsert::FieldValue::Text(id.clone()));
     }
     if is_superuser {
         record.grant_access(AccessLevel::Superuser);
