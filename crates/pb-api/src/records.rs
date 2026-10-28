@@ -164,9 +164,37 @@ pub async fn file_token(
     Ok(Json(json!({"token": file_token})))
 }
 
+fn is_protected_file(collection: &Collection, record: &Record, filename: &str) -> bool {
+    let api = record.to_api_json();
+    for field in collection.field_list().items() {
+        if pb_core::fields::field_type(field) != "file" {
+            continue;
+        }
+        let protected = field
+            .get("protected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !protected {
+            continue;
+        }
+        let name = pb_core::fields::field_name(field);
+        let Some(val) = api.get(name) else { continue; };
+        let contains = match val {
+            Value::String(s) => s == filename,
+            Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(filename)),
+            _ => false,
+        };
+        if contains {
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn file_download(
     State(db): State<Db>,
-    _headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Path((collection_name, record_id, filename)): Path<(String, String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Response, ApiError> {
@@ -175,9 +203,66 @@ pub async fn file_download(
     let collection = Collection::find(&conn, &collection_name)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(json!("sql: no rows in result set")))?;
-    let _record = Record::find_by_id(&conn, &collection, &record_id)
+    let record = Record::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(json!("sql: no rows in result set")))?;
+
+    // Protected file access check (mirrors oracle).
+    let protected = is_protected_file(&collection, &record, &filename);
+    if protected {
+        let settings = pb_core::settings::load(&conn).unwrap_or_default();
+        let real_ip = crate::rate_limit::real_ip(&headers, &settings, Some(addr));
+        let token = params.get("token").cloned().unwrap_or_default();
+        let auth_record = if token.is_empty() {
+            None
+        } else {
+            pb_core::records::Record::find_auth_record_by_token(&conn, &token, &[pb_core::tokens::TYPE_FILE])
+                .ok()
+                .flatten()
+        };
+        // superuser IP whitelist
+        let auth_record = if let Some(ar) = auth_record {
+            if ar.collection.name == pb_core::superusers::COLLECTION_NAME_SUPERUSERS {
+                let allowed_ips = settings.superuser_ips.clone();
+                if !allowed_ips.is_empty()
+                    && !crate::rate_limit::is_ip_in_list(&allowed_ips, &real_ip)
+                {
+                    None
+                } else {
+                    Some(ar)
+                }
+            } else {
+                Some(ar)
+            }
+        } else {
+            None
+        };
+
+        let auth_ctx = auth_record.map(|ar| crate::auth::AuthContext {
+            record: ar.clone(),
+            collection: ar.collection.clone(),
+        });
+        let mut request = RequestInfo::new(auth_ctx, Map::new(), params.clone(), &headers, "GET");
+        request.context = "protectedFile".to_string();
+
+        let allowed = if request.is_superuser() {
+            true
+        } else {
+            match collection.view_rule.as_deref() {
+                None => false,
+                Some("") => true,
+                Some(rule) => {
+                    let ctx = filter_context(&conn, &collection, true);
+                    record_rule_matches(&conn, &collection, rule, &record_id, &request, &ctx)
+                        .unwrap_or(false)
+                }
+            }
+        };
+        if !allowed {
+            drop(conn);
+            return Err(ApiError::not_found("The requested resource wasn't found."));
+        }
+    }
     drop(conn);
 
     let storage_root = DATA_DIR

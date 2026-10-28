@@ -174,7 +174,7 @@ fn default_audiences(auth: Option<&AuthContext>) -> Vec<&'static str> {
     }
 }
 
-fn is_ip_in_list(ips_or_subnets: &[String], ip: &str) -> bool {
+pub fn is_ip_in_list(ips_or_subnets: &[String], ip: &str) -> bool {
     if ips_or_subnets.is_empty() || ip.is_empty() {
         return false;
     }
