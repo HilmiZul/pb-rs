@@ -2883,6 +2883,19 @@ pub(crate) async fn update_inner(
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE).with_raw_data(json!("sql: no rows in result set")))?;
 
+    // Collect old file names per file field so they can be removed on replacement.
+    let mut old_files: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for field in collection.field_list().items() {
+        if pb_core::fields::field_type(field) != "file" {
+            continue;
+        }
+        let name = pb_core::fields::field_name(field).to_string();
+        if let Some(pb_core::record_upsert::FieldValue::List(items)) = record.get_raw(&name) {
+            old_files.insert(name, items.clone());
+        }
+    }
+
     let (body, uploaded_names) = if is_multipart(&headers) {
         let (mut fields, files) = parse_multipart(&headers, &body)?;
         let mut uploaded_names: Vec<String> = Vec::new();
@@ -2961,6 +2974,29 @@ pub(crate) async fn update_inner(
         }
         Err(SubmitError::Raw(_)) => {
             return Err(ApiError::bad_request("Failed to update record."));
+        }
+    }
+
+    // Replace old files: delete files that are no longer referenced.
+    for (field_name, old_list) in &old_files {
+        let new_list = match record.get_raw(field_name) {
+            Some(pb_core::record_upsert::FieldValue::List(v)) => v.clone(),
+            _ => Vec::new(),
+        };
+        for old in old_list {
+            if new_list.contains(old) {
+                continue;
+            }
+            let root = crate::records::DATA_DIR
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::path::PathBuf::from("pb_data"))
+                .join("storage")
+                .join(&collection.id)
+                .join(&record_id);
+            let _ = std::fs::remove_file(root.join(old));
+            // remove thumb dir if present
+            let _ = std::fs::remove_dir_all(root.join(format!("thumbs_{}", old)));
         }
     }
 
