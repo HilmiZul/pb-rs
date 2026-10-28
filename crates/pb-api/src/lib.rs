@@ -215,6 +215,7 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
     app.fallback(not_found)
         // Layer order: the last layer added is the outermost. CORS runs first so
         // preflight OPTIONS requests never hit the rate limiters or activity log.
+        .layer(axum::middleware::from_fn(redirect_underscore_slash))
         .layer(axum::middleware::from_fn_with_state(
             allowed_origins.clone(),
             cors_middleware,
@@ -301,4 +302,13 @@ async fn cors_middleware(
     let _ = headers.append(header::VARY, "Origin".parse().unwrap());
     let _ = headers.insert("Access-Control-Allow-Origin", allow_origin.parse().unwrap());
     resp
+}
+async fn redirect_underscore_slash(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.uri().path() == "/_" {
+        return axum::response::Redirect::temporary("/_/").into_response();
+    }
+    next.run(req).await
 }
