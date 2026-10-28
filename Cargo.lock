@@ -1662,6 +1662,8 @@ dependencies = [
  "clap",
  "pb-api",
  "pb-core",
+ "rusqlite",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

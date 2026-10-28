@@ -3135,52 +3135,63 @@ impl Drop for RealtimeGuard {
 }
 
 pub async fn realtime_connect(
-    State(_db): State<Db>,
+    State(db): State<Db>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
-) -> axum::response::Sse<
-    impl futures_util::Stream<Item = Result<axum::response::sse::Event, axum::BoxError>>,
-> {
+) -> axum::response::Response {
     use futures_util::stream;
     use std::time::Duration;
 
+    let settings = {
+        let conn = db.lock().unwrap();
+        pb_core::settings::load(&conn).ok()
+    }
+    .unwrap_or_default();
+    let addr = connect_info.map(|c| c.0);
+    let ip = crate::rate_limit::real_ip(&headers, &settings, addr);
+
     let client_id = pb_core::ids::random_string(40);
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
     let rx = crate::realtime::broker().register(&client_id, &ip);
     let connect_data = format!(r#"{{"clientId":"{client_id}"}}"#);
-    let guard = RealtimeGuard(client_id);
+    let guard = RealtimeGuard(client_id.clone());
 
-    let stream = stream::unfold((Some(rx), guard, false), move |(rx_opt, guard, sent)| {
+    let stream = stream::unfold((Some(rx), guard, false, client_id), move |(rx_opt, guard, sent, client_id)| {
         let connect_data = connect_data.clone();
+        let client_id = client_id.clone();
         async move {
             if !sent {
-                let ev = axum::response::sse::Event::default()
-                    .event("PB_CONNECT")
-                    .data(connect_data);
-                return Some((Ok(ev), (rx_opt, guard, true)));
+                let frame = format!(
+                    "id:{}\nevent:PB_CONNECT\ndata:{}\n\n",
+                    client_id, connect_data
+                );
+                return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(frame)), (rx_opt, guard, true, client_id)));
             }
             let mut rx = rx_opt?;
             match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
                 Ok(Some(msg)) => {
-                    let ev = axum::response::sse::Event::default()
-                        .event(msg.name)
-                        .data(msg.data);
-                    Some((Ok(ev), (Some(rx), guard, true)))
+                    let frame = format!(
+                        "id:{}\nevent:{}\ndata:{}\n\n",
+                        client_id, msg.name, msg.data
+                    );
+                    Some((Ok(axum::body::Bytes::from(frame)), (Some(rx), guard, true, client_id)))
                 }
                 Ok(None) => None,
                 Err(_) => {
-                    let ev = axum::response::sse::Event::default().comment("ping");
-                    Some((Ok(ev), (Some(rx), guard, true)))
+                    let frame = format!(":ping\n\n");
+                    Some((Ok(axum::body::Bytes::from(frame)), (Some(rx), guard, true, client_id)))
                 }
             }
         }
     });
-    axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+
+    let body = axum::body::Body::from_stream(stream);
+    axum::response::Response::builder()
+        .status(200)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .header("X-Accel-Buffering", "no")
+        .body(body)
+        .unwrap()
 }
 
 pub async fn realtime_subscribe(

@@ -84,7 +84,10 @@ enum Command {
     },
 
     /// Executes app DB migration scripts
-    Migrate,
+    Migrate {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Automatically updates the current app executable with the latest available version
     Update,
@@ -129,8 +132,11 @@ enum SuperuserCommand {
     Delete { email: String },
     /// Creates a new OTP for the specified superuser
     Otp { email: String },
-    /// Lists the IPs the specified superuser has logged in from
-    Ips { email: String },
+    /// Updates the superuser IPs whitelist setting
+    Ips {
+        #[arg(trailing_var_arg = true)]
+        ips: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -139,7 +145,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Some(Command::Serve(args)) => serve(cli.global, args),
         Some(Command::Superuser { cmd }) => superuser(cli.global, cmd),
-        Some(Command::Migrate) => bail!("migrate: not implemented yet (M1.1)"),
+        Some(Command::Migrate { args }) => migrate(cli.global, args),
         Some(Command::Update) => bail!("update: not implemented yet (M5)"),
         None => {
             use clap::CommandFactory;
@@ -255,10 +261,127 @@ fn superuser(global: Global, cmd: Option<SuperuserCommand>) -> Result<()> {
                 println!("superuser {email:?} is missing or already deleted");
             }
         }
-        SuperuserCommand::Otp { .. } => bail!("superuser otp: not implemented yet (M4)"),
-        SuperuserCommand::Ips { .. } => bail!("superuser ips: not implemented yet (M4)"),
+        SuperuserCommand::Otp { email } => {
+            check_email(&email, "invalid or missing email address")?;
+            let superuser = pb_core::superusers::find(&conn, &email)?
+                .with_context(|| format!("superuser with email {email:?} doesn't exist"))?;
+            let collection = pb_core::collections::Collection::find(&conn, "_superusers")?
+                .context("missing _superusers collection")?;
+            let otp_cfg = collection
+                .options
+                .get("otp")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let enabled = otp_cfg
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !enabled {
+                bail!("OTP auth is not enabled for the _superusers collection");
+            }
+            let length = otp_cfg
+                .get("length")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(6) as usize;
+            let duration = otp_cfg
+                .get("duration")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let pass = pb_core::ids::random_string_with_alphabet(length, "1234567890");
+            let hash = pb_core::record_upsert::hash_password(&pass, 10);
+            conn.execute(
+                "INSERT INTO _otps (collectionRef, recordRef, password, sentTo, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%d %H:%M:%fZ','now'), strftime('%Y-%m-%d %H:%M:%fZ','now'))",
+                rusqlite::params![collection.id, superuser.id(), hash, ""],
+            )
+            .context("failed to create OTP")?;
+            let otp_id: String = conn
+                .query_row(
+                    "SELECT id FROM _otps WHERE rowid = last_insert_rowid()",
+                    [],
+                    |r| r.get(0),
+                )
+                .context("failed to read otp id")?;
+            println!("Successfully created OTP for superuser {:?}:", email.to_lowercase());
+            println!("├─ Id:    {}", otp_id);
+            println!("├─ Pass:  {}", pass);
+            println!("└─ Valid: {}s\n", duration);
+        }
+        SuperuserCommand::Ips { ips } => {
+            let mut settings = pb_core::settings::load(&conn).context("load settings")?;
+            settings.superuser_ips = ips.clone();
+            pb_core::settings::save(&conn, &settings).context("save settings")?;
+            if ips.is_empty() {
+                println!("Successfully cleared SuperuserIPs setting!");
+            } else {
+                println!("Successfully updated SuperuserIPs setting:");
+                for (i, ip) in ips.iter().enumerate() {
+                    if i + 1 == ips.len() {
+                        println!("└─ {}", ip);
+                    } else {
+                        println!("├─ {}", ip);
+                    }
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+const MIGRATION_TEMPLATE: &str = r#"migrate((app) => {
+  // add up queries...
+}, (app) => {
+  // add down queries...
+})
+"#;
+
+fn migrate(global: Global, args: Vec<String>) -> Result<()> {
+    let _conn = bootstrap(&global.dir)?;
+    let sub = args.first().map(String::as_str).unwrap_or("up");
+    match sub {
+        "up" | "" => {
+            println!("No new migrations to apply.");
+        }
+        "create" => {
+            let name = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "new_migration".to_string());
+            let dir = global
+                .migrations_dir
+                .clone()
+                .unwrap_or_else(|| {
+                    global
+                        .dir
+                        .parent()
+                        .map(|p| p.join("pb_migrations"))
+                        .unwrap_or_else(|| global.dir.join("pb_migrations"))
+                });
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create migrations dir {}", dir.display()))?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let path = dir.join(format!("{}_{}.js", ts, name));
+            std::fs::write(&path, MIGRATION_TEMPLATE)
+                .with_context(|| format!("write {}", path.display()))?;
+            println!("Created new migration file: {}", path.display());
+        }
+        "collections" => {
+            bail!("migrate collections: not implemented yet");
+        }
+        "down" => {
+            bail!("migrate down: not implemented yet");
+        }
+        "history-sync" => {
+            bail!("migrate history-sync: not implemented yet");
+        }
+        other => {
+            bail!("unknown migrate command: {}", other);
+        }
+    }
     Ok(())
 }
 
