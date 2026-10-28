@@ -200,5 +200,6 @@ insert) keep `rusqlite`'s text.
 
 *Why:* only the index path is reachable from a normal API request; the others are
 500-class failures that a client cannot trigger deliberately.
-*Status:* partially resolved (index, collection DDL, and truncate paths now
-translate rusqlite errors); remaining statements still use rusqlite text.
+*Status:* partially resolved (index, collection DDL, truncate, and protected-file
+paths now translate rusqlite errors); remaining statements still use rusqlite
+text.
