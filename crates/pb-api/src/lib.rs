@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -63,7 +64,7 @@ async fn not_found(method: axum::http::Method) -> error::ApiError {
 ///
 /// `ui_dir` is the mirrored admin UI directory (`ui/_`); when present it is
 /// served under `/_/` with SPA fallback, exactly like the embedded FS.
-pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_conn: Option<Connection>) -> Router {
+pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_conn: Option<Connection>, allowed_origins: Option<Vec<String>>) -> Router {
     if let Some(dir) = data_dir {
         let _ = records::DATA_DIR.set(dir);
     }
@@ -71,6 +72,12 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
         let _ = records::AUX_DB.set(std::sync::Arc::new(std::sync::Mutex::new(ac)));
     }
     let db: Db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let allowed_origins = allowed_origins.unwrap_or_default();
+    let allowed_origins = if allowed_origins.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        allowed_origins
+    };
     // `OnServe`: start the cron ticker once the server is about to run.
     crons::start_scheduler(db.clone());
     let api = Router::new()
@@ -206,9 +213,12 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
     // The oracle binds the activity logger on the root router, so unmatched
     // `/api/*` paths and the static UI are logged too.
     app.fallback(not_found)
-        // Layer order: the last layer added is the outermost. The activity
-        // logger wraps everything (so 429s are logged), the global limiter runs
-        // before the collection-scoped one, mirroring the oracle priorities.
+        // Layer order: the last layer added is the outermost. CORS runs first so
+        // preflight OPTIONS requests never hit the rate limiters or activity log.
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_origins.clone(),
+            cors_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             db.clone(),
             rate_limit::collection_middleware,
@@ -222,4 +232,73 @@ pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBu
             activity::activity_logger,
         ))
         .with_state(db)
+}
+async fn cors_middleware(
+    State(allowed_origins): State<Vec<String>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, Method, StatusCode};
+
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let preflight = req.method() == Method::OPTIONS;
+
+    if origin.is_empty() {
+        if preflight {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        return next.run(req).await;
+    }
+
+    let mut allow_origin = String::new();
+    for o in &allowed_origins {
+        if o == "*" {
+            allow_origin = "*".to_string();
+            break;
+        }
+        if o == &origin {
+            allow_origin = origin.clone();
+            break;
+        }
+    }
+
+    if allow_origin.is_empty() {
+        if !preflight {
+            return next.run(req).await;
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if preflight {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        let headers = resp.headers_mut();
+        let _ = headers.insert(header::VARY, "Origin".parse().unwrap());
+        let _ = headers.insert("Access-Control-Allow-Origin", allow_origin.parse().unwrap());
+        let _ = headers.insert(
+            "Access-Control-Allow-Methods",
+            "GET, HEAD, PUT, PATCH, POST, DELETE".parse().unwrap(),
+        );
+        if let Some(h) = req.headers().get("Access-Control-Request-Headers") {
+            if let Ok(s) = h.to_str() {
+                if let Ok(v) = s.parse() {
+                    let _ = headers.insert("Access-Control-Allow-Headers", v);
+                }
+            }
+        }
+        // Vary for method/headers
+        let _ = headers.append(header::VARY, "Access-Control-Request-Method".parse().unwrap());
+        let _ = headers.append(header::VARY, "Access-Control-Request-Headers".parse().unwrap());
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    let _ = headers.append(header::VARY, "Origin".parse().unwrap());
+    let _ = headers.insert("Access-Control-Allow-Origin", allow_origin.parse().unwrap());
+    resp
 }

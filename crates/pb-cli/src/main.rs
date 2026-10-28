@@ -185,7 +185,7 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         println!("Server started at http://{addr}");
-        let app = pb_api::router(data_db, ui_dir, Some(global.dir.clone()), Some(aux_db))
+        let app = pb_api::router(data_db, ui_dir, Some(global.dir.clone()), Some(aux_db), args.origins.clone())
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         pb_api::axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
