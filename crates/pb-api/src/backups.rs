@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,6 +56,7 @@ fn invalid_name_error(message: &str) -> ApiError {
         "An error occurred while validating the submitted data.",
         validation::errors_to_value(&errors),
     )
+    .with_raw_data(validation::errors_to_log_value(&errors))
 }
 
 fn validation_error(field: &str, node: validation::Node) -> ApiError {
@@ -66,6 +67,7 @@ fn validation_error(field: &str, node: validation::Node) -> ApiError {
         "An error occurred while validating the submitted data.",
         validation::errors_to_value(&errors),
     )
+    .with_raw_data(validation::errors_to_log_value(&errors))
 }
 
 /// `inflector.Snakecase`.
@@ -97,6 +99,68 @@ fn snakecase(input: &str) -> String {
     }
     flush(&mut word, &mut out);
     out.to_lowercase()
+}
+
+/// `filesystem.extractExtension`: last extension, including a secondary one
+/// (`test.tar.gz` -> `.tar.gz`).
+fn extract_extension(name: &str) -> &str {
+    match name.rfind('.') {
+        None => "",
+        Some(primary) => match name[..primary].rfind('.') {
+            Some(secondary) => &name[secondary..],
+            None => &name[primary..],
+        },
+    }
+}
+
+/// `filesystem.normalizeName`: the random internal name used in validation
+/// messages. The upload itself is stored under the original filename.
+fn normalize_upload_name(name: &str, data: &[u8]) -> String {
+    const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+    // cut the name even if it is not multibyte safe, like the oracle.
+    let name = if name.len() > 300 {
+        &name[name.len() - 300..]
+    } else {
+        name
+    };
+
+    let original_ext = extract_extension(name);
+    let clean_ext: String = original_ext
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '*' | '-' | '+' | '=' | '#'))
+        .collect();
+    let mut clean_ext = format!(".{}", clean_ext.trim_matches('.'));
+    if clean_ext == "." {
+        // `detectExtension`: only the content types we accept need an
+        // extension; the oracle falls back to the detected mime extension.
+        clean_ext = if data.starts_with(b"PK\x03\x04") {
+            ".zip".to_string()
+        } else {
+            String::new()
+        };
+    }
+    if clean_ext.len() > 20 {
+        clean_ext = format!(".{}", clean_ext[clean_ext.len() - 20..].trim_matches('.'));
+    }
+
+    let base = name
+        .strip_suffix(original_ext)
+        .unwrap_or(name)
+        .trim_matches('.');
+    let mut clean_name = snakecase(base);
+    if clean_name.len() < 3 {
+        clean_name.push_str(&pb_core::ids::random_string_with_alphabet(10, ALPHABET));
+    } else if clean_name.len() > 100 {
+        clean_name.truncate(100);
+    }
+
+    format!(
+        "{}_{}{}",
+        clean_name,
+        pb_core::ids::random_string_with_alphabet(10, ALPHABET),
+        clean_ext
+    )
 }
 
 fn now_timestamp(conn: &rusqlite::Connection, format: &str) -> String {
@@ -413,13 +477,14 @@ pub async fn upload(
     };
     let valid_zip = zip::ZipArchive::new(std::io::Cursor::new(&data)).is_ok();
     if name.is_empty() || !valid_zip {
+        let normalized = normalize_upload_name(&name, &data);
         return Err(validation_error(
             "file",
             validation::leaf(
                 "validation_invalid_mime_type",
                 format!(
                     "\"{}\" mime type must be one of: application/zip.",
-                    name
+                    normalized
                 ),
             ),
         ));
@@ -513,17 +578,29 @@ pub async fn restore(
     let data = data_dir();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(1));
-        let result = restore_zip(&path, &data);
-        if let Err(err) = result {
+        if let Err(err) = restore_zip(&path, &data) {
             eprintln!("failed to restore backup: {err}");
+            *active().lock().unwrap() = None;
+            return;
         }
-        *active().lock().unwrap() = None;
+        if let Err(err) = restart_process() {
+            eprintln!("failed to restart after restore: {err}");
+            *active().lock().unwrap() = None;
+        }
     });
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn restore_zip(path: &FsPath, data: &FsPath) -> Result<(), String> {
+/// Entries that are never moved during a restore (`BackupEvent.Exclude`).
+const RESTORE_EXCLUDE: &[&str] = &[
+    BACKUPS_DIR,
+    ".pb_temp_to_delete",
+    ".autocert_cache",
+    "lost+found",
+];
+
+fn extract_zip(path: &FsPath, dest: &FsPath) -> Result<(), String> {
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
     for i in 0..archive.len() {
@@ -531,7 +608,7 @@ fn restore_zip(path: &FsPath, data: &FsPath) -> Result<(), String> {
         let Some(name) = entry.enclosed_name() else {
             continue;
         };
-        let out = data.join(name);
+        let out = dest.join(name);
         if entry.is_dir() {
             fs::create_dir_all(&out).map_err(|e| e.to_string())?;
             continue;
@@ -544,6 +621,59 @@ fn restore_zip(path: &FsPath, data: &FsPath) -> Result<(), String> {
         fs::write(&out, buf).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// `osutils.MoveDirContent`: move every entry except the excluded names.
+fn move_dir_content(src: &FsPath, dst: &FsPath, exclude: &[&str]) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let read = fs::read_dir(src).map_err(|e| e.to_string())?;
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if exclude.contains(&name.as_str()) {
+            continue;
+        }
+        fs::rename(entry.path(), dst.join(&name)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn restore_zip(path: &FsPath, data: &FsPath) -> Result<(), String> {
+    let temp_root = data.join(".pb_temp_to_delete");
+    fs::create_dir_all(&temp_root).map_err(|e| e.to_string())?;
+
+    let suffix = pb_core::ids::default_random_id();
+    let extracted = temp_root.join(format!("pb_restore_{suffix}"));
+    extract_zip(path, &extracted)?;
+
+    if !extracted.join(pb_core::DATA_DB).is_file() {
+        return Err("data.db file is missing or invalid".to_string());
+    }
+
+    // Move the current content aside (including the WAL/SHM files) and the
+    // restored content into pb_data. The old directory is removed on the next
+    // bootstrap, like the oracle.
+    let old = temp_root.join(format!("old_pb_data_{suffix}"));
+    move_dir_content(data, &old, RESTORE_EXCLUDE)?;
+    move_dir_content(&extracted, data, RESTORE_EXCLUDE)?;
+    let _ = fs::remove_dir(&extracted);
+    Ok(())
+}
+
+/// `App.Restart`: replace the current process image with the same binary and
+/// arguments. Only returns on failure.
+#[cfg(unix)]
+fn restart_process() -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let error = std::process::Command::new(exe).args(args).exec();
+    Err(format!("failed to restart the app process: {error}"))
+}
+
+#[cfg(not(unix))]
+fn restart_process() -> Result<(), String> {
+    Err("restart is not supported on this platform".to_string())
 }
 
 /// Runs a backup immediately (used by the `__pbAutoBackup__` cron job).

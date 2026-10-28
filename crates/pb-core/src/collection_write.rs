@@ -1067,7 +1067,7 @@ fn validate_inner(
             "id",
             Some(validation::leaf(
                 "validation_match_invalid",
-                "Must be in a valid format.",
+                "must be in a valid format",
             )),
         );
     } else if all.iter().any(|other| other.id == c.id) {
@@ -1284,7 +1284,7 @@ fn validate_collection_name(
     if !is_word(name) {
         return Some(validation::leaf(
             "validation_match_invalid",
-            "Must be in a valid format.",
+            "must be in a valid format",
         ));
     }
 
@@ -2508,10 +2508,36 @@ pub fn import_collections(
 
     for draft in &mut imported {
         let original = all.iter().find(|c| c.id == draft.collection.id).cloned();
-        if let Some(orig) = original {
-            save_update(conn, draft, &orig, &all).map_err(|e| e)?;
+        let result = if let Some(orig) = original {
+            save_update(conn, draft, &orig, &all)
         } else {
-            save(conn, draft, &all).map_err(|e| e)?;
+            save(conn, draft, &all)
+        };
+        match result {
+            Ok(()) => {}
+            Err(SaveError::Validation(errors)) => {
+                // `collection_import.go`: the per-collection validation tree is
+                // JSON-serialized (raw messages, two-space indent) into one
+                // `collections` leaf.
+                let serialized =
+                    serde_json::to_string_pretty(&validation::errors_to_log_value(&errors))
+                        .unwrap_or_default();
+                let mut wrapped = validation::Errors::new();
+                wrapped.insert(
+                    "collections".into(),
+                    validation::leaf(
+                        "validation_collections_import_failure",
+                        format!(
+                            "Data validations failed for collection {} ({}):\n{}",
+                            crate::fields::go_quote(&draft.collection.name),
+                            draft.collection.id,
+                            serialized
+                        ),
+                    ),
+                );
+                return Err(SaveError::Validation(wrapped));
+            }
+            Err(err) => return Err(err),
         }
     }
 
@@ -2588,26 +2614,81 @@ fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-/// `app.TruncateCollection`.
-///
-/// Record hooks (cascade deletes, the "only superuser" guard) belong to the
-/// record CRUD milestone (D10); until then the only observable guard is the
-/// superuser one, which the oracle enforces per deleted record.
-pub fn truncate(conn: &mut Connection, collection: &Collection) -> Result<(), String> {
+/// `app.TruncateCollection`: delete the records in batches of 500 through the
+/// regular record delete path, so relation cascades and the superuser guard
+/// behave exactly like the oracle. The whole operation runs in a savepoint.
+pub fn truncate(
+    conn: &mut Connection,
+    collection: &Collection,
+) -> Result<(), crate::record_delete::DeleteError> {
+    use crate::record_delete::{delete_record_in_savepoint, DeleteError};
+    use crate::record_upsert::RecordModel;
+
     if collection.is_view() {
-        return Err("view collections cannot be truncated since they don't store their own records".into());
+        return Err(DeleteError::Raw(
+            "view collections cannot be truncated since they don't store their own records".into(),
+        ));
     }
 
-    if collection.name == "_superusers" {
-        let total: i64 = conn
-            .query_row("SELECT count(*) FROM `_superusers`", [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        if total > 0 {
-            return Err("You can't delete the only existing superuser".into());
+    let all = Collection::load_all(conn).map_err(|e| DeleteError::Raw(e.to_string()))?;
+    conn.execute_batch("SAVEPOINT pb_truncate")
+        .map_err(|e| DeleteError::Raw(e.to_string()))?;
+
+    let mut deleted = Vec::new();
+    let result = (|| -> Result<(), DeleteError> {
+        loop {
+            let ids: Vec<String> = {
+                let sql = format!(
+                    "SELECT id FROM {} LIMIT 500",
+                    quote_ident(&collection.name)
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| DeleteError::Raw(e.to_string()))?;
+                let mut rows = stmt
+                    .query([])
+                    .map_err(|e| DeleteError::Raw(e.to_string()))?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| DeleteError::Raw(e.to_string()))?
+                {
+                    ids.push(
+                        row.get::<_, String>(0)
+                            .map_err(|e| DeleteError::Raw(e.to_string()))?,
+                    );
+                }
+                ids
+            };
+
+            if ids.is_empty() {
+                break;
+            }
+
+            for id in ids {
+                let Some(record) = RecordModel::find_by_id(conn, collection, &id)
+                    .map_err(|e| DeleteError::Raw(e.to_string()))?
+                else {
+                    // A cascade deleted it after the batch query.
+                    continue;
+                };
+                delete_record_in_savepoint(conn, &all, collection, &record, &mut deleted)?;
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE pb_truncate")
+                .map_err(|e| DeleteError::Raw(e.to_string()))?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK TO pb_truncate; RELEASE pb_truncate");
+            Err(err)
         }
     }
-
-    schema_sync::truncate(conn, collection).map_err(|e| e.to_string())
 }
 
 /// `collectionValidator.checkRule`: ensure a rule expression parses and every
@@ -2640,9 +2721,18 @@ fn validate_rule(
         relations
     };
 
-    let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
-    for col in all {
-        let info = search::CollectionInfo {
+    let info_for = |col: &Collection| -> search::CollectionInfo {
+        let mut field_types = HashMap::new();
+        let mut hidden = std::collections::HashSet::new();
+        for f in col.field_list().items() {
+            let name = fields::field_name(f).to_string();
+            field_types.insert(name.clone(), fields::field_type(f).to_string());
+            if fields::field_bool(f, "hidden") {
+                hidden.insert(name);
+            }
+        }
+        field_types.insert("id".to_string(), "text".to_string());
+        search::CollectionInfo {
             table: col.name.clone(),
             fields: col
                 .field_list()
@@ -2651,29 +2741,45 @@ fn validate_rule(
                 .map(|f| fields::field_name(f).to_string())
                 .chain(std::iter::once("id".to_string()))
                 .collect(),
+            field_types,
+            hidden,
             relations: relations_for(col),
-        };
+        }
+    };
+
+    let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
+    for col in all {
+        let info = info_for(col);
         collections.insert(col.name.clone(), info.clone());
         collections.insert(col.id.clone(), info);
     }
 
-    let relations = relations_for(c);
-    let allowed: Vec<String> = c
-        .field_list()
-        .items()
-        .iter()
-        .map(|f| fields::field_name(f).to_string())
-        .chain(std::iter::once("id".to_string()))
-        .collect();
+    // `checkRule` resolves against the *draft* collection (validator.new),
+    // which may not be part of `all` yet (create) or still be the old version
+    // (update).
+    let base = info_for(c);
+    collections.insert(c.name.clone(), base.clone());
+    collections.insert(c.id.clone(), base.clone());
+
+    let relations = base.relations.clone();
+    let allowed: Vec<String> = base.fields.clone();
 
     let empty_request = search::RequestData::default();
     let types = search::RequestFieldTypes::default();
 
     let expr = search::parse(rule).map_err(|e| e.0)?;
+    search::validate_record_expr(&expr, &base, &collections).map_err(|e| e.0)?;
     let expr = search::resolve_request_fields(&expr, &empty_request, &types).map_err(|e| e.0)?;
-    search::build_sql_full(&expr, &allowed, None, &relations, &collections)
-        .map(|_| ())
-        .map_err(|e| e.0)
+    search::build_sql_full_with_types(
+        &expr,
+        &allowed,
+        None,
+        &relations,
+        &collections,
+        &base.field_types,
+    )
+    .map(|_| ())
+    .map_err(|e| e.0)
 }
 
 #[cfg(test)]

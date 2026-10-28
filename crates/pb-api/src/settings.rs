@@ -67,12 +67,16 @@ pub async fn set(
             StatusCode::BAD_REQUEST,
             "An error occurred while saving the new settings.",
             settings::errors_to_value(&errors),
-        ));
+        )
+        .with_raw_data(pb_core::validation::errors_to_log_value(&errors)));
     }
 
     // The save hook normalizes nothing else; persist as-is.
     settings::save(&conn, &settings)
         .map_err(|e| ApiError::internal(format!("failed to save settings: {e}")))?;
+
+    // `OnSettingsReload` destroys the rate limiter store.
+    crate::rate_limit::reset();
 
     let saved: Settings = settings::load(&conn)
         .map_err(|e| ApiError::internal(format!("failed to reload settings: {e}")))?;

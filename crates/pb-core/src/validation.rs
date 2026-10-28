@@ -59,7 +59,8 @@ pub fn required() -> Node {
 
 /// `validation.ErrInInvalid`.
 pub fn invalid_in() -> Node {
-    leaf("validation_in_invalid", "Must be a valid value.")
+    // ozzo's raw message; the API layer sentenizes it on output.
+    leaf("validation_in_invalid", "must be a valid value")
 }
 
 /// `validation.ErrEmpty` (`validation.Empty`).
@@ -104,7 +105,7 @@ pub fn min(value: i64, threshold: i64) -> Option<Node> {
     if value < threshold {
         return Some(leaf_with_params(
             "validation_min_greater_equal_than_required",
-            format!("Must be no less than {threshold}."),
+            "must be no less than {{.threshold}}",
             json!({ "threshold": threshold }),
         ));
     }
@@ -119,7 +120,7 @@ pub fn max(value: i64, threshold: i64) -> Option<Node> {
     if value > threshold {
         return Some(leaf_with_params(
             "validation_max_less_equal_than_required",
-            format!("Must be no greater than {threshold}."),
+            "must be no greater than {{.threshold}}",
             json!({ "threshold": threshold }),
         ));
     }
@@ -176,6 +177,25 @@ pub fn errors_to_value(errors: &Errors) -> Value {
     let mut out = serde_json::Map::new();
     for (key, node) in errors {
         out.insert(key.clone(), node_to_value(node));
+    }
+    Value::Object(out)
+}
+
+/// `validation.Errors.MarshalJSON`: branches become nested objects and leaves
+/// their interpolated message **without** `inflector.Sentenize`.
+///
+/// This is what the activity logger records as `details` (`ApiError.RawData`),
+/// unlike the public response body which uses [`errors_to_value`].
+pub fn errors_to_log_value(errors: &Errors) -> Value {
+    let mut out = serde_json::Map::new();
+    for (key, node) in errors {
+        let value = match node {
+            Node::Branch(inner) => errors_to_log_value(inner),
+            Node::Leaf(error) => {
+                Value::String(interpolate(&error.message, error.params.as_ref()))
+            }
+        };
+        out.insert(key.clone(), value);
     }
     Value::Object(out)
 }
@@ -307,7 +327,7 @@ mod tests {
             min(-1, 1),
             Some(leaf_with_params(
                 "validation_min_greater_equal_than_required",
-                "Must be no less than 1.",
+                "must be no less than {{.threshold}}",
                 json!({"threshold": 1})
             ))
         );
@@ -316,7 +336,7 @@ mod tests {
             max(11, 10),
             Some(leaf_with_params(
                 "validation_max_less_equal_than_required",
-                "Must be no greater than 10.",
+                "must be no greater than {{.threshold}}",
                 json!({"threshold": 10})
             ))
         );

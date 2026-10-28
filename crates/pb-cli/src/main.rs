@@ -179,7 +179,9 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         println!("Server started at http://{addr}");
-        pb_api::axum::serve(listener, pb_api::router(data_db, ui_dir, Some(global.dir.clone()), Some(aux_db)))
+        let app = pb_api::router(data_db, ui_dir, Some(global.dir.clone()), Some(aux_db))
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        pb_api::axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("http server")?;
@@ -194,6 +196,8 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
 fn bootstrap(data_dir: &Path) -> Result<pb_core::rusqlite::Connection> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
+    // `LocalTempDirName` is deleted on every app bootstrap.
+    let _ = std::fs::remove_dir_all(data_dir.join(".pb_temp_to_delete"));
 
     let data_db = pb_core::db::open(&data_dir.join(pb_core::DATA_DB))?;
     let recorded = pb_core::migrations::migrate_data(&data_db)?;

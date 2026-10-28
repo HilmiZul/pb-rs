@@ -51,11 +51,14 @@ fn search_error() -> ApiError {
     )
 }
 
+/// A generic search error carrying the oracle's internal error string.
+fn search_error_raw(raw: impl Into<String>) -> ApiError {
+    search_error().with_raw_data(json!(raw.into()))
+}
+
 /// `strconv.Atoi`.
 fn parse_int(raw: &str) -> Result<i64, ApiError> {
-    raw.trim()
-        .parse::<i64>()
-        .map_err(|_| search_error())
+    crate::records::go_atoi(raw).map_err(search_error_raw)
 }
 
 /// `strconv.ParseBool`.
@@ -63,7 +66,7 @@ fn parse_bool(raw: &str) -> Result<bool, ApiError> {
     match raw {
         "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
-        _ => Err(search_error()),
+        _ => Err(search_error_raw(crate::records::go_parse_bool_error(raw))),
     }
 }
 
@@ -98,7 +101,12 @@ fn validate_sort(fields: &[SortField]) -> Result<(), ApiError> {
         match field.name.as_str() {
             "@random" | "@rowid" => {}
             name if SORT_FIELDS.contains(&name) => {}
-            _ => return Err(search_error()),
+            _ => {
+                return Err(search_error_raw(format!(
+                    "invalid sort field {}",
+                    pb_core::fields::go_quote(&field.name)
+                )))
+            }
         }
     }
     Ok(())
@@ -204,15 +212,9 @@ pub async fn list(
     // `_collections` table itself.
     if let Some(filter) = params.filter.as_deref().filter(|f| !f.trim().is_empty()) {
         let allowed: Vec<String> = SORT_FIELDS.iter().map(|f| f.to_string()).collect();
-        let expr = pb_core::search::parse(filter).map_err(|_| search_error())?;
-        let sf = pb_core::search::build_sql_full(
-            &expr,
-            &allowed,
-            None,
-            &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
-        )
-        .map_err(|_| search_error())?;
+        let expr = pb_core::search::parse(filter).map_err(|err| search_error_raw(err.0))?;
+        let sf = pb_core::search::build_sql_simple(&expr, &allowed, false)
+            .map_err(|err| search_error_raw(err.0))?;
         let sql = format!("SELECT id FROM _collections WHERE {}", sf.sql);
         let sql_params: Vec<rusqlite::types::Value> =
             sf.params.iter().map(json_to_sqlite).collect();
@@ -269,7 +271,7 @@ pub async fn view(
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = Collection::find(&conn, &id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
-        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(serde_json::json!("sql: no rows in result set")))?;
 
     Ok(Json(collection.to_api_json()))
 }
@@ -361,7 +363,8 @@ pub async fn dry_run_view(
             StatusCode::BAD_REQUEST,
             "An error occurred while validating the submitted data.",
             validation::errors_to_value(&errors),
-        ));
+        )
+        .with_raw_data(validation::errors_to_log_value(&errors)));
     }
 
     let conn = db
@@ -417,7 +420,8 @@ pub async fn create(
             StatusCode::BAD_REQUEST,
             "Failed to create collection.",
             validation::errors_to_value(&errors),
-        )),
+        )
+        .with_raw_data(validation::errors_to_log_value(&errors))),
         // `e.BadRequestError("Failed to create collection. Raw error: \n"+err.Error(), nil)`
         Err(SaveError::NotFound) => Err(ApiError::not_found("The requested resource wasn't found.")),
         Err(SaveError::Raw(message)) => Err(ApiError::bad_request(format!(
@@ -440,7 +444,7 @@ pub async fn update(
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let original = Collection::find(&conn, &id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
-        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(serde_json::json!("sql: no rows in result set")))?;
 
     let payload = match crate::body::bind_json(&headers, &body) {
         Ok(Some(value)) => value,
@@ -465,7 +469,8 @@ pub async fn update(
             StatusCode::BAD_REQUEST,
             "Failed to update collection.",
             validation::errors_to_value(&errors),
-        )),
+        )
+        .with_raw_data(validation::errors_to_log_value(&errors))),
         Err(collection_write::SaveError::NotFound) => {
             Err(ApiError::not_found("The requested resource wasn't found."))
         }
@@ -508,7 +513,8 @@ pub async fn import(
             StatusCode::BAD_REQUEST,
             "An error occurred while validating the submitted data.",
             validation::errors_to_value(&errs),
-        ));
+        )
+        .with_raw_data(validation::errors_to_log_value(&errs)));
     }
     let delete_missing = form.delete_missing.unwrap_or(false);
 
@@ -522,7 +528,8 @@ pub async fn import(
             StatusCode::BAD_REQUEST,
             "Failed to import collections.",
             validation::errors_to_value(&errors),
-        )),
+        )
+        .with_raw_data(validation::errors_to_log_value(&errors))),
         Err(collection_write::SaveError::NotFound) => {
             Err(ApiError::not_found("The requested resource wasn't found."))
         }
@@ -545,7 +552,7 @@ pub async fn delete(
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = Collection::find(&conn, &id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
-        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(serde_json::json!("sql: no rows in result set")))?;
 
     let all = Collection::load_all(&conn)
         .map_err(|e| ApiError::internal(format!("failed to load collections: {e}")))?;
@@ -577,7 +584,7 @@ pub async fn truncate(
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = Collection::find(&conn, &id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
-        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(serde_json::json!("sql: no rows in result set")))?;
 
     if collection.is_view() {
         return Err(ApiError::bad_request(
@@ -587,9 +594,22 @@ pub async fn truncate(
 
     match collection_write::truncate(&mut conn, &collection) {
         Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
-        Err(_) => Err(ApiError::bad_request(
-            "Failed to truncate collection (most likely due to required cascade delete record references).",
-        )),
+        Err(err) => {
+            // `e.BadRequestError(message, err)`: the raw data is the underlying
+            // error (a plain string, or the hook's ApiError object).
+            let raw = match err {
+                pb_core::record_delete::DeleteError::Api { message } => json!({
+                    "data": {},
+                    "message": pb_core::validation::sentenize(&message),
+                    "status": 400,
+                }),
+                pb_core::record_delete::DeleteError::Raw(message) => json!(message),
+            };
+            Err(ApiError::bad_request(
+                "Failed to truncate collection (most likely due to required cascade delete record references).",
+            )
+            .with_raw_data(raw))
+        }
     }
 }
 

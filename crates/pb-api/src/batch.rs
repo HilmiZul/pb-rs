@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use pb_core::validation::{self, Errors, Node};
@@ -32,8 +32,13 @@ fn batch_error(status: u16, message: &str, data: Value) -> Value {
     })
 }
 
-fn request_error(message: &str, data: Value) -> ApiError {
-    ApiError::new(StatusCode::BAD_REQUEST, message, data)
+fn request_error(message: &str, errors: &Errors) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        message,
+        validation::errors_to_value(errors),
+    )
+    .with_raw_data(validation::errors_to_log_value(errors))
 }
 
 fn parse_query(raw: &str) -> HashMap<String, String> {
@@ -101,6 +106,7 @@ enum HandlerResult {
     Empty,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     db: &Db,
     base_headers: &HeaderMap,
@@ -108,6 +114,7 @@ async fn dispatch(
     url: &str,
     body: Value,
     headers: &Map<String, Value>,
+    addr: std::net::SocketAddr,
 ) -> Result<HandlerResult, ApiError> {
     let Some(parsed) = parse_records_url(url) else {
         return Err(ApiError::bad_request("Something went wrong while processing your request."));
@@ -119,6 +126,7 @@ async fn dispatch(
     } = parsed;
     let headers = merged_headers(base_headers, headers);
     let query = Query(query);
+    let inner_path = url.split('?').next().unwrap_or(url);
 
     if matches!(method, "POST" | "PUT" | "PATCH") {
         let payload = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
@@ -131,19 +139,35 @@ async fn dispatch(
 
         let result = match (method, record_id.as_deref()) {
             ("POST", None) => {
-                records::create(State(db.clone()), headers, Path(collection), query, bytes).await
-            }
-            ("PATCH", Some(id)) => {
-                records::update(
-                    State(db.clone()),
+                records::create_inner(
+                    db.clone(),
                     headers,
-                    Path((collection, id.to_string())),
-                    query,
+                    collection,
+                    query.0,
                     bytes,
+                    addr,
+                    inner_path,
+                    "",
                 )
                 .await
             }
-            ("PUT", None) => return upsert(db, headers, collection, query, bytes).await,
+            ("PATCH", Some(id)) => {
+                records::update_inner(
+                    db.clone(),
+                    headers,
+                    collection,
+                    id.to_string(),
+                    query.0,
+                    bytes,
+                    addr,
+                    inner_path,
+                    "",
+                )
+                .await
+            }
+            ("PUT", None) => {
+                return upsert(db, headers, collection, query, bytes, addr).await
+            }
             _ => return Err(ApiError::bad_request("Something went wrong while processing your request.")),
         };
         return result.map(|Json(value)| HandlerResult::Json(value));
@@ -151,7 +175,16 @@ async fn dispatch(
 
     match (method, record_id) {
         ("DELETE", Some(id)) => {
-            records::delete(State(db.clone()), headers, Path((collection, id))).await?;
+            records::delete_inner(
+                db.clone(),
+                headers,
+                collection,
+                id,
+                addr,
+                inner_path,
+                "",
+            )
+            .await?;
             Ok(HandlerResult::Empty)
         }
         _ => Err(ApiError::bad_request("Something went wrong while processing your request.")),
@@ -166,6 +199,7 @@ async fn upsert(
     collection: String,
     query: Query<HashMap<String, String>>,
     bytes: Bytes,
+    addr: std::net::SocketAddr,
 ) -> Result<HandlerResult, ApiError> {
     let id = serde_json::from_slice::<Value>(&bytes)
         .ok()
@@ -188,19 +222,35 @@ async fn upsert(
                 .is_some()
         };
         if exists {
-            let result = records::update(
-                State(db.clone()),
+            let path = format!("/api/collections/{collection}/records/{id}");
+            let result = records::update_inner(
+                db.clone(),
                 headers,
-                Path((collection, id)),
-                query,
+                collection,
+                id,
+                query.0,
                 bytes,
+                addr,
+                &path,
+                "",
             )
             .await?;
             return Ok(HandlerResult::Json(result.0));
         }
     }
 
-    let result = records::create(State(db.clone()), headers, Path(collection), query, bytes).await?;
+    let path = format!("/api/collections/{collection}/records");
+    let result = records::create_inner(
+        db.clone(),
+        headers,
+        collection,
+        query.0,
+        bytes,
+        addr,
+        &path,
+        "",
+    )
+    .await?;
     Ok(HandlerResult::Json(result.0))
 }
 
@@ -214,6 +264,7 @@ fn length_too_long(max: usize) -> Node {
 
 pub async fn batch_transaction(
     State(db): State<Db>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
@@ -243,7 +294,7 @@ pub async fn batch_transaction(
         errors.insert("requests".into(), validation::required());
         return Err(request_error(
             "Invalid batch request data.",
-            validation::errors_to_value(&errors),
+            &errors,
         ));
     };
 
@@ -252,7 +303,7 @@ pub async fn batch_transaction(
         errors.insert("requests".into(), validation::required());
         return Err(request_error(
             "Invalid batch request data.",
-            validation::errors_to_value(&errors),
+            &errors,
         ));
     }
     if requests.len() > max_requests {
@@ -260,7 +311,7 @@ pub async fn batch_transaction(
         errors.insert("requests".into(), length_too_long(max_requests));
         return Err(request_error(
             "Invalid batch request data.",
-            validation::errors_to_value(&errors),
+            &errors,
         ));
     }
 
@@ -289,7 +340,7 @@ pub async fn batch_transaction(
         errors.insert("requests".into(), Node::Branch(request_errors));
         return Err(request_error(
             "Invalid batch request data.",
-            validation::errors_to_value(&errors),
+            &errors,
         ));
     }
 
@@ -313,12 +364,12 @@ pub async fn batch_transaction(
             .cloned()
             .unwrap_or_default();
 
-        match dispatch(&db, &headers, method, url, body, &item_headers).await {
+        match dispatch(&db, &headers, method, url, body, &item_headers, addr).await {
             Ok(HandlerResult::Json(value)) => {
-                results.push(json!({ "status": 200, "body": value }));
+                results.push(json!({ "body": value, "status": 200 }));
             }
             Ok(HandlerResult::Empty) => {
-                results.push(json!({ "status": 204, "body": Value::Null }));
+                results.push(json!({ "body": Value::Null, "status": 204 }));
             }
             Err(err) => {
                 let status = err.status.as_u16();

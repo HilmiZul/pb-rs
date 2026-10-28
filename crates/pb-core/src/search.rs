@@ -1,11 +1,8 @@
-//! Minimal filter-expression parser (`tools/search/filter.go`).
+//! Filter-expression parsing and SQL generation (`tools/search/filter.go`).
 //!
-//! This is a *partial* port: it handles comparisons (`=`, `!=`, `>`, `>=`,
-//! `<`, `<=`, `~`, `!~`), logical `&&`/`||`, parentheses, field references,
-//! literals (`'str'`, numbers, `true`/`false`/`null`) and a handful of
-//! functions (`lower`, `upper`, `trim`, `length`). Relation traversal
-//! (`a.b`), `@request.auth`/`@collection` macros, `@now`/`@rowid` and the
-//! multi-match subqueries are NOT implemented yet and are tracked for M3b.
+//! The grammar is the faithful [`crate::fexpr`] port; this module converts the
+//! flat token groups into an [`Expr`] tree, resolves record fields/macros and
+//! renders SQLite WHERE fragments with PocketBase's null-fallback semantics.
 
 use std::fmt;
 
@@ -26,7 +23,8 @@ pub enum Expr {
     /// `@collection.<nameOrId>[:alias].<field>[.<sub>]`.
     CollectionField(String),
     AuthField(String),
-    Now,
+    /// `identifierMacros`: `@now`, `@todayStart`, ...
+    Macro(String),
     Literal(Literal),
     Func {
         name: String,
@@ -120,349 +118,184 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-// ---------- Lexer----------
+// ---------- Parsing (`fexpr` port) ----------
 
-#[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    Eof,
-    Ident(String),
-    String(String),
-    Number(f64),
-    Op(String), // multi-char or single-char operators
-    LParen,
-    RParen,
-    Comma,
-}
-
-fn lex(input: &str) -> Result<Vec<Tok>, ParseError> {
-    let chars: Vec<char> = input.chars().collect();
-    let mut pos = 0;
-    let mut out = Vec::new();
-    while pos < chars.len() {
-        let c = chars[pos];
-        if c.is_whitespace() {
-            pos += 1;
-            continue;
-        }
-        if c == '(' {
-            out.push(Tok::LParen);
-            pos += 1;
-            continue;
-        }
-        if c == ')' {
-            out.push(Tok::RParen);
-            pos += 1;
-            continue;
-        }
-        if c == ',' {
-            out.push(Tok::Comma);
-            pos += 1;
-            continue;
-        }
-        // operators
-        if c == '?' {
-            let n = chars.get(pos + 1).copied();
-            let n2 = chars.get(pos + 2).copied();
-            let (op, len) = match (n, n2) {
-                (Some('='), _) => ("?=", 2),
-                (Some('!'), Some('=')) => ("?!=", 3),
-                (Some('!'), Some('~')) => ("?!~", 3),
-                (Some('>'), Some('=')) => ("?>=", 3),
-                (Some('>'), _) => ("?>", 2),
-                (Some('<'), Some('=')) => ("?<=", 3),
-                (Some('<'), _) => ("?<", 2),
-                (Some('~'), _) => ("?~", 2),
-                _ => return Err(ParseError("unexpected char: ?".into())),
-            };
-            out.push(Tok::Op(op.into()));
-            pos += len;
-            continue;
-        }
-        if c == '!' {
-            if pos + 1 < chars.len() && chars[pos + 1] == '=' {
-                out.push(Tok::Op("!=".into()));
-                pos += 2;
-                continue;
-            }
-            if pos + 1 < chars.len() && chars[pos + 1] == '~' {
-                out.push(Tok::Op("!~".into()));
-                pos += 2;
-                continue;
-            }
-            out.push(Tok::Op("!".into()));
-            pos += 1;
-            continue;
-        }
-        if c == '=' {
-            out.push(Tok::Op("=".into()));
-            pos += 1;
-            continue;
-        }
-        if c == '>' {
-            if pos + 1 < chars.len() && chars[pos + 1] == '=' {
-                out.push(Tok::Op(">=".into()));
-                pos += 2;
-                continue;
-            }
-            out.push(Tok::Op(">".into()));
-            pos += 1;
-            continue;
-        }
-        if c == '<' {
-            if pos + 1 < chars.len() && chars[pos + 1] == '=' {
-                out.push(Tok::Op("<=".into()));
-                pos += 2;
-                continue;
-            }
-            out.push(Tok::Op("<".into()));
-            pos += 1;
-            continue;
-        }
-        if c == '~' {
-            out.push(Tok::Op("~".into()));
-            pos += 1;
-            continue;
-        }
-        if c == '&' && pos + 1 < chars.len() && chars[pos + 1] == '&' {
-            out.push(Tok::Op("&&".into()));
-            pos += 2;
-            continue;
-        }
-        if c == '|' && pos + 1 < chars.len() && chars[pos + 1] == '|' {
-            out.push(Tok::Op("||".into()));
-            pos += 2;
-            continue;
-        }
-        // string literal
-        if c == '\'' || c == '"' {
-            let quote = c;
-            pos += 1;
-            let mut s = String::new();
-            while pos < chars.len() && chars[pos] != quote {
-                if chars[pos] == '\\' {
-                    pos += 1;
-                    if pos < chars.len() {
-                        s.push(chars[pos]);
-                        pos += 1;
-                    }
-                } else {
-                    s.push(chars[pos]);
-                    pos += 1;
-                }
-            }
-            if pos >= chars.len() {
-                return Err(ParseError("unterminated string".into()));
-            }
-            pos += 1;
-            out.push(Tok::String(s));
-            continue;
-        }
-        // number
-        if c.is_ascii_digit() || (c == '-' && pos + 1 < chars.len() && chars[pos + 1].is_ascii_digit()) {
-            let start = pos;
-            if chars[pos] == '-' {
-                pos += 1;
-            }
-            while pos < chars.len() && (chars[pos].is_ascii_digit() || chars[pos] == '.') {
-                pos += 1;
-            }
-            let s: String = chars[start..pos].iter().collect();
-            let n: f64 = s.parse().map_err(|_| ParseError(format!("bad number: {s}")))?;
-            out.push(Tok::Number(n));
-            continue;
-        }
-        // identifier
-        if c.is_alphabetic() || c == '_' || c == '@' {
-            let start = pos;
-            while pos < chars.len()
-                && (chars[pos].is_alphanumeric()
-                    || chars[pos] == '_'
-                    || chars[pos] == '.'
-                    || chars[pos] == '@'
-                    || chars[pos] == ':')
-            {
-                pos += 1;
-            }
-            let ident: String = chars[start..pos].iter().collect();
-            // keywords
-            match ident.as_str() {
-                "true" => out.push(Tok::Ident("__true__".into())),
-                "false" => out.push(Tok::Ident("__false__".into())),
-                "null" => out.push(Tok::Ident("__null__".into())),
-                _ => out.push(Tok::Ident(ident)),
-            }
-            continue;
-        }
-        return Err(ParseError(format!("unexpected char: {c}")));
-    }
-    out.push(Tok::Eof);
-    Ok(out)
-}
-
-// ----------Parser----------
-
-struct Parser {
-    toks: Vec<Tok>,
-    pos: usize,
-}
-
-impl Parser {
-    fn peek(&self) -> &Tok {
-        self.toks.get(self.pos).unwrap_or(&Tok::Eof)
-    }
-    fn advance(&mut self) {
-        if self.pos < self.toks.len() {
-            self.pos += 1;
-        }
-    }
-    fn parse(&mut self) -> Result<Expr, ParseError> {
-        let e = self.or_expr()?;
-        if !matches!(self.peek(), Tok::Eof) {
-            return Err(ParseError("trailing tokens".into()));
-        }
-        Ok(e)
-    }
-    fn or_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.and_expr()?;
-        while let Tok::Op(op) = self.peek() {
-            if op != "||" {
-                break;
-            }
-            self.advance();
-            let right = self.and_expr()?;
-            left = Expr::Or(Box::new(left), Box::new(right));
-        }
-        Ok(left)
-    }
-    fn and_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.not_expr()?;
-        while let Tok::Op(op) = self.peek() {
-            if op != "&&" {
-                break;
-            }
-            self.advance();
-            let right = self.not_expr()?;
-            left = Expr::And(Box::new(left), Box::new(right));
-        }
-        Ok(left)
-    }
-    fn not_expr(&mut self) -> Result<Expr, ParseError> {
-        if let Tok::Op(op) = self.peek() {
-            if op == "!" {
-                self.advance();
-                let e = self.not_expr()?;
-                return Ok(Expr::Not(Box::new(e)));
-            }
-        }
-        self.cmp_expr()
-    }
-    fn cmp_expr(&mut self) -> Result<Expr, ParseError> {
-        let left = self.primary()?;
-        if let Tok::Op(op) = self.peek() {
-            let cmp = match op.as_str() {
-                "=" => Some(CmpOp::Eq),
-                "!=" => Some(CmpOp::Ne),
-                ">" => Some(CmpOp::Gt),
-                ">=" => Some(CmpOp::Gte),
-                "<" => Some(CmpOp::Lt),
-                "<=" => Some(CmpOp::Lte),
-                "~" => Some(CmpOp::Contains),
-                "!~" => Some(CmpOp::NotContains),
-                "?=" => Some(CmpOp::AnyEq),
-                "?!=" => Some(CmpOp::AnyNe),
-                "?>" => Some(CmpOp::AnyGt),
-                "?>=" => Some(CmpOp::AnyGte),
-                "?<" => Some(CmpOp::AnyLt),
-                "?<=" => Some(CmpOp::AnyLte),
-                "?~" => Some(CmpOp::AnyContains),
-                "?!~" => Some(CmpOp::AnyNotContains),
-                _ => None,
-            };
-            if let Some(cmp) = cmp {
-                self.advance();
-                let right = self.primary()?;
-                return Ok(Expr::Cmp {
-                    left: Box::new(left),
-                    op: cmp,
-                    right: Box::new(right),
-                });
-            }
-        }
-        Ok(left)
-    }
-    fn primary(&mut self) -> Result<Expr, ParseError> {
-        match self.peek().clone() {
-            Tok::LParen => {
-                self.advance();
-                let e = self.or_expr()?;
-                if !matches!(self.peek(), Tok::RParen) {
-                    return Err(ParseError("expected )".into()));
-                }
-                self.advance();
-                Ok(e)
-            }
-            Tok::Ident(name) => {
-                self.advance();
-                if name == "@now" {
-                    return Ok(Expr::Now);
-                }
-                if let Some(rest) = name.strip_prefix("@collection.") {
-                    return Ok(Expr::CollectionField(rest.to_string()));
-                }
-                if let Some(rest) = name.strip_prefix("@request.auth.") {
-                    return Ok(Expr::AuthField(rest.to_string()));
-                }
-                if name == "@request.auth" {
-                    return Ok(Expr::AuthField("id".to_string()));
-                }
-                // function call?
-                if matches!(self.peek(), Tok::LParen) {
-                    self.advance();
-                    let mut args = Vec::new();
-                    if !matches!(self.peek(), Tok::RParen) {
-                        args.push(self.or_expr()?);
-                        while matches!(self.peek(), Tok::Comma) {
-                            self.advance();
-                            args.push(self.or_expr()?);
-                        }
-                    }
-                    if !matches!(self.peek(), Tok::RParen) {
-                        return Err(ParseError("expected )".into()));
-                    }
-                    self.advance();
-                    // keywords
-                    match name.as_str() {
-                        "__true__" => Ok(Expr::Literal(Literal::Bool(true))),
-                        "__false__" => Ok(Expr::Literal(Literal::Bool(false))),
-                        "__null__" => Ok(Expr::Literal(Literal::Null)),
-                        _ => Ok(Expr::Func { name, args }),
-                    }
-                } else {
-                    match name.as_str() {
-                        "__true__" => Ok(Expr::Literal(Literal::Bool(true))),
-                        "__false__" => Ok(Expr::Literal(Literal::Bool(false))),
-                        "__null__" => Ok(Expr::Literal(Literal::Null)),
-                        _ => Ok(Expr::Field(name)),
-                    }
-                }
-            }
-            Tok::String(s) => {
-                self.advance();
-                Ok(Expr::Literal(Literal::String(s)))
-            }
-            Tok::Number(n) => {
-                self.advance();
-                Ok(Expr::Literal(Literal::Number(n)))
-            }
-            _ => Err(ParseError(format!("unexpected token: {:?}", self.peek()))),
-        }
-    }
-}
-
+/// Parse a filter/rule expression.
+///
+/// The grammar and all scanner/parser errors come from the faithful `fexpr`
+/// port; the flat group list is converted to a binary tree while preserving
+/// SQL's `AND`-before-`OR` precedence (PocketBase joins the parts with spaces
+/// and lets SQLite parse the precedence).
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
-    let toks = lex(input)?;
-    let mut p = Parser { toks, pos: 0 };
-    p.parse()
+    let groups = crate::fexpr::parse(input).map_err(ParseError)?;
+    if groups.is_empty() {
+        return Err(ParseError(crate::fexpr::ERR_EMPTY.to_string()));
+    }
+    Ok(convert_groups(&groups))
+}
+
+fn convert_groups(groups: &[crate::fexpr::ExprGroup]) -> Expr {
+    let mut or_terms: Vec<Expr> = Vec::new();
+    let mut and_terms: Vec<Expr> = Vec::new();
+
+    for group in groups {
+        let item = match &group.item {
+            crate::fexpr::GroupItem::Expr(expr) => convert_expr(expr),
+            crate::fexpr::GroupItem::Groups(nested) => convert_groups(nested),
+        };
+        match group.join {
+            crate::fexpr::JoinOp::Or => {
+                or_terms.push(fold_and(std::mem::take(&mut and_terms)));
+                and_terms.push(item);
+            }
+            crate::fexpr::JoinOp::And => and_terms.push(item),
+        }
+    }
+    or_terms.push(fold_and(and_terms));
+
+    or_terms
+        .into_iter()
+        .reduce(|a, b| Expr::Or(Box::new(a), Box::new(b)))
+        .unwrap_or(Expr::Literal(Literal::Bool(true)))
+}
+
+fn fold_and(terms: Vec<Expr>) -> Expr {
+    terms
+        .into_iter()
+        .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
+        .unwrap_or(Expr::Literal(Literal::Bool(true)))
+}
+
+fn convert_expr(expr: &crate::fexpr::Expr) -> Expr {
+    Expr::Cmp {
+        left: Box::new(convert_token(&expr.left)),
+        op: convert_sign(&expr.op),
+        right: Box::new(convert_token(&expr.right)),
+    }
+}
+
+fn convert_token(token: &crate::fexpr::Token) -> Expr {
+    use crate::fexpr::TokenType;
+
+    match token.ty {
+        TokenType::Identifier => {
+            let literal = &token.literal;
+            if is_macro(literal) {
+                Expr::Macro(literal.clone())
+            } else if let Some(rest) = literal.strip_prefix("@collection.") {
+                Expr::CollectionField(rest.to_string())
+            } else if let Some(rest) = literal.strip_prefix("@request.auth.") {
+                Expr::AuthField(rest.to_string())
+            } else {
+                Expr::Field(literal.clone())
+            }
+        }
+        TokenType::Text => Expr::Literal(Literal::String(token.literal.clone())),
+        TokenType::Number => Expr::Literal(Literal::Number(
+            token.literal.parse::<f64>().unwrap_or(0.0),
+        )),
+        TokenType::Function => Expr::Func {
+            name: token.literal.clone(),
+            args: token.meta.iter().map(convert_token).collect(),
+        },
+        _ => Expr::Literal(Literal::Null),
+    }
+}
+
+fn convert_sign(sign: &str) -> CmpOp {
+    match sign {
+        "=" => CmpOp::Eq,
+        "!=" => CmpOp::Ne,
+        ">" => CmpOp::Gt,
+        ">=" => CmpOp::Gte,
+        "<" => CmpOp::Lt,
+        "<=" => CmpOp::Lte,
+        "~" => CmpOp::Contains,
+        "!~" => CmpOp::NotContains,
+        "?=" => CmpOp::AnyEq,
+        "?!=" => CmpOp::AnyNe,
+        "?>" => CmpOp::AnyGt,
+        "?>=" => CmpOp::AnyGte,
+        "?<" => CmpOp::AnyLt,
+        "?<=" => CmpOp::AnyLte,
+        "?~" => CmpOp::AnyContains,
+        "?!~" => CmpOp::AnyNotContains,
+        _ => CmpOp::Eq,
+    }
+}
+
+/// `search.identifierMacros`: resolved before the field resolver.
+fn is_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "@now"
+            | "@yesterday"
+            | "@tomorrow"
+            | "@second"
+            | "@minute"
+            | "@hour"
+            | "@day"
+            | "@month"
+            | "@weekday"
+            | "@year"
+            | "@todayStart"
+            | "@todayEnd"
+            | "@monthStart"
+            | "@monthEnd"
+            | "@yearStart"
+            | "@yearEnd"
+    )
+}
+
+/// Evaluate an `identifierMacros` entry (`timeNow().UTC()` in the oracle).
+fn macro_value(name: &str) -> Literal {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let day_ms = 86_400_000i64;
+    let days = ms.div_euclid(day_ms);
+    let rem = ms.rem_euclid(day_ms);
+    let (year, month, day) = crate::fields::civil_from_days(days);
+    let hour = rem / 3_600_000;
+    let minute = (rem % 3_600_000) / 60_000;
+    let second = (rem % 60_000) / 1_000;
+
+    match name {
+        "@now" => Literal::String(crate::fields::format_date_millis(ms)),
+        "@yesterday" => Literal::String(crate::fields::format_date_millis(ms - day_ms)),
+        "@tomorrow" => Literal::String(crate::fields::format_date_millis(ms + day_ms)),
+        "@second" => Literal::Number(second as f64),
+        "@minute" => Literal::Number(minute as f64),
+        "@hour" => Literal::Number(hour as f64),
+        "@day" => Literal::Number(day as f64),
+        "@month" => Literal::Number(month as f64),
+        "@weekday" => Literal::Number((days + 4).rem_euclid(7) as f64),
+        "@year" => Literal::Number(year as f64),
+        "@todayStart" => Literal::String(crate::fields::format_date_millis(days * day_ms)),
+        "@todayEnd" => {
+            Literal::String(crate::fields::format_date_millis(days * day_ms + day_ms - 1))
+        }
+        "@monthStart" => Literal::String(crate::fields::format_date_millis(
+            crate::fields::days_from_civil(year, month, 1) * day_ms,
+        )),
+        "@monthEnd" => {
+            let next_month = if month == 12 { 1 } else { month + 1 };
+            let next_year = if month == 12 { year + 1 } else { year };
+            Literal::String(crate::fields::format_date_millis(
+                crate::fields::days_from_civil(next_year, next_month, 1) * day_ms - 1,
+            ))
+        }
+        "@yearStart" => Literal::String(crate::fields::format_date_millis(
+            crate::fields::days_from_civil(year, 1, 1) * day_ms,
+        )),
+        "@yearEnd" => Literal::String(crate::fields::format_date_millis(
+            crate::fields::days_from_civil(year + 1, 1, 1) * day_ms - 1,
+        )),
+        _ => Literal::Null,
+    }
 }
 
 // ----------SQL generation----------
@@ -470,6 +303,98 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
 pub struct SqlFilter {
     pub sql: String,
     pub params: Vec<serde_json::Value>,
+}
+
+/// A field resolved by [`SimpleFieldResolver`].
+#[derive(Clone, Debug)]
+pub struct ResolvedField {
+    pub identifier: String,
+    /// `search.NullFallbackDisabled`: dotted (JSON) fields don't coalesce NULL,
+    /// so `=`/`!=` are emitted as `IS`/`IS NOT`.
+    pub null_fallback_disabled: bool,
+}
+
+/// `search.SimpleFieldResolver`: allowed plain names or anchored regex
+/// patterns; dotted names resolve to `JSON_EXTRACT` paths.
+#[derive(Clone, Debug)]
+pub struct SimpleFieldResolver {
+    allowed: Vec<String>,
+    json_paths: bool,
+}
+
+impl SimpleFieldResolver {
+    pub fn new(allowed: &[String], json_paths: bool) -> Self {
+        Self {
+            allowed: allowed.to_vec(),
+            json_paths,
+        }
+    }
+
+    pub fn resolve(&self, field: &str) -> Result<ResolvedField, ParseError> {
+        if !exist_in_slice_with_regex(field, &self.allowed) {
+            return Err(ParseError(format!("failed to resolve field {field:?}")));
+        }
+
+        let parts: Vec<&str> = field.split('.').collect();
+
+        // single regular field
+        if parts.len() == 1 {
+            return Ok(ResolvedField {
+                identifier: crate::records::quote_ident(&columnify(parts[0])),
+                null_fallback_disabled: false,
+            });
+        }
+
+        if !self.json_paths {
+            return Err(ParseError(format!("failed to resolve field {field:?}")));
+        }
+
+        // treat as json path
+        let mut path = String::from("$");
+        for part in &parts[1..] {
+            if part.parse::<i64>().is_ok() {
+                path.push('[');
+                path.push_str(&columnify(part));
+                path.push(']');
+            } else {
+                path.push('.');
+                path.push_str(&columnify(part));
+            }
+        }
+
+        Ok(ResolvedField {
+            identifier: format!(
+                "JSON_EXTRACT({}, '{}')",
+                crate::records::quote_ident(&columnify(parts[0])),
+                path
+            ),
+            null_fallback_disabled: true,
+        })
+    }
+}
+
+/// `inflector.Columnify`: strip characters that aren't valid identifiers.
+fn columnify(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '*' | '-' | '@' | '#')
+        })
+        .collect()
+}
+
+/// `list.ExistInSliceWithRegex`: exact match for plain entries, regex match
+/// only for entries wrapped in `^...$`.
+fn exist_in_slice_with_regex(value: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|pattern| {
+        if pattern.starts_with('^') && pattern.ends_with('$') {
+            regex::Regex::new(pattern)
+                .map(|re| re.is_match(value))
+                .unwrap_or(false)
+        } else {
+            pattern == value
+        }
+    })
 }
 
 /// Metadata for a relation field used by relation-path filters.
@@ -656,6 +581,10 @@ fn extract_nested_string_map(
 pub struct CollectionInfo {
     pub table: String,
     pub fields: Vec<String>,
+    /// Field name -> PocketBase field type (used by the rule validator).
+    pub field_types: std::collections::HashMap<String, String>,
+    /// Fields marked `hidden` (non-filterable for non-superusers).
+    pub hidden: std::collections::HashSet<String>,
     pub relations: std::collections::HashMap<String, RelationInfo>,
 }
 
@@ -688,12 +617,56 @@ pub fn build_sql_full(
     relations: &std::collections::HashMap<String, RelationInfo>,
     collections: &std::collections::HashMap<String, CollectionInfo>,
 ) -> Result<SqlFilter, ParseError> {
+    build_sql_full_with_types(
+        expr,
+        allowed_fields,
+        auth,
+        relations,
+        collections,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Like [`build_sql_full`] but with the queried collection's field types.
+pub fn build_sql_full_with_types(
+    expr: &Expr,
+    allowed_fields: &[String],
+    auth: Option<&PbRecord>,
+    relations: &std::collections::HashMap<String, RelationInfo>,
+    collections: &std::collections::HashMap<String, CollectionInfo>,
+    base_types: &std::collections::HashMap<String, String>,
+) -> Result<SqlFilter, ParseError> {
     let mut ctx = BuildCtx {
         params: Vec::new(),
         allowed: allowed_fields,
         auth,
         relations,
         collections,
+        base_types,
+        simple: None,
+    };
+    let sql = build_expr(expr, &mut ctx)?;
+    Ok(SqlFilter { sql, params: ctx.params })
+}
+
+/// Build a WHERE clause for the generic `search.SimpleFieldResolver` used by
+/// the logs endpoints. Dotted fields resolve to JSON paths.
+pub fn build_sql_simple(
+    expr: &Expr,
+    allowed_fields: &[String],
+    json_paths: bool,
+) -> Result<SqlFilter, ParseError> {
+    let relations = std::collections::HashMap::new();
+    let collections = std::collections::HashMap::new();
+    let empty_types = std::collections::HashMap::new();
+    let mut ctx = BuildCtx {
+        params: Vec::new(),
+        allowed: allowed_fields,
+        auth: None,
+        relations: &relations,
+        collections: &collections,
+        base_types: &empty_types,
+        simple: Some(SimpleMode { json_paths }),
     };
     let sql = build_expr(expr, &mut ctx)?;
     Ok(SqlFilter { sql, params: ctx.params })
@@ -707,12 +680,491 @@ pub fn build_sql_with_auth(
     build_sql_with_auth_and_relations(expr, allowed_fields, auth, &std::collections::HashMap::new())
 }
 
+// ---------- Rule validation (`core.RecordFieldResolver` error parity) ----------
+
+/// `search.normalizedIdentifiers`: identifiers that fall back to SQL literals
+/// when no collection field matches (case-insensitive, like `EqualFold`).
+fn normalized_identifier(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("null") {
+        Some("NULL")
+    } else if name.eq_ignore_ascii_case("true") {
+        Some("1")
+    } else if name.eq_ignore_ascii_case("false") {
+        Some("0")
+    } else {
+        None
+    }
+}
+
+fn is_go_word(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_ident_tail(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    let Some(last) = chars.next_back() else {
+        return false;
+    };
+    is_go_word(last) && rest.chars().all(|c| is_go_word(c) || c == '.' || c == ':')
+}
+
+/// `core.NewRecordFieldResolver` `allowedFields` (Go's `\w` is ASCII-only).
+fn allowed_record_field(name: &str) -> bool {
+    // `^\w+[\w\.\:]*$`
+    if name
+        .chars()
+        .next()
+        .is_some_and(is_go_word)
+        && name.chars().all(|c| is_go_word(c) || c == '.' || c == ':')
+    {
+        return true;
+    }
+
+    if name == "@request.context" || name == "@request.method" {
+        return true;
+    }
+
+    for prefix in [
+        "@request.auth.",
+        "@request.body.",
+        "@request.query.",
+        "@request.headers.",
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return is_ident_tail(rest);
+        }
+    }
+
+    // `^\@collection\.\w+(\:\w+)?\.[\w\.\:]*\w+$`
+    if let Some(rest) = name.strip_prefix("@collection.") {
+        let mut chars = rest.chars();
+        let mut name_len = 0usize;
+        while chars.next().is_some_and(is_go_word) {
+            name_len += 1;
+        }
+        if name_len == 0 {
+            return false;
+        }
+        let after_name = &rest[name_len..];
+        let after_alias = if let Some(alias) = after_name.strip_prefix(':') {
+            let mut alias_chars = alias.chars();
+            let mut alias_len = 0usize;
+            while alias_chars.next().is_some_and(is_go_word) {
+                alias_len += 1;
+            }
+            if alias_len == 0 {
+                return false;
+            }
+            &alias[alias_len..]
+        } else {
+            after_name
+        };
+        let Some(tail) = after_alias.strip_prefix('.') else {
+            return false;
+        };
+        return is_ident_tail(tail);
+    }
+
+    false
+}
+
+/// `core.splitModifier`.
+fn split_modifier(combined: &str) -> Result<(&str, Option<&str>), ParseError> {
+    let parts: Vec<&str> = combined.split(':').collect();
+    if parts.len() != 2 {
+        return Ok((combined, None));
+    }
+    match parts[1] {
+        "isset" | "each" | "length" | "lower" | "changed" => Ok((parts[0], Some(parts[1]))),
+        _ => Err(ParseError(format!(
+            "unknown modifier in {}",
+            crate::fields::go_quote(combined)
+        ))),
+    }
+}
+
+struct ValidationCtx<'a> {
+    base: &'a CollectionInfo,
+    collections: &'a std::collections::HashMap<String, CollectionInfo>,
+}
+
+impl<'a> ValidationCtx<'a> {
+    fn collection(&self, name_or_id: &str) -> Option<&'a CollectionInfo> {
+        self.collections.get(name_or_id)
+    }
+
+    fn resolve(&self, name: &str) -> Result<(), ParseError> {
+        if !allowed_record_field(name) {
+            return Err(ParseError(format!(
+                "failed to resolve field {}",
+                crate::fields::go_quote(name)
+            )));
+        }
+
+        if name.starts_with("@collection.") {
+            let props: Vec<&str> = name.split('.').collect();
+            if props.len() < 3 {
+                return Err(ParseError(format!(
+                    "invalid @collection field path in {}",
+                    crate::fields::go_quote(name)
+                )));
+            }
+            let collection_part = props[1];
+            let collection_name = collection_part.split(':').next().unwrap_or(collection_part);
+            let Some(collection) = self.collection(collection_name) else {
+                return Err(ParseError(format!(
+                    "failed to load collection {} from field path {}",
+                    crate::fields::go_quote(collection_part),
+                    crate::fields::go_quote(name)
+                )));
+            };
+            return self.process_active_props(collection, &props[2..], false);
+        }
+
+        if name.starts_with("@request.") {
+            let props: Vec<&str> = name.split('.').collect();
+            // `@request.auth.*` resolves to NULL when there is no auth record
+            // (the rule validator always uses an empty RequestInfo).
+            if name.starts_with("@request.auth.") {
+                return Ok(());
+            }
+            if name.starts_with("@request.body.") && props.len() > 2 {
+                let (field, _) = split_modifier(props[2])?;
+                if self.base.field_types.contains_key(field) {
+                    // The request body is empty during validation, so known
+                    // body relation paths resolve to NULL.
+                    return Ok(());
+                }
+            }
+            if let Some(last) = props.last() {
+                split_modifier(last)?;
+            }
+            return Ok(());
+        }
+
+        let props: Vec<&str> = name.split('.').collect();
+        self.process_active_props(self.base, &props, false)
+    }
+
+    fn process_active_props(
+        &self,
+        mut active: &'a CollectionInfo,
+        props: &[&str],
+        nullify_missing: bool,
+    ) -> Result<(), ParseError> {
+        let total = props.len();
+        for (i, prop) in props.iter().enumerate() {
+            if i == total - 1 {
+                return finalize_active_prop(active, prop);
+            }
+
+            let field = active.fields.iter().find(|f| f == prop);
+            let Some(field) = field else {
+                // back relation: `yourCollection_via_yourRelField`
+                let parts: Vec<&str> = prop.split("_via_").collect();
+                if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                    if nullify_missing {
+                        return Ok(());
+                    }
+                    return Err(ParseError(format!(
+                        "failed to resolve field {}",
+                        crate::fields::go_quote(prop)
+                    )));
+                }
+                let Some(back_collection) = self.collection(parts[0]) else {
+                    if nullify_missing {
+                        return Ok(());
+                    }
+                    return Err(ParseError(format!(
+                        "failed to load back relation field {} collection",
+                        crate::fields::go_quote(prop)
+                    )));
+                };
+                let Some(back_field_type) = back_collection.field_types.get(parts[1]) else {
+                    if nullify_missing {
+                        return Ok(());
+                    }
+                    return Err(ParseError(format!(
+                        "missing back relation field {}",
+                        crate::fields::go_quote(parts[1])
+                    )));
+                };
+                if back_field_type != "relation" {
+                    if nullify_missing {
+                        return Ok(());
+                    }
+                    return Err(ParseError(format!(
+                        "invalid back relation field {}",
+                        crate::fields::go_quote(parts[1])
+                    )));
+                }
+                active = back_collection;
+                continue;
+            };
+
+            if active.hidden.contains(field.as_str()) {
+                return Err(ParseError(format!(
+                    "non-filterable field {}",
+                    crate::fields::go_quote(prop)
+                )));
+            }
+
+            let field_type = active
+                .field_types
+                .get(field.as_str())
+                .map(String::as_str)
+                .unwrap_or("");
+
+            if field_type == "json" || field_type == "geoPoint" {
+                return Ok(());
+            }
+
+            if i >= 6 {
+                return Err(ParseError(format!(
+                    "max nested relations reached for field {}",
+                    crate::fields::go_quote(prop)
+                )));
+            }
+
+            if field_type != "relation" {
+                return Err(ParseError(format!(
+                    "field {} is not a valid relation",
+                    crate::fields::go_quote(prop)
+                )));
+            }
+
+            let Some(relation) = active.relations.get(field.as_str()) else {
+                return Err(ParseError(format!(
+                    "failed to load field {} collection",
+                    crate::fields::go_quote(prop)
+                )));
+            };
+
+            // "id" lookups optimization for single relations.
+            if !relation.multiple && i + 2 == total && props[i + 1] == "id" {
+                return finalize_active_prop(active, prop);
+            }
+
+            let Some(target) = self.collection(&relation.table) else {
+                return Err(ParseError(format!(
+                    "failed to load field {} collection",
+                    crate::fields::go_quote(prop)
+                )));
+            };
+            active = target;
+        }
+
+        Err(ParseError(format!(
+            "failed to resolve field {}",
+            crate::fields::go_quote(props.last().copied().unwrap_or(""))
+        )))
+    }
+}
+
+fn finalize_active_prop(collection: &CollectionInfo, prop: &str) -> Result<(), ParseError> {
+    let (name, _) = split_modifier(prop)?;
+    if !collection.fields.iter().any(|f| f == name) {
+        return Err(ParseError(format!(
+            "unknown field {}",
+            crate::fields::go_quote(name)
+        )));
+    }
+    if collection.hidden.contains(name) {
+        return Err(ParseError(format!(
+            "non-filterable field {}",
+            crate::fields::go_quote(name)
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve one token for validation, mirroring `search.resolveToken`.
+fn validate_token(expr: &Expr, ctx: &ValidationCtx<'_>) -> Result<(), ParseError> {
+    match expr {
+        Expr::Field(name) => ctx.resolve(name).or_else(|err| {
+            normalized_identifier(name)
+                .map(|_| ())
+                .ok_or(err)
+        }),
+        Expr::AuthField(path) => ctx.resolve(&format!("@request.auth.{path}")),
+        Expr::CollectionField(path) => ctx.resolve(&format!("@collection.{path}")),
+        Expr::Macro(_) | Expr::Literal(_) => Ok(()),
+        Expr::Func { name, args } => validate_token_function(name, args, ctx),
+        _ => Err(ParseError("unsupported token type".into())),
+    }
+}
+
+fn validate_token_function(
+    name: &str,
+    args: &[Expr],
+    ctx: &ValidationCtx<'_>,
+) -> Result<(), ParseError> {
+    match name {
+        "geoDistance" => {
+            if args.len() != 4 {
+                return Err(ParseError(format!(
+                    "[geoDistance] expected 4 arguments, got {}",
+                    args.len()
+                )));
+            }
+            for (i, arg) in args.iter().enumerate() {
+                let identifier_or_number = matches!(
+                    arg,
+                    Expr::Field(_)
+                        | Expr::AuthField(_)
+                        | Expr::CollectionField(_)
+                        | Expr::Macro(_)
+                        | Expr::Literal(Literal::Number(_))
+                );
+                if !identifier_or_number {
+                    return Err(ParseError(format!(
+                        "[geoDistance] argument {i} must be an identifier or number"
+                    )));
+                }
+                validate_token(arg, ctx).map_err(|e| {
+                    ParseError(format!("[geoDistance] failed to resolve argument {i}: {e}"))
+                })?;
+            }
+            Ok(())
+        }
+        "strftime" => {
+            let total = args.len();
+            if total < 1 {
+                return Err(ParseError(format!(
+                    "[strftime] expected at least 1 arguments, got {total}"
+                )));
+            }
+            if total > 10 {
+                return Err(ParseError(format!(
+                    "[strftime] too many arguments (max allowed 10, got {total})"
+                )));
+            }
+            if !matches!(args[0], Expr::Literal(Literal::String(_))) {
+                return Err(ParseError(
+                    "[strftime] expects the first argument to be a format string".into(),
+                ));
+            }
+            validate_token(&args[0], ctx).map_err(|e| {
+                ParseError(format!("[strftime] failed to resolve format argument: {e}"))
+            })?;
+            if total == 1 {
+                return Ok(());
+            }
+            let valid_time_value = matches!(
+                args[1],
+                Expr::Literal(Literal::String(_))
+                    | Expr::Literal(Literal::Number(_))
+                    | Expr::Field(_)
+                    | Expr::AuthField(_)
+                    | Expr::CollectionField(_)
+                    | Expr::Macro(_)
+            );
+            if !valid_time_value {
+                return Err(ParseError(
+                    "[strftime] expects the second argument to be of a valid time-value type".into(),
+                ));
+            }
+            validate_token(&args[1], ctx).map_err(|e| {
+                ParseError(format!(
+                    "[strftime] failed to resolve time-value argument: {e}"
+                ))
+            })?;
+            for (i, arg) in args[2..].iter().enumerate() {
+                if !matches!(arg, Expr::Literal(Literal::String(_))) {
+                    return Err(ParseError(format!(
+                        "[strftime] invalid modifier argument {i} - can be only string"
+                    )));
+                }
+                validate_token(arg, ctx).map_err(|e| {
+                    ParseError(format!(
+                        "[strftime] failed to resolve modifier argument {i}: {e}"
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+        other => Err(ParseError(format!(
+            "unknown function {}",
+            crate::fields::go_quote(other)
+        ))),
+    }
+}
+
+fn validate_token_literal(expr: &Expr) -> String {
+    match expr {
+        Expr::Field(name) => name.clone(),
+        Expr::CollectionField(path) => format!("@collection.{path}"),
+        Expr::AuthField(path) => format!("@request.auth.{path}"),
+        Expr::Macro(name) => name.clone(),
+        Expr::Func { name, .. } => name.clone(),
+        Expr::Literal(Literal::String(s)) => s.clone(),
+        Expr::Literal(Literal::Number(n)) => {
+            let mut out = n.to_string();
+            if !out.contains('.') {
+                out.push_str(".0");
+            }
+            out
+        }
+        Expr::Literal(Literal::Bool(b)) => b.to_string(),
+        Expr::Literal(Literal::Null) => "null".into(),
+        _ => String::new(),
+    }
+}
+
+/// Validate a parsed rule/filter expression against a collection schema,
+/// reproducing `search.resolveTokenizedExpr`'s wrapped error messages.
+pub fn validate_record_expr(
+    expr: &Expr,
+    base: &CollectionInfo,
+    collections: &std::collections::HashMap<String, CollectionInfo>,
+) -> Result<(), ParseError> {
+    let ctx = ValidationCtx { base, collections };
+    validate_expr_inner(expr, &ctx)
+}
+
+fn validate_expr_inner(expr: &Expr, ctx: &ValidationCtx<'_>) -> Result<(), ParseError> {
+    match expr {
+        Expr::Or(a, b) | Expr::And(a, b) => {
+            validate_expr_inner(a, ctx)?;
+            validate_expr_inner(b, ctx)
+        }
+        Expr::Not(inner) => validate_expr_inner(inner, ctx),
+        Expr::Cmp { left, right, .. } => {
+            if let Err(err) = validate_token(left, ctx) {
+                return Err(ParseError(format!(
+                    "invalid left operand {} - {err}",
+                    crate::fields::go_quote(&validate_token_literal(left))
+                )));
+            }
+            if let Err(err) = validate_token(right, ctx) {
+                return Err(ParseError(format!(
+                    "invalid right operand {} - {err}",
+                    crate::fields::go_quote(&validate_token_literal(right))
+                )));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SimpleMode {
+    json_paths: bool,
+}
+
 struct BuildCtx<'a> {
     params: Vec<serde_json::Value>,
     allowed: &'a [String],
     auth: Option<&'a PbRecord>,
     relations: &'a std::collections::HashMap<String, RelationInfo>,
     collections: &'a std::collections::HashMap<String, CollectionInfo>,
+    /// Field name -> field type for the queried collection, used to
+    /// distinguish JSON paths from invalid relation traversals.
+    base_types: &'a std::collections::HashMap<String, String>,
+    /// Set for `search.SimpleFieldResolver` queries (logs). The collection
+    /// resolver ignores dotted JSON paths.
+    simple: Option<SimpleMode>,
 }
 
 fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
@@ -737,18 +1189,57 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
             Ok(format!("EXISTS (SELECT 1 FROM {from} WHERE {col})"))
         }
         Expr::Field(name) => {
-            if name.contains('.') {
-                let first = name.split('.').next().unwrap_or(name);
+            if let Some(mode) = ctx.simple {
+                let resolver = SimpleFieldResolver::new(ctx.allowed, mode.json_paths);
+                return match resolver.resolve(name) {
+                    Ok(field) => Ok(field.identifier),
+                    Err(err) => match normalized_identifier(name) {
+                        Some(sql) => Ok(sql.into()),
+                        None => Err(err),
+                    },
+                };
+            }
+            let (clean, modifier) = split_modifier(name)?;
+            if let Some((first, _rest)) = clean.split_once('.') {
                 if !ctx.allowed.iter().any(|f| f == first) && first != "id" {
-                    return Err(ParseError(format!("unknown field: {}", name)));
+                    // The record resolver processes the first path segment
+                    // before it can reach the final `unknown field` check.
+                    return Err(ParseError(format!(
+                        "failed to resolve field {}",
+                        crate::fields::go_quote(first)
+                    )));
                 }
-                return Ok(crate::records::quote_ident(name));
+                let field_type = ctx
+                    .base_types
+                    .get(first)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if field_type != "json" && field_type != "geoPoint" {
+                    return Err(ParseError(format!(
+                        "field {} is not a valid relation",
+                        crate::fields::go_quote(first)
+                    )));
+                }
+                let column = crate::records::quote_ident(clean);
+                return Ok(match modifier {
+                    Some("lower") => format!("LOWER({column})"),
+                    _ => column,
+                });
             }
-            if !ctx.allowed.iter().any(|f| f == name) && name != "id" {
-                return Err(ParseError(format!("unknown field: {}", name)));
+            if !ctx.allowed.iter().any(|f| f == clean) && clean != "id" {
+                if let Some(sql) = normalized_identifier(clean) {
+                    return Ok(sql.into());
+                }
+                return Err(ParseError(format!(
+                    "unknown field {}",
+                    crate::fields::go_quote(clean)
+                )));
             }
-            // quote identifier
-            Ok(format!("\"{}\"", name.replace('"', "\"")))
+            let column = crate::records::quote_ident(clean);
+            Ok(match modifier {
+                Some("lower") => format!("LOWER({column})"),
+                _ => column,
+            })
         }
         Expr::AuthField(path) => {
             let val = ctx
@@ -758,7 +1249,7 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
             ctx.params.push(val);
             Ok("?".into())
         }
-        Expr::Now => Ok("datetime('now')".into()),
+        Expr::Macro(name) => build_expr(&Expr::Literal(macro_value(name)), ctx),
         Expr::Literal(lit) => match lit {
             Literal::Null => Ok("NULL".into()),
             Literal::Bool(b) => {
@@ -774,22 +1265,119 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
                 Ok("?".into())
             }
         },
-        Expr::Func { name, args } => {
-            let mut parts = Vec::new();
-            for a in args {
-                parts.push(build_expr(a, ctx)?);
-            }
-            // map function names to SQL
-            let sql_name = match name.to_lowercase().as_str() {
-                "lower" => "lower",
-                "upper" => "upper",
-                "trim" => "trim",
-                "length" => "length",
-                _ => name.as_str(),
-            };
-            Ok(format!("{}({})", sql_name, parts.join(", ")))
-        }
+        Expr::Func { name, args } => build_func(name, args, ctx),
     }
+}
+
+/// `search.TokenFunctions`: PocketBase v0.40 only registers `geoDistance` and
+/// `strftime`; everything else is an `unknown function` resolution error.
+fn build_func(name: &str, args: &[Expr], ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
+    match name {
+        "geoDistance" => build_geo_distance(args, ctx),
+        "strftime" => build_strftime(args, ctx),
+        other => Err(ParseError(format!(
+            "unknown function {}",
+            crate::fields::go_quote(other)
+        ))),
+    }
+}
+
+fn build_geo_distance(args: &[Expr], ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
+    if args.len() != 4 {
+        return Err(ParseError(format!(
+            "[geoDistance] expected 4 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let mut resolved = Vec::with_capacity(4);
+    for (i, arg) in args.iter().enumerate() {
+        if !matches!(arg, Expr::Field(_) | Expr::AuthField(_) | Expr::CollectionField(_) | Expr::Macro(_) | Expr::Literal(Literal::Number(_))) {
+            return Err(ParseError(format!(
+                "[geoDistance] argument {i} must be an identifier or number"
+            )));
+        }
+        let sql = build_expr(arg, ctx)
+            .map_err(|e| ParseError(format!("[geoDistance] failed to resolve argument {i}: {e}")))?;
+        resolved.push(sql);
+    }
+
+    // The clamping prevents floating point rounding errors for identical
+    // points (arccosine domain).
+    Ok(format!(
+        "(6371 * acos(min(1, max(-1, \
+         cos(radians({lat_a})) * cos(radians({lat_b})) * \
+         cos(radians({lon_b}) - radians({lon_a})) + \
+         sin(radians({lat_a})) * sin(radians({lat_b}))\
+         ))))",
+        lon_a = resolved[0],
+        lat_a = resolved[1],
+        lon_b = resolved[2],
+        lat_b = resolved[3],
+    ))
+}
+
+fn build_strftime(args: &[Expr], ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
+    let total = args.len();
+    if total < 1 {
+        return Err(ParseError(format!(
+            "[strftime] expected at least 1 arguments, got {total}"
+        )));
+    }
+    if total > 10 {
+        return Err(ParseError(format!(
+            "[strftime] too many arguments (max allowed 10, got {total})"
+        )));
+    }
+
+    if !matches!(args[0], Expr::Literal(Literal::String(_))) {
+        return Err(ParseError(
+            "[strftime] expects the first argument to be a format string".into(),
+        ));
+    }
+    let format = build_expr(&args[0], ctx).map_err(|e| {
+        ParseError(format!("[strftime] failed to resolve format argument: {e}"))
+    })?;
+
+    if total == 1 {
+        return Ok(format!("strftime({format})"));
+    }
+
+    if !matches!(
+        args[1],
+        Expr::Literal(Literal::String(_))
+            | Expr::Literal(Literal::Number(_))
+            | Expr::Field(_)
+            | Expr::AuthField(_)
+            | Expr::CollectionField(_)
+            | Expr::Macro(_)
+    ) {
+        return Err(ParseError(
+            "[strftime] expects the second argument to be of a valid time-value type".into(),
+        ));
+    }
+    let time_value = build_expr(&args[1], ctx).map_err(|e| {
+        ParseError(format!(
+            "[strftime] failed to resolve time-value argument: {e}"
+        ))
+    })?;
+
+    let mut identifiers = vec![format, time_value];
+    for (i, arg) in args[2..].iter().enumerate() {
+        if !matches!(arg, Expr::Literal(Literal::String(_))) {
+            return Err(ParseError(format!(
+                "[strftime] invalid modifier argument {i} - can be only string"
+            )));
+        }
+        let modifier = build_expr(arg, ctx).map_err(|e| {
+            ParseError(format!(
+                "[strftime] failed to resolve modifier argument {i}: {e}"
+            ))
+        })?;
+        identifiers.push(modifier);
+    }
+
+    Ok(format!("strftime({})", identifiers.join(",")))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -816,12 +1404,39 @@ fn build_operand(
     let kind = static_kind(expr);
     match kind {
         OperandKind::Null => Ok(("NULL".into(), kind)),
-        OperandKind::EmptyString => {
-            ctx.params.push(serde_json::Value::String(String::new()));
-            Ok(("?".into(), kind))
-        }
+        // `resolveEqualExpr` inlines empty strings as `''`, so no bound param
+        // is emitted for this operand.
+        OperandKind::EmptyString => Ok(("''".into(), kind)),
         OperandKind::Value => Ok((build_expr(expr, ctx)?, kind)),
     }
+}
+
+/// Compare two built operands, duplicating the parameters of an operand that
+/// `resolveEqualExpr` repeats in the SQL (the empty-string fallback).
+fn compare_operands(
+    left: &str,
+    left_kind: OperandKind,
+    left_start: usize,
+    op: CmpOp,
+    right: &str,
+    right_kind: OperandKind,
+    right_start: usize,
+    ctx: &mut BuildCtx<'_>,
+) -> String {
+    if left_kind == OperandKind::EmptyString
+        && right_kind != OperandKind::EmptyString
+        && ctx.params.len() > right_start
+    {
+        let repeated = ctx.params[right_start..].to_vec();
+        ctx.params.extend(repeated);
+    } else if right_kind == OperandKind::EmptyString
+        && left_kind != OperandKind::EmptyString
+        && ctx.params.len() > left_start
+    {
+        let repeated = ctx.params[left_start..].to_vec();
+        ctx.params.extend(repeated);
+    }
+    compare_sql(left, left_kind, op, right, right_kind)
 }
 
 /// `tools/search/filter.go` `resolveEqualExpr` + the simple operators.
@@ -1036,6 +1651,64 @@ fn column_cmp_sql(
 }
 
 /// Comparison of a related record's column (`__pb_rel.<sub>`).
+/// Validate a relation-path suffix (`rel.<sub>`) against the target schema,
+/// mirroring `runner.processActiveProps` errors. Nested relations are walked,
+/// but the SQL builder only renders one level (tracked separately).
+fn validate_relation_sub<'a>(
+    mut active: &'a CollectionInfo,
+    path: &str,
+    collections: &'a std::collections::HashMap<String, CollectionInfo>,
+) -> Result<(), ParseError> {
+    let props: Vec<&str> = path.split('.').collect();
+    for (i, prop) in props.iter().enumerate() {
+        if i == props.len() - 1 {
+            let (name, _) = split_modifier(prop)?;
+            if !active.fields.iter().any(|f| f == name) && name != "id" {
+                return Err(ParseError(format!(
+                    "unknown field {}",
+                    crate::fields::go_quote(name)
+                )));
+            }
+            return Ok(());
+        }
+
+        let Some(field) = active.fields.iter().find(|f| f == prop) else {
+            return Err(ParseError(format!(
+                "failed to resolve field {}",
+                crate::fields::go_quote(prop)
+            )));
+        };
+        let field_type = active
+            .field_types
+            .get(field.as_str())
+            .map(String::as_str)
+            .unwrap_or("");
+        if field_type == "json" || field_type == "geoPoint" {
+            return Ok(());
+        }
+        if field_type != "relation" {
+            return Err(ParseError(format!(
+                "field {} is not a valid relation",
+                crate::fields::go_quote(prop)
+            )));
+        }
+        let Some(relation) = active.relations.get(field.as_str()) else {
+            return Err(ParseError(format!(
+                "failed to load field {} collection",
+                crate::fields::go_quote(prop)
+            )));
+        };
+        let Some(target) = collections.get(&relation.table) else {
+            return Err(ParseError(format!(
+                "failed to load field {} collection",
+                crate::fields::go_quote(prop)
+            )));
+        };
+        active = target;
+    }
+    Ok(())
+}
+
 fn relation_cmp_sql(
     rel_alias: &str,
     sub: &str,
@@ -1043,7 +1716,12 @@ fn relation_cmp_sql(
     right: &Expr,
     ctx: &mut BuildCtx<'_>,
 ) -> Result<String, ParseError> {
-    let left = format!("{}.{}", rel_alias, crate::records::quote_ident(sub));
+    let (sub, modifier) = split_modifier(sub)?;
+    let column = format!("{}.{}", rel_alias, crate::records::quote_ident(sub));
+    let left = match modifier {
+        Some("lower") => format!("LOWER({column})"),
+        _ => column,
+    };
     match op {
         CmpOp::Contains | CmpOp::NotContains => {
             like_sql(&left, right, ctx, op == CmpOp::NotContains)
@@ -1055,9 +1733,80 @@ fn relation_cmp_sql(
     }
 }
 
+/// The original token text of an operand (`fexpr.Token.Literal`), used by
+/// Go's `invalid left/right operand %q` error wrappers.
+fn expr_literal(expr: &Expr) -> String {
+    match expr {
+        Expr::Field(name)
+        | Expr::AuthField(name)
+        | Expr::Macro(name)
+        | Expr::CollectionField(name) => name.clone(),
+        Expr::Literal(Literal::String(value)) => value.clone(),
+        Expr::Literal(Literal::Number(value)) => {
+            if value.fract() == 0.0 {
+                format!("{}", *value as i64)
+            } else {
+                value.to_string()
+            }
+        }
+        Expr::Literal(Literal::Bool(value)) => value.to_string(),
+        Expr::Literal(Literal::Null) => "null".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `fmt.Errorf("invalid %s operand %q - %v", side, literal, err)`.
+fn operand_error(side: &str, expr: &Expr, err: ParseError) -> ParseError {
+    ParseError(format!(
+        "invalid {side} operand {} - {}",
+        crate::fields::go_quote(&expr_literal(expr)),
+        err.0
+    ))
+}
+
 fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError> {
     let any = op.is_any();
     let base = op.base();
+
+    // `search.SimpleFieldResolver` (logs): no relation traversal, and dotted
+    // fields are JSON paths whose NULL fallback is disabled.
+    if ctx.simple.is_some() {
+        let left_json = matches!(left, Expr::Field(name) if name.contains('.'));
+        let right_json = matches!(right, Expr::Field(name) if name.contains('.'));
+        let left_kind = static_kind(left);
+        let left_start = ctx.params.len();
+        // `resolveTokenizedExpr`: both operands are resolved up-front and the
+        // resolver error is wrapped with the raw token literal.
+        let l = build_expr(left, ctx)
+            .map_err(|err| operand_error("left", left, err))?;
+        return match base {
+            CmpOp::Contains | CmpOp::NotContains => {
+                like_sql(&l, right, ctx, base == CmpOp::NotContains)
+                    .map_err(|err| operand_error("right", right, err))
+            }
+            CmpOp::Eq | CmpOp::Ne if left_json || right_json => {
+                let (r, _) = build_operand(right, ctx)
+                    .map_err(|err| operand_error("right", right, err))?;
+                let sql_op = if base == CmpOp::Eq { "IS" } else { "IS NOT" };
+                Ok(format!("{l} {sql_op} {r}"))
+            }
+            _ => {
+                let right_start = ctx.params.len();
+                let (r, kind) = build_operand(right, ctx)
+                    .map_err(|err| operand_error("right", right, err))?;
+                Ok(compare_operands(
+                    &l,
+                    left_kind,
+                    left_start,
+                    base,
+                    &r,
+                    kind,
+                    right_start,
+                    ctx,
+                ))
+            }
+        };
+    }
 
     // `@collection.<name>.<field> <op> value`.
     if let Expr::CollectionField(path) = left {
@@ -1115,9 +1864,22 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
     if let Expr::Field(name) = left {
         if let Some((field, sub)) = name.split_once('.') {
             if !ctx.allowed.iter().any(|f| f == field) && field != "id" {
-                return Err(ParseError(format!("unknown field: {name}")));
+                return Err(operand_error(
+                    "left",
+                    left,
+                    ParseError(format!(
+                        "failed to resolve field {}",
+                        crate::fields::go_quote(field)
+                    )),
+                ));
             }
             if let Some(info) = ctx.relations.get(field).cloned() {
+                // Validate the path suffix against the relation target before
+                // rendering SQL (the oracle reports `unknown field` etc.).
+                if let Some(target) = ctx.collections.get(&info.table) {
+                    validate_relation_sub(target, sub, ctx.collections)
+                        .map_err(|err| operand_error("left", left, err))?;
+                }
                 // `rel.id` on a single relation is a direct column comparison.
                 if sub == "id" && !info.multiple {
                     let left_sql = crate::records::quote_ident(field);
@@ -1125,9 +1887,11 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
                     return match base {
                         CmpOp::Contains | CmpOp::NotContains => {
                             like_sql(&left_sql, right, ctx, base == CmpOp::NotContains)
+                                .map_err(|err| operand_error("right", right, err))
                         }
                         _ => {
-                            let (r, kind) = build_operand(right, ctx)?;
+                            let (r, kind) = build_operand(right, ctx)
+                                .map_err(|err| operand_error("right", right, err))?;
                             Ok(compare_sql(&left_sql, left_kind, base, &r, kind))
                         }
                     };
@@ -1148,13 +1912,15 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
                     )
                 };
 
-                let outer_cmp = relation_cmp_sql("__pb_rel", sub, base, right, ctx)?;
+                let outer_cmp = relation_cmp_sql("__pb_rel", sub, base, right, ctx)
+                    .map_err(|err| operand_error("right", right, err))?;
                 let mut sql = format!("EXISTS (SELECT 1 FROM {from} WHERE {outer_cmp})");
 
                 // PB's multi-match check: no related value may fail the
                 // comparison. Only plain (non-`?`) operators get this.
                 if info.multiple && !any {
-                    let inner_cmp = relation_cmp_sql("__pb_rel2", sub, base, right, ctx)?;
+                    let inner_cmp = relation_cmp_sql("__pb_rel2", sub, base, right, ctx)
+                        .map_err(|err| operand_error("right", right, err))?;
                     let from2 = format!(
                         "(SELECT 1) AS __pb_one2 LEFT JOIN json_each({field}) AS __pb_je2 ON 1 \
                          LEFT JOIN {table} AS __pb_rel2 ON __pb_rel2.id = __pb_je2.value",
@@ -1171,14 +1937,28 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
     }
 
     let left_kind = static_kind(left);
-    let l = build_expr(left, ctx)?;
+    let left_start = ctx.params.len();
+    let l = build_expr(left, ctx)
+        .map_err(|err| operand_error("left", left, err))?;
     match base {
         CmpOp::Contains | CmpOp::NotContains => {
             like_sql(&l, right, ctx, base == CmpOp::NotContains)
+                .map_err(|err| operand_error("right", right, err))
         }
         _ => {
-            let (r, kind) = build_operand(right, ctx)?;
-            Ok(compare_sql(&l, left_kind, base, &r, kind))
+            let right_start = ctx.params.len();
+            let (r, kind) = build_operand(right, ctx)
+                .map_err(|err| operand_error("right", right, err))?;
+            Ok(compare_operands(
+                &l,
+                left_kind,
+                left_start,
+                base,
+                &r,
+                kind,
+                right_start,
+                ctx,
+            ))
         }
     }
 }

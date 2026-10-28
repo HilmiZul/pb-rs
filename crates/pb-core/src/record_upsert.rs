@@ -1458,7 +1458,7 @@ fn validate_email(field: &Value, value: &FieldValue) -> Option<Node> {
     if !is_email(email) {
         return Some(leaf(
             "validation_is_email",
-            "Must be a valid email address",
+            "must be a valid email address",
         ));
     }
     let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
@@ -1973,7 +1973,10 @@ mod tests {
         let SubmitError::Validation(errors) = record.submit(&conn).unwrap_err() else {
             panic!("expected validation errors");
         };
-        assert_eq!(errors["email"].clone(), leaf("validation_is_email", "Must be a valid email address"));
+        assert_eq!(
+            errors["email"].clone(),
+            leaf("validation_is_email", "must be a valid email address")
+        );
         assert_eq!(
             errors["password"].clone(),
             leaf(

@@ -396,7 +396,7 @@ impl MetaConfig {
                     "accentColor",
                     Some(leaf(
                         "validation_is_hex_color",
-                        "Must be a valid hexadecimal color code.",
+                        "must be a valid hexadecimal color code",
                     )),
                 );
             }
@@ -482,7 +482,7 @@ impl S3Config {
         let mut errs = Errors::new();
         // is.URL then When(enabled, Required)
         let endpoint = if !self.endpoint.is_empty() && !is_url(&self.endpoint) {
-            Some(leaf("validation_is_url", "Must be a valid URL."))
+            Some(leaf("validation_is_url", "must be a valid URL"))
         } else if self.enabled && self.endpoint.is_empty() {
             Some(required())
         } else {
@@ -572,7 +572,7 @@ impl RateLimitRule {
         let label = if self.label.is_empty() {
             Some(required())
         } else if !valid_rate_limit_label(&self.label) {
-            Some(leaf("validation_match_invalid", "Must be in a valid format."))
+            Some(leaf("validation_match_invalid", "must be in a valid format"))
         } else {
             None
         };
@@ -646,7 +646,7 @@ fn required_or_url(value: &str) -> Option<Node> {
     if value.is_empty() {
         Some(required())
     } else if !is_url(value) {
-        Some(leaf("validation_is_url", "Must be a valid URL."))
+        Some(leaf("validation_is_url", "must be a valid URL"))
     } else {
         None
     }
@@ -655,7 +655,7 @@ fn required_or_url(value: &str) -> Option<Node> {
 /// `validation.Field(&c.SenderAddress, is.EmailFormat, validation.Required)`
 fn email_then_required(value: &str) -> Option<Node> {
     if !value.is_empty() && !is_email(value) {
-        Some(leaf("validation_is_email", "Must be a valid email address."))
+        Some(leaf("validation_is_email", "must be a valid email address"))
     } else if value.is_empty() {
         Some(required())
     } else {
@@ -848,136 +848,13 @@ fn check_cron_expression(value: &str) -> Option<Node> {
     }
     match parse_cron(value) {
         Ok(()) => None,
-        Err(message) => Some(leaf("validation_invalid_cron", sentenize(&message))),
+        Err(message) => Some(leaf("validation_invalid_cron", message)),
     }
-}
-
-/// `inflector.Sentenize`.
-fn sentenize(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut out = String::with_capacity(trimmed.len() + 1);
-    let mut chars = trimmed.chars();
-    if let Some(first) = chars.next() {
-        out.extend(first.to_uppercase());
-        out.push_str(chars.as_str());
-    }
-    if !matches!(out.chars().last(), Some('.' | '?' | '!')) {
-        out.push('.');
-    }
-    out
 }
 
 /// `cron.NewSchedule` (validation only: the slots themselves are irrelevant).
 fn parse_cron(expr: &str) -> Result<(), String> {
-    const MACROS: &[(&str, &str)] = &[
-        ("@yearly", "0 0 1 1 *"),
-        ("@annually", "0 0 1 1 *"),
-        ("@monthly", "0 0 1 * *"),
-        ("@weekly", "0 0 * * 0"),
-        ("@daily", "0 0 * * *"),
-        ("@midnight", "0 0 * * *"),
-        ("@hourly", "0 * * * *"),
-    ];
-    let expr = MACROS
-        .iter()
-        .find(|(name, _)| *name == expr)
-        .map(|(_, expanded)| *expanded)
-        .unwrap_or(expr);
-
-    let segments: Vec<&str> = expr.split(' ').collect();
-    if segments.len() != 5 {
-        return Err(
-            "invalid cron expression - must be a valid macro or to have exactly 5 space separated segments"
-                .to_string(),
-        );
-    }
-    for (segment, min, max) in [
-        (segments[0], 0, 59),
-        (segments[1], 0, 23),
-        (segments[2], 1, 31),
-        (segments[3], 1, 12),
-        (segments[4], 0, 6),
-    ] {
-        parse_cron_segment(segment, min, max)?;
-    }
-    Ok(())
-}
-
-fn parse_cron_segment(segment: &str, min: i64, max: i64) -> Result<(), String> {
-    for part in segment.split(',') {
-        let step_parts: Vec<&str> = part.split('/').collect();
-        let step = match step_parts.len() {
-            1 => 1,
-            2 => {
-                let step: i64 = step_parts[1]
-                    .parse()
-                    .map_err(|_| "invalid syntax".to_string())?;
-                if step < 1 || step > max {
-                    return Err(format!(
-                        "invalid segment step boundary - the step must be between 1 and the {max}"
-                    ));
-                }
-                step
-            }
-            _ => {
-                return Err(
-                    "invalid segment step format - must be in the format */n or 1-30/n".to_string(),
-                )
-            }
-        };
-
-        if step_parts[0] == "*" {
-            continue;
-        }
-
-        let range_parts: Vec<&str> = step_parts[0].split('-').collect();
-        match range_parts.len() {
-            1 => {
-                if step != 1 {
-                    return Err(
-                        "invalid segment step - step > 1 could be used only with the wildcard or range format"
-                            .to_string(),
-                    );
-                }
-                let parsed: i64 = range_parts[0]
-                    .parse()
-                    .map_err(|_| "invalid syntax".to_string())?;
-                if parsed < min || parsed > max {
-                    return Err(
-                        "invalid segment value - must be between the min and max of the segment"
-                            .to_string(),
-                    );
-                }
-            }
-            2 => {
-                let parsed_min: i64 = range_parts[0]
-                    .parse()
-                    .map_err(|_| "invalid syntax".to_string())?;
-                if parsed_min < min || parsed_min > max {
-                    return Err(format!(
-                        "invalid segment range minimum - must be between {min} and {max}"
-                    ));
-                }
-                let parsed_max: i64 = range_parts[1]
-                    .parse()
-                    .map_err(|_| "invalid syntax".to_string())?;
-                if parsed_max < parsed_min || parsed_max > max {
-                    return Err(format!(
-                        "invalid segment range maximum - must be between {parsed_min} and {max}"
-                    ));
-                }
-            }
-            _ => {
-                return Err(
-                    "invalid segment range format - the range must have 1 or 2 parts".to_string(),
-                )
-            }
-        }
-    }
-    Ok(())
+    crate::cron::Schedule::new(expr).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1102,12 +979,12 @@ mod tests {
         };
         assert_eq!(
             meta["accentColor"],
-            leaf("validation_is_hex_color", "Must be a valid hexadecimal color code.")
+            leaf("validation_is_hex_color", "must be a valid hexadecimal color code")
         );
-        assert_eq!(meta["appURL"], leaf("validation_is_url", "Must be a valid URL."));
+        assert_eq!(meta["appURL"], leaf("validation_is_url", "must be a valid URL"));
         assert_eq!(
             meta["senderAddress"],
-            leaf("validation_is_email", "Must be a valid email address.")
+            leaf("validation_is_email", "must be a valid email address")
         );
 
         let mut settings = Settings::default();
@@ -1196,7 +1073,7 @@ mod tests {
             check_cron_expression("nope"),
             Some(leaf(
                 "validation_invalid_cron",
-                "Invalid cron expression - must be a valid macro or to have exactly 5 space separated segments."
+                "invalid cron expression - must be a valid macro or to have exactly 5 space separated segments"
             ))
         );
     }

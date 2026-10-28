@@ -6,7 +6,7 @@
 
 use axum::body::Bytes;
 use std::sync::OnceLock;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
 use pb_core::collections::Collection;
@@ -23,10 +23,17 @@ pub static AUX_DB: OnceLock<std::sync::Arc<std::sync::Mutex<rusqlite::Connection
 
 /// `findAuthCollection`: 404 when the collection is missing or not an auth one.
 fn find_auth_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {
-    Collection::find(conn, id_or_name)
+    match Collection::find(conn, id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
-        .filter(Collection::is_auth)
-        .ok_or_else(|| ApiError::not_found("Missing or invalid collection context."))
+    {
+        Some(collection) if collection.is_auth() => Ok(collection),
+        Some(_) => Err(ApiError::not_found(
+            "Missing or invalid auth collection context.",
+        )),
+        None => Err(
+            ApiError::not_found("Missing or invalid collection context.").with_raw_data(json!("sql: no rows in result set")),
+        ),
+    }
 }
 
 /// Reject non-JSON bodies the way `e.BindBody` does.
@@ -159,7 +166,7 @@ pub async fn file_token(
 
 pub async fn file_download(
     State(db): State<Db>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((collection_name, record_id, filename)): Path<(String, String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Response, ApiError> {
@@ -167,10 +174,10 @@ pub async fn file_download(
     let conn = db.lock().map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = Collection::find(&conn, &collection_name)
         .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
-    let record = Record::find_by_id(&conn, &collection, &record_id)
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(json!("sql: no rows in result set")))?;
+    let _record = Record::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found."))?;
+        .ok_or_else(|| ApiError::not_found("The requested resource wasn't found.").with_raw_data(json!("sql: no rows in result set")))?;
     drop(conn);
 
     let storage_root = DATA_DIR
@@ -334,6 +341,7 @@ pub async fn auth_with_otp(
     State(db): State<Db>,
     headers: HeaderMap,
     Path(id_or_name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let conn = db
@@ -427,10 +435,17 @@ pub async fn auth_with_otp(
 
     // verified state update (only if sentTo matches email); sentTo is "" here so skip
 
-    let mfa_id_req = form.get("mfaId").and_then(Value::as_str).unwrap_or("").to_string();
+    let mfa_id_req = query
+        .get("mfaId")
+        .cloned()
+        .or_else(|| form.get("mfaId").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
     match check_mfa(&conn, &collection, &record, "otp", &mfa_id_req)? {
         Some(mfa_id) => {
-            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "", json!({"mfaId": mfa_id})));
+            return Err(ApiError::raw(
+                StatusCode::UNAUTHORIZED,
+                json!({"mfaId": mfa_id}),
+            ));
         }
         None => {}
     }
@@ -782,59 +797,61 @@ pub async fn confirm_email_change(
     let password = form.get("password").and_then(Value::as_str).unwrap_or("");
 
     let mut errors = Map::new();
+
+    // `EmailChangeConfirmForm.parseToken`: payload, signature, collection and
+    // email uniqueness are all reported through the `token` field.
+    let claims = pb_core::tokens::parse_unverified(token).ok();
+    let new_email = claims
+        .as_ref()
+        .and_then(|c| c.new_email.clone())
+        .unwrap_or_default();
+
+    let mut token_error: Option<Value> = None;
+    let mut record: Option<pb_core::records::Record> = None;
     if token.is_empty() {
-        errors.insert("token".into(), validation_required());
+        token_error = Some(validation_required());
+    } else if new_email.is_empty() {
+        token_error = Some(json!({"code": "validation_invalid_token_payload", "message": "Invalid token payload - newEmail must be set."}));
+    } else {
+        match pb_core::records::Record::find_auth_record_by_token(&conn, token, &["emailChange"]) {
+            Ok(Some(rec)) if rec.collection.id == collection.id => {
+                let duplicate = Record::find_by_email(&conn, &collection, &new_email)
+                    .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?
+                    .is_some();
+                if duplicate {
+                    token_error = Some(json!({"code": "validation_invalid_token_email", "message": "The new email address is invalid."}));
+                } else {
+                    record = Some(rec);
+                }
+            }
+            Ok(Some(_)) => {
+                token_error = Some(json!({"code": "validation_token_collection_mismatch", "message": "The provided token is for different auth collection."}));
+            }
+            _ => {
+                token_error = Some(json!({"code": "validation_invalid_token", "message": "Invalid or expired token."}));
+            }
+        }
     }
+
     if password.is_empty() {
         errors.insert("password".into(), validation_required());
-    }
-    if !errors.is_empty() {
-        return Err(ApiError::validation(Value::Object(errors)));
-    }
-
-    // parse token
-    let claims = pb_core::tokens::parse_unverified(token).ok();
-    let new_email = claims.as_ref().and_then(|c| c.new_email.clone()).unwrap_or_default();
-    if new_email.is_empty() {
-        errors.insert(
-            "token".into(),
-            json!({"code": "validation_invalid_token_payload", "message": "Invalid token payload - newEmail must be set."}),
-        );
-        return Err(ApiError::validation(Value::Object(errors)));
-    }
-
-    let record = pb_core::records::Record::find_auth_record_by_token(&conn, token, &["emailChange"])
-        .map_err(|_| ApiError::bad_request("Invalid or expired token."))?
-        .ok_or_else(|| ApiError::bad_request("Invalid or expired token."))?;
-
-    if record.collection.id != collection.id {
-        errors.insert(
-            "token".into(),
-            json!({"code": "validation_token_collection_mismatch", "message": "The provided token is for different auth collection."}),
-        );
-        return Err(ApiError::validation(Value::Object(errors)));
-    }
-
-    // check password
-    if !record.validate_password(password) {
+    } else if !record
+        .as_ref()
+        .map(|rec| rec.validate_password(password))
+        .unwrap_or(false)
+    {
         errors.insert(
             "password".into(),
             json!({"code": "validation_invalid_password", "message": "Missing or invalid auth record password."}),
         );
+    }
+    if let Some(error) = token_error {
+        errors.insert("token".into(), error);
+    }
+    if !errors.is_empty() {
         return Err(ApiError::validation(Value::Object(errors)));
     }
-
-    // check if new email already used
-    if Record::find_by_email(&conn, &collection, &new_email)
-        .map_err(|e| ApiError::internal(format!("failed to load record: {e}")))?
-        .is_some()
-    {
-        errors.insert(
-            "token".into(),
-            json!({"code": "validation_invalid_token_email", "message": "The new email address is invalid."}),
-        );
-        return Err(ApiError::validation(Value::Object(errors)));
-    }
+    let record = record.ok_or_else(|| ApiError::bad_request("Invalid or expired token."))?;
 
     // update record
     let hash_check = record.to_api_json().get("password").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1088,6 +1105,7 @@ pub async fn with_password(
     State(db): State<Db>,
     headers: HeaderMap,
     Path(id_or_name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let conn = db
@@ -1116,7 +1134,11 @@ pub async fn with_password(
     let identity = form.get("identity").and_then(Value::as_str).unwrap_or("");
     let password = form.get("password").and_then(Value::as_str).unwrap_or("");
     let identity_field = form.get("identityField").and_then(Value::as_str);
-    let mfa_id_req = form.get("mfaId").and_then(Value::as_str).unwrap_or("").to_string();
+    let mfa_id_req = query
+        .get("mfaId")
+        .cloned()
+        .or_else(|| form.get("mfaId").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
 
     let mut errors = Map::new();
     validate_required_string(form.get("identity"), &mut errors, "identity");
@@ -1187,7 +1209,10 @@ pub async fn with_password(
     // MFA check
     match check_mfa(&conn, &collection, &record, "password", &mfa_id_req)? {
         Some(mfa_id) => {
-            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "", json!({"mfaId": mfa_id})));
+            return Err(ApiError::raw(
+                StatusCode::UNAUTHORIZED,
+                json!({"mfaId": mfa_id}),
+            ));
         }
         None => {}
     }
@@ -1396,6 +1421,7 @@ struct FilterContext {
     allowed: Vec<String>,
     relations: HashMap<String, search::RelationInfo>,
     collections: HashMap<String, search::CollectionInfo>,
+    base_types: HashMap<String, String>,
     types: search::RequestFieldTypes,
 }
 
@@ -1444,6 +1470,16 @@ fn filter_context(
 
     let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
     for c in &all {
+        let mut field_types = HashMap::new();
+        let mut hidden = std::collections::HashSet::new();
+        for f in c.field_list().items() {
+            let name = pb_core::fields::field_name(f).to_string();
+            field_types.insert(name.clone(), pb_core::fields::field_type(f).to_string());
+            if pb_core::fields::field_bool(f, "hidden") {
+                hidden.insert(name);
+            }
+        }
+        field_types.insert("id".to_string(), "text".to_string());
         let info = search::CollectionInfo {
             table: c.name.clone(),
             fields: c
@@ -1451,17 +1487,33 @@ fn filter_context(
                 .items()
                 .iter()
                 .map(|f| pb_core::fields::field_name(f).to_string())
+                .chain(std::iter::once("id".to_string()))
                 .collect(),
+            field_types,
+            hidden,
             relations: relations_for(c),
         };
         collections.insert(c.name.clone(), info.clone());
         collections.insert(c.id.clone(), info);
     }
 
+    let mut base_types: HashMap<String, String> = fields
+        .items()
+        .iter()
+        .map(|f| {
+            (
+                pb_core::fields::field_name(f).to_string(),
+                pb_core::fields::field_type(f).to_string(),
+            )
+        })
+        .collect();
+    base_types.insert("id".to_string(), "text".to_string());
+
     FilterContext {
         allowed,
         relations: relations_for(collection),
         collections,
+        base_types,
         types: search::RequestFieldTypes { numbers },
     }
 }
@@ -1474,24 +1526,63 @@ fn build_filter_sql_raw(
 ) -> Result<search::SqlFilter, search::ParseError> {
     let expr = search::parse(filter)?;
     let expr = search::resolve_request_fields(&expr, &request.search_data(), &ctx.types)?;
-    search::build_sql_full(
+    search::build_sql_full_with_types(
         &expr,
         &ctx.allowed,
         request.auth_record(),
         &ctx.relations,
         &ctx.collections,
+        &ctx.base_types,
     )
+}
+
+/// `search.ParseSortFromString` / `SortField.BuildExpr`: an unresolved sort
+/// field reports the whole token literal.
+fn invalid_sort_field(field: &str) -> ApiError {
+    generic_bad_request_raw(format!(
+        "invalid sort field {}",
+        pb_core::fields::go_quote(field)
+    ))
 }
 
 fn generic_bad_request() -> ApiError {
     ApiError::bad_request(GENERIC_BAD_REQUEST)
 }
 
+/// A generic 400 carrying the oracle's internal error string as log details.
+fn generic_bad_request_raw(raw: impl Into<String>) -> ApiError {
+    generic_bad_request().with_raw_data(json!(raw.into()))
+}
+
+/// Go's `strconv.Atoi` error string.
+pub(crate) fn go_atoi(raw: &str) -> Result<i64, String> {
+    raw.parse::<i64>().map_err(|err| {
+        let reason = match err.kind() {
+            std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                "value out of range"
+            }
+            _ => "invalid syntax",
+        };
+        format!(
+            "strconv.Atoi: parsing {}: {reason}",
+            pb_core::fields::go_quote(raw)
+        )
+    })
+}
+
+/// Go's `strconv.ParseBool` error string.
+pub(crate) fn go_parse_bool_error(raw: &str) -> String {
+    format!(
+        "strconv.ParseBool: parsing {}: invalid syntax",
+        pb_core::fields::go_quote(raw)
+    )
+}
+
 /// `findCollection`: 404 when the collection is missing.
 fn find_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {
     Collection::find(conn, id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
-        .ok_or_else(|| ApiError::not_found("Missing collection context."))
+        .ok_or_else(|| ApiError::not_found("Missing collection context.").with_raw_data(json!("sql: no rows in result set")))
 }
 
 /// `e.BindBody` for the JSON content type.
@@ -1521,10 +1612,9 @@ fn parse_int_param(
     key: &str,
 ) -> Result<Option<i64>, ApiError> {
     match query.get(key) {
-        Some(raw) if !raw.is_empty() => raw
-            .parse::<i64>()
+        Some(raw) if !raw.is_empty() => go_atoi(raw)
             .map(Some)
-            .map_err(|_| generic_bad_request()),
+            .map_err(generic_bad_request_raw),
         _ => Ok(None),
     }
 }
@@ -1543,9 +1633,9 @@ fn parse_bool_param(
     key: &str,
 ) -> Result<Option<bool>, ApiError> {
     match query.get(key) {
-        Some(raw) if !raw.is_empty() => {
-            go_parse_bool(raw).map(Some).ok_or_else(generic_bad_request)
-        }
+        Some(raw) if !raw.is_empty() => go_parse_bool(raw)
+            .map(Some)
+            .ok_or_else(|| generic_bad_request_raw(go_parse_bool_error(raw))),
         _ => Ok(None),
     }
 }
@@ -1759,6 +1849,8 @@ fn enrich_record(
 /// `GET /api/collections/{collection}/records`
 pub async fn list(
     State(db): State<Db>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(id_or_name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
@@ -1768,6 +1860,17 @@ pub async fn list(
         .lock()
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+    crate::rate_limit::check_collection(
+        &conn,
+        &collection,
+        &headers,
+        Some(addr),
+        auth.as_ref(),
+        &["list"],
+        "/api/collections/{collection}/records",
+        "GET",
+        uri.path(),
+    )?;
     let request = RequestInfo::new(auth, Map::new(), query, &headers, "GET");
 
     if !request.is_superuser() && collection.list_rule.is_none() {
@@ -1778,7 +1881,7 @@ pub async fn list(
     let page = parse_int_param(&request.query, "page")?.unwrap_or(1).max(1);
     let per_page = match parse_int_param(&request.query, "perPage")? {
         Some(value) if value <= 0 => 30,
-        Some(value) => value.min(500),
+        Some(value) => value.min(1000),
         None => 30,
     };
     let skip_total = parse_bool_param(&request.query, "skipTotal")?.unwrap_or(false);
@@ -1794,8 +1897,8 @@ pub async fn list(
         if let Some(rule) = &collection.list_rule {
             if !rule.is_empty() {
                 let ctx = filter_context(&conn, &collection, true);
-                let sf =
-                    build_filter_sql_raw(&ctx, rule, &request).map_err(|_| generic_bad_request())?;
+                let sf = build_filter_sql_raw(&ctx, rule, &request)
+                    .map_err(|err| generic_bad_request_raw(err.0))?;
                 clauses.push(sf.sql);
                 filter_params.extend(sf.params);
             }
@@ -1804,8 +1907,8 @@ pub async fn list(
     if let Some(filter) = request.query.get("filter") {
         if !filter.trim().is_empty() {
             let ctx = filter_context(&conn, &collection, request.is_superuser());
-            let sf =
-                build_filter_sql_raw(&ctx, filter, &request).map_err(|_| generic_bad_request())?;
+            let sf = build_filter_sql_raw(&ctx, filter, &request)
+                .map_err(|err| generic_bad_request_raw(err.0))?;
             clauses.push(format!("({})", sf.sql));
             filter_params.extend(sf.params);
         }
@@ -2101,13 +2204,13 @@ fn build_order(
                             && pb_core::fields::field_type(f) == "relation"
                     });
                     let Some(rel) = rel else {
-                        return Err(generic_bad_request());
+                        return Err(invalid_sort_field(other));
                     };
                     let coll_id = pb_core::fields::field_str(rel, "collectionId");
                     let Some(target) = Collection::find(conn, coll_id)
                         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
                     else {
-                        return Err(generic_bad_request());
+                        return Err(invalid_sort_field(other));
                     };
                     let exists = target
                         .field_list()
@@ -2116,7 +2219,7 @@ fn build_order(
                         .any(|f| pb_core::fields::field_name(f) == sub)
                         || sub == "id";
                     if !exists {
-                        return Err(generic_bad_request());
+                        return Err(invalid_sort_field(other));
                     }
                     format!(
                         "(SELECT {} FROM {} WHERE {} = {})",
@@ -2132,7 +2235,7 @@ fn build_order(
                         .iter()
                         .any(|f| pb_core::fields::field_name(f) == other);
                     if !exists {
-                        return Err(generic_bad_request());
+                        return Err(invalid_sort_field(other));
                     }
                     pb_core::records::quote_ident(other)
                 }
@@ -2151,6 +2254,8 @@ fn build_order(
 /// `GET /api/collections/{collection}/records/{id}`
 pub async fn view(
     State(db): State<Db>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
@@ -2160,6 +2265,17 @@ pub async fn view(
         .lock()
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
+    crate::rate_limit::check_collection(
+        &conn,
+        &collection,
+        &headers,
+        Some(addr),
+        auth.as_ref(),
+        &["view"],
+        "/api/collections/{collection}/records/{id}",
+        "GET",
+        uri.path(),
+    )?;
     let request = RequestInfo::new(auth, Map::new(), query, &headers, "GET");
 
     if !request.is_superuser() && collection.view_rule.is_none() {
@@ -2168,7 +2284,7 @@ pub async fn view(
 
     let record = RecordModel::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
-        .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE))?;
+        .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE).with_raw_data(json!("sql: no rows in result set")))?;
 
     if !request.is_superuser() {
         if let Some(rule) = collection.view_rule.as_deref() {
@@ -2192,13 +2308,39 @@ pub async fn view(
 /// `POST /api/collections/{collection}/records`
 pub async fn create(
     State(db): State<Db>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(id_or_name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    create_inner(
+        db,
+        headers,
+        id_or_name,
+        query,
+        body,
+        addr,
+        uri.path(),
+        "/api/collections/{collection}/records",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_inner(
+    db: Db,
+    headers: HeaderMap,
+    id_or_name: String,
+    query: HashMap<String, String>,
+    body: Bytes,
+    addr: std::net::SocketAddr,
+    uri_path: &str,
+    pattern: &str,
+) -> Result<Json<Value>, ApiError> {
     let auth = load_auth(&db, &headers);
-    let conn = db
+    let mut conn = db
         .lock()
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
@@ -2206,6 +2348,18 @@ pub async fn create(
     if collection.is_view() {
         return Err(ApiError::bad_request("Unsupported collection type."));
     }
+
+    crate::rate_limit::check_collection(
+        &conn,
+        &collection,
+        &headers,
+        Some(addr),
+        auth.as_ref(),
+        &["create"],
+        pattern,
+        "POST",
+        uri_path,
+    )?;
 
     let request = RequestInfo::new(auth, Map::new(), query, &headers, "POST");
     let is_superuser = request.is_superuser();
@@ -2223,6 +2377,11 @@ pub async fn create(
     let data = record_data_from_request(&record, &request, is_superuser);
     request.body = data.clone();
     record.load(&data);
+
+    // `pbSuperusersRecordSaveExec` always marks superusers as verified.
+    if collection.name == pb_core::superusers::COLLECTION_NAME_SUPERUSERS {
+        record.set_verified(true);
+    }
 
     if !is_superuser {
         if let Some(rule) = collection.create_rule.as_deref() {
@@ -2257,7 +2416,8 @@ pub async fn create(
                 StatusCode::BAD_REQUEST,
                 "Failed to create record.",
                 errors_to_value(&errors),
-            ));
+            )
+            .with_raw_data(pb_core::validation::errors_to_log_value(&errors)));
         }
         Err(SubmitError::Raw(_)) => {
             return Err(ApiError::bad_request("Failed to create record."));
@@ -2265,6 +2425,14 @@ pub async fn create(
     }
 
     broadcast_record(&conn, &collection, &record, "create");
+
+    // `pbSuperusersRecordSaveExec`: creating the first real superuser removes
+    // the installer placeholder.
+    if collection.name == pb_core::superusers::COLLECTION_NAME_SUPERUSERS
+        && record.email() != pb_core::superusers::DEFAULT_INSTALLER_EMAIL
+    {
+        remove_installer_superuser(&mut conn);
+    }
 
     let mut records = vec![enrich_record(&conn, &collection, &record, &request)];
     project_fields(
@@ -2277,10 +2445,38 @@ pub async fn create(
 /// `PATCH /api/collections/{collection}/records/{id}`
 pub async fn update(
     State(db): State<Db>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    update_inner(
+        db,
+        headers,
+        id_or_name,
+        record_id,
+        query,
+        body,
+        addr,
+        uri.path(),
+        "/api/collections/{collection}/records/{id}",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_inner(
+    db: Db,
+    headers: HeaderMap,
+    id_or_name: String,
+    record_id: String,
+    query: HashMap<String, String>,
+    body: Bytes,
+    addr: std::net::SocketAddr,
+    uri_path: &str,
+    pattern: &str,
 ) -> Result<Json<Value>, ApiError> {
     let auth = load_auth(&db, &headers);
     let conn = db
@@ -2292,6 +2488,18 @@ pub async fn update(
         return Err(ApiError::bad_request("Unsupported collection type."));
     }
 
+    crate::rate_limit::check_collection(
+        &conn,
+        &collection,
+        &headers,
+        Some(addr),
+        auth.as_ref(),
+        &["update"],
+        pattern,
+        "PATCH",
+        uri_path,
+    )?;
+
     let request = RequestInfo::new(auth, Map::new(), query, &headers, "PATCH");
     let is_superuser = request.is_superuser();
     if !is_superuser && collection.update_rule.is_none() {
@@ -2300,7 +2508,7 @@ pub async fn update(
 
     let mut record = RecordModel::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
-        .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE))?;
+        .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE).with_raw_data(json!("sql: no rows in result set")))?;
 
     let body = bind_body(&headers, &body)?;
     let mut request = RequestInfo { body, ..request };
@@ -2325,6 +2533,11 @@ pub async fn update(
     }
     record.load(&data);
 
+    // `pbSuperusersRecordSaveExec` always marks superusers as verified.
+    if collection.name == pb_core::superusers::COLLECTION_NAME_SUPERUSERS {
+        record.set_verified(true);
+    }
+
     if !record.has_manage_access() {
         let ctx = filter_context(&conn, &collection, true);
         if has_auth_manage_access_record(&conn, &collection, &record_id, &request, &ctx) {
@@ -2339,7 +2552,8 @@ pub async fn update(
                 StatusCode::BAD_REQUEST,
                 "Failed to update record.",
                 errors_to_value(&errors),
-            ));
+            )
+            .with_raw_data(pb_core::validation::errors_to_log_value(&errors)));
         }
         Err(SubmitError::Raw(_)) => {
             return Err(ApiError::bad_request("Failed to update record."));
@@ -2359,11 +2573,35 @@ pub async fn update(
 /// `DELETE /api/collections/{collection}/records/{id}`
 pub async fn delete(
     State(db): State<Db>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path((id_or_name, record_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    delete_inner(
+        db,
+        headers,
+        id_or_name,
+        record_id,
+        addr,
+        uri.path(),
+        "/api/collections/{collection}/records/{id}",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn delete_inner(
+    db: Db,
+    headers: HeaderMap,
+    id_or_name: String,
+    record_id: String,
+    addr: std::net::SocketAddr,
+    uri_path: &str,
+    pattern: &str,
+) -> Result<StatusCode, ApiError> {
     let auth = load_auth(&db, &headers);
-    let conn = db
+    let mut conn = db
         .lock()
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
     let collection = find_collection(&conn, &id_or_name)?;
@@ -2371,6 +2609,18 @@ pub async fn delete(
     if collection.is_view() {
         return Err(ApiError::bad_request("Unsupported collection type."));
     }
+
+    crate::rate_limit::check_collection(
+        &conn,
+        &collection,
+        &headers,
+        Some(addr),
+        auth.as_ref(),
+        &["delete"],
+        pattern,
+        "DELETE",
+        uri_path,
+    )?;
 
     let request = RequestInfo::new(auth, Map::new(), HashMap::new(), &headers, "DELETE");
     if !request.is_superuser() && collection.delete_rule.is_none() {
@@ -2380,7 +2630,7 @@ pub async fn delete(
     let Some(record) = RecordModel::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
     else {
-        return Err(ApiError::not_found(NOT_FOUND_MESSAGE));
+        return Err(ApiError::not_found(NOT_FOUND_MESSAGE).with_raw_data(json!("sql: no rows in result set")));
     };
 
     if !request.is_superuser() {
@@ -2394,19 +2644,22 @@ pub async fn delete(
         }
     }
 
-    let sql = format!(
-        "DELETE FROM {} WHERE {} = ?1",
-        quote_table(&collection.name),
-        pb_core::records::quote_ident("id")
-    );
-    conn.execute(&sql, [&record_id])
-        .map_err(|_| {
-            ApiError::bad_request(
-                "Failed to delete record. Make sure that the record is not part of a required relation reference.",
-            )
-        })?;
-    broadcast_record(&conn, &collection, &record, "delete");
-    Ok(StatusCode::NO_CONTENT)
+    match pb_core::record_delete::delete_record(&mut conn, &collection, &record) {
+        Ok(deleted) => {
+            for item in deleted {
+                broadcast_record(&conn, &item.collection, &item.record, "delete");
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
+        // `firstApiError`: a hook's ApiError keeps its own message.
+        Err(pb_core::record_delete::DeleteError::Api { message }) => {
+            Err(ApiError::bad_request(message))
+        }
+        Err(pb_core::record_delete::DeleteError::Raw(message)) => Err(ApiError::bad_request(
+            "Failed to delete record. Make sure that the record is not part of a required relation reference.",
+        )
+        .with_raw_data(json!(message))),
+    }
 }
 
 fn json_to_sqlite(value: &Value) -> rusqlite::types::Value {
@@ -2454,6 +2707,28 @@ fn check_mfa(
     if !mfa_config.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(None);
     }
+    let rule = mfa_config.get("rule").and_then(Value::as_str).unwrap_or("");
+    if !rule.is_empty() {
+        let data: Map<String, Value> = auth_record
+            .to_api_json()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let request = RequestInfo {
+            auth: None,
+            body: Map::new(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            method: "GET".to_string(),
+            context: "default".to_string(),
+        };
+        let ctx = filter_context(conn, collection, true);
+        if !rule_matches_data(conn, rule, &data, &request, &ctx)
+            .map_err(|_| ApiError::bad_request("Failed to authenticate."))?
+        {
+            return Ok(None);
+        }
+    }
     let mfas_collection = Collection::find(conn, "_mfas")
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::internal("missing _mfas collection"))?;
@@ -2480,9 +2755,6 @@ fn check_mfa(
     let mfa_collection_ref = mfa_json.get("collectionRef").and_then(Value::as_str).unwrap_or("");
     let mfa_record_ref = mfa_json.get("recordRef").and_then(Value::as_str).unwrap_or("");
     let mfa_method = mfa_json.get("method").and_then(Value::as_str).unwrap_or("");
-    if mfa_collection_ref != collection.id || mfa_record_ref != auth_record.id() {
-        return Err(ApiError::bad_request("Invalid MFA session."));
-    }
     let expired: i64 = conn
         .query_row(
             "SELECT CASE WHEN datetime(created, '+' || ?2 || ' seconds') < datetime('now') THEN 1 ELSE 0 END FROM _mfas WHERE id = ?1",
@@ -2494,11 +2766,72 @@ fn check_mfa(
         conn.execute("DELETE FROM _mfas WHERE id = ?1", [requested_mfa_id]).ok();
         return Err(ApiError::bad_request("Invalid or expired MFA session."));
     }
+    if mfa_collection_ref != collection.id || mfa_record_ref != auth_record.id() {
+        return Err(ApiError::bad_request("Invalid MFA session."));
+    }
     if mfa_method == current_method {
         return Err(ApiError::bad_request("A different authentication method is required."));
     }
     conn.execute("DELETE FROM _mfas WHERE id = ?1", [requested_mfa_id]).ok();
     Ok(None)
+}
+
+/// `apis.logFilterFields`: the `search.SimpleFieldResolver` allowlist. Dotted
+/// `data.*` names are JSON paths.
+const LOG_FILTER_FIELDS: &[&str] = &[
+    "id",
+    "created",
+    "level",
+    "message",
+    "data",
+    r"^data\.[\w.:]*\w+$",
+];
+
+fn log_filter_fields() -> Vec<String> {
+    LOG_FILTER_FIELDS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Parse a logs filter with `search.SimpleFieldResolver` semantics.
+fn logs_filter_sql(filter: &str) -> Result<Option<search::SqlFilter>, ApiError> {
+    if filter.is_empty() {
+        return Ok(None);
+    }
+    let expr = search::parse(filter).map_err(|err| generic_bad_request_raw(err.0))?;
+    search::build_sql_simple(&expr, &log_filter_fields(), true)
+        .map(Some)
+        .map_err(|err| generic_bad_request_raw(err.0))
+}
+
+/// `search.ParseSortFromString` + `SortField.BuildExpr` for the logs resolver.
+fn logs_order(sort: &str) -> Result<String, ApiError> {
+    if sort.is_empty() {
+        return Ok(String::new());
+    }
+    let fields = log_filter_fields();
+    let resolver = search::SimpleFieldResolver::new(&fields, true);
+    let mut parts = Vec::new();
+    for raw in sort.split(',') {
+        let raw = raw.trim();
+        let (name, direction) = match raw.strip_prefix('-') {
+            Some(rest) => (rest, "DESC"),
+            None => (raw.strip_prefix('+').unwrap_or(raw), "ASC"),
+        };
+        let expr = if name == "@random" {
+            "RANDOM()".to_string()
+        } else if name == "@rowid" {
+            format!("\"_rowid_\" {direction}")
+        } else {
+            let resolved = resolver.resolve(name).map_err(|_| {
+                generic_bad_request_raw(format!(
+                    "invalid sort field {}",
+                    pb_core::fields::go_quote(name)
+                ))
+            })?;
+            format!("{} {direction}", resolved.identifier)
+        };
+        parts.push(expr);
+    }
+    Ok(format!("ORDER BY {}", parts.join(", ")))
 }
 
 pub async fn logs_list(
@@ -2507,25 +2840,79 @@ pub async fn logs_list(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     crate::auth::require_superuser(&db, &headers)?;
+
+    // `search.Provider.Parse`: an invalid numeric/bool value is a generic 400.
+    let mut page = match params.get("page") {
+        Some(raw) if !raw.is_empty() => go_atoi(raw).map_err(generic_bad_request_raw)?,
+        _ => 0,
+    };
+    if page <= 0 {
+        page = 1;
+    }
+    let mut per_page = match params.get("perPage") {
+        Some(raw) if !raw.is_empty() => go_atoi(raw).map_err(generic_bad_request_raw)?,
+        _ => 0,
+    };
+    if per_page <= 0 {
+        per_page = 30;
+    } else if per_page > 1000 {
+        per_page = 1000;
+    }
+    let skip_total = match params.get("skipTotal") {
+        Some(raw) if !raw.is_empty() => go_parse_bool(raw)
+            .ok_or_else(|| generic_bad_request_raw(go_parse_bool_error(raw)))?,
+        _ => false,
+    };
+    let filter = logs_filter_sql(params.get("filter").map(String::as_str).unwrap_or(""))?;
+    let order = logs_order(params.get("sort").map(String::as_str).unwrap_or(""))?;
+
     let aux = AUX_DB
         .get()
         .cloned()
         .ok_or_else(|| ApiError::internal("aux db not available"))?;
     let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
 
-    let page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
-    let per_page: i64 = params.get("perPage").and_then(|s| s.parse().ok()).unwrap_or(30).clamp(1, 500);
-    let offset = (page - 1) * per_page;
+    let where_clause = filter
+        .as_ref()
+        .map(|f| format!("WHERE {}", f.sql))
+        .unwrap_or_default();
+    let sql_params: Vec<rusqlite::types::Value> = filter
+        .as_ref()
+        .map(|f| f.params.iter().map(json_to_sqlite).collect())
+        .unwrap_or_default();
 
-    let total: i64 = conn
-        .query_row("SELECT count(*) FROM _logs", [], |r| r.get(0))
-        .unwrap_or(0);
+    let total: i64 = if skip_total {
+        -1
+    } else {
+        let count_sql =
+            format!("SELECT COUNT(DISTINCT \"_logs\".\"id\") FROM _logs {where_clause}");
+        conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(sql_params.iter()),
+            |r| r.get(0),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    };
+    let total_pages = if skip_total {
+        -1
+    } else {
+        ((total as f64) / (per_page as f64)).ceil() as i64
+    };
 
+    // No default ORDER BY: the oracle returns SQLite's natural rowid order.
+    let sql = format!(
+        "SELECT id, level, message, data, created FROM _logs {where_clause} {order} LIMIT ? OFFSET ?"
+    );
+    let mut all_params = sql_params;
+    all_params.push(rusqlite::types::Value::Integer(per_page));
+    all_params.push(rusqlite::types::Value::Integer(
+        per_page * (page - 1),
+    ));
     let mut stmt = conn
-        .prepare("SELECT id, level, message, data, created FROM _logs ORDER BY created DESC LIMIT ?1 OFFSET ?2")
+        .prepare(&sql)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let rows = stmt
-        .query_map(rusqlite::params![per_page, offset], |r| {
+        .query_map(rusqlite::params_from_iter(all_params.iter()), |r| {
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "level": r.get::<_, i64>(1)?,
@@ -2540,7 +2927,6 @@ pub async fn logs_list(
         items.push(row.map_err(|e| ApiError::internal(e.to_string()))?);
     }
 
-    let total_pages = if total == 0 { 0 } else { (total + per_page - 1) / per_page };
     Ok(Json(json!({
         "items": items,
         "page": page,
@@ -2574,38 +2960,74 @@ pub async fn logs_view(
                 "created": r.get::<_, String>(4)?,
             }))
         })
-        .map_err(|_| ApiError::not_found("The requested resource wasn't found."))?;
+        .map_err(|_| {
+            ApiError::not_found("The requested resource wasn't found.")
+                .with_raw_data(json!("sql: no rows in result set"))
+        })?;
     Ok(Json(row))
 }
 
 pub async fn logs_stats(
     State(db): State<Db>,
     headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     crate::auth::require_superuser(&db, &headers)?;
+
+    // `logsStats` parses the filter itself and uses a distinct message.
+    let filter = params.get("filter").map(String::as_str).unwrap_or("");
+    let filter_sql = if filter.is_empty() {
+        None
+    } else {
+        let expr = search::parse(filter).map_err(|err| {
+            ApiError::bad_request("Invalid filter format.").with_raw_data(json!(err.0))
+        })?;
+        Some(
+            search::build_sql_simple(&expr, &log_filter_fields(), true).map_err(|err| {
+                ApiError::bad_request("Invalid filter format.").with_raw_data(json!(err.0))
+            })?,
+        )
+    };
+
     let aux = AUX_DB
         .get()
         .cloned()
         .ok_or_else(|| ApiError::internal("aux db not available"))?;
     let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
-    // simple stats: count by level
+    // `core.LogsStats`: hourly grouped counts, with `types.DateTime` adding
+    // the `.000Z` suffix that SQLite's `strftime` doesn't emit.
+    let where_clause = filter_sql
+        .as_ref()
+        .map(|f| format!("WHERE {}", f.sql))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT strftime('%Y-%m-%d %H:00:00', created) || '.000Z' AS date,
+                count(id) AS total
+         FROM _logs
+         {where_clause}
+         GROUP BY date
+         ORDER BY date ASC"
+    );
+    let sql_params: Vec<rusqlite::types::Value> = filter_sql
+        .as_ref()
+        .map(|f| f.params.iter().map(json_to_sqlite).collect())
+        .unwrap_or_default();
     let mut stmt = conn
-        .prepare("SELECT level, count(*) FROM _logs GROUP BY level")
+        .prepare(&sql)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .query_map(rusqlite::params_from_iter(sql_params.iter()), |r| {
+            Ok(json!({
+                "date": r.get::<_, String>(0)?,
+                "total": r.get::<_, i64>(1)?,
+            }))
+        })
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut by_level = Map::new();
-    let mut total = 0i64;
+    let mut items = Vec::new();
     for row in rows {
-        let (level, count) = row.map_err(|e| ApiError::internal(e.to_string()))?;
-        by_level.insert(level.to_string(), json!(count));
-        total += count;
+        items.push(row.map_err(|e| ApiError::internal(e.to_string()))?);
     }
-    Ok(Json(json!({
-        "total": total,
-        "byLevel": by_level,
-    })))
+    Ok(Json(Value::Array(items)))
 }
 
 pub async fn logs_truncate(
@@ -2620,6 +3042,9 @@ pub async fn logs_truncate(
     let conn = aux.lock().map_err(|_| ApiError::internal("aux lock poisoned"))?;
     conn.execute("DELETE FROM _logs", [])
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    // `logsTruncate` reclaims disk space after the delete; a vacuum failure is
+    // only logged as a warning by the oracle, so it must not fail the request.
+    let _ = conn.execute_batch("VACUUM");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2640,7 +3065,7 @@ pub async fn realtime_connect(
     use futures_util::stream;
     use std::time::Duration;
 
-    let client_id = pb_core::ids::default_random_id();
+    let client_id = pb_core::ids::random_string(40);
     let ip = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -2690,15 +3115,13 @@ pub async fn realtime_subscribe(
 
     let client_id = form.get("clientId").and_then(Value::as_str).unwrap_or("");
     if client_id.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::form_validation(
             "",
             json!({"clientId": validation_required()}),
         ));
     }
     if client_id.chars().count() > 255 {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::form_validation(
             "",
             json!({"clientId": validation_length(1, 255)}),
         ));
@@ -2730,15 +3153,13 @@ pub async fn realtime_subscribe(
         }
     }
     if subscriptions.len() > 1000 {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::form_validation(
             "",
             json!({"subscriptions": validation_length(0, 1000)}),
         ));
     }
     if subscriptions.iter().any(|s| s.chars().count() > 2500) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::form_validation(
             "",
             json!({"subscriptions": validation_length(0, 2500)}),
         ));
@@ -2767,6 +3188,42 @@ pub async fn realtime_subscribe(
 
 /// Broadcasts a record change to every subscribed realtime client, applying
 /// the collection view/list API rule and the per-subscription `filter`.
+/// Delete the `__pbinstaller@example.com` placeholder if it still exists.
+///
+/// Mirrors the `pbSuperusersRecordSaveExec` cleanup: a failure is logged by the
+/// oracle and does not fail the create, so it is ignored here as well.
+fn remove_installer_superuser(conn: &mut rusqlite::Connection) {
+    use rusqlite::OptionalExtension as _;
+
+    let Ok(Some(collection)) =
+        Collection::find(conn, pb_core::superusers::COLLECTION_NAME_SUPERUSERS)
+    else {
+        return;
+    };
+    let installer_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM `_superusers` WHERE email = ?1 LIMIT 1",
+            [pb_core::superusers::DEFAULT_INSTALLER_EMAIL],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some(installer_id) = installer_id else {
+        return;
+    };
+    let Ok(Some(installer)) =
+        pb_core::record_upsert::RecordModel::find_by_id(conn, &collection, &installer_id)
+    else {
+        return;
+    };
+    if let Ok(deleted) = pb_core::record_delete::delete_record(conn, &collection, &installer) {
+        for item in deleted {
+            broadcast_record(conn, &item.collection, &item.record, "delete");
+        }
+    }
+}
+
 fn broadcast_record(
     conn: &rusqlite::Connection,
     collection: &Collection,
@@ -2840,8 +3297,8 @@ fn broadcast_record(
             }
 
             let mut payload = json!({
-                "action": action,
                 "record": record.to_api_json(),
+                "action": action,
             });
             // Optional `fields` projection from the subscription options.
             if let Some(options) = topic.split_once("options=").map(|(_, v)| v) {

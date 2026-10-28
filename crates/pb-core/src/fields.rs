@@ -553,7 +553,7 @@ fn parse_date_parts(value: &str) -> Option<(i64, String)> {
 }
 
 /// Howard Hinnant's `civil_from_days`.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -564,6 +564,17 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Howard Hinnant's `days_from_civil` (inverse of [`civil_from_days`]).
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// `types.DateTime.Scan` + `String()`: normalize a date, or `""` when unparsable.

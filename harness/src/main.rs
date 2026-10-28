@@ -63,6 +63,10 @@ struct Request {
     path: String,
     #[serde(default)]
     body: Option<String>,
+    /// Multipart file upload (`POST /api/backups/upload`). The content is
+    /// base64-encoded so binary payloads survive JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multipart: Option<MultipartFile>,
     /// Query parameters, percent-encoded by the harness. Prefer this over
     /// embedding `?filter=...` in `path`: filter expressions contain spaces
     /// and `&` that must be encoded as a single value.
@@ -70,10 +74,42 @@ struct Request {
     query: BTreeMap<String, String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// Wait before sending this request (milliseconds). The oracle batches its
+    /// activity-log writes in 3-second intervals, so scenarios that read
+    /// `/api/logs` must wait for the batch to flush.
+    #[serde(default, rename = "delayMs", skip_serializing_if = "is_zero")]
+    delay_ms: u64,
+    /// Wait until the next UTC minute boundary before sending the request.
+    /// `delayMs` is applied after the boundary (used by cron-scheduling
+    /// scenarios, which must observe the scheduler tick deterministically).
+    #[serde(default, rename = "waitForNextMinute", skip_serializing_if = "is_false")]
+    wait_for_next_minute: bool,
     /// Extract values from the JSON response for use in later requests.
     /// Key = variable name, value = dot-separated path (e.g. `token`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     save: BTreeMap<String, String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct MultipartFile {
+    field: String,
+    filename: String,
+    #[serde(default = "default_part_content_type")]
+    content_type: String,
+    /// Base64-encoded file content.
+    content_base64: String,
+}
+
+fn default_part_content_type() -> String {
+    "application/octet-stream".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -111,10 +147,16 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
 
 fn normalize_body(raw: &str, content_type: &str) -> String {
     let normalized = normalize(raw);
-    if content_type.split(';').next().unwrap_or("").trim() == "application/json" {
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type == "application/json" {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&normalized) {
             return serde_json::to_string(&sort_json(value)).unwrap_or(normalized);
         }
+    }
+    // Binary payloads (backup downloads) embed machine-specific database
+    // snapshots, so only status/content-type are part of the contract.
+    if !media_type.is_empty() && !media_type.starts_with("text/") {
+        return "<binary>".to_string();
     }
     normalized
 }
@@ -137,6 +179,17 @@ fn normalize(input: &str) -> String {
     let ids = Regex::new(r"\b[a-z0-9]{15}\b").unwrap();
     // RFC3339-ish timestamps, with or without fractional seconds.
     let ts = Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?Z?").unwrap();
+    // Activity-log execution times are inherently machine dependent.
+    let exec_time = Regex::new(r#""execTime":\s*-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"#).unwrap();
+    // Backup archives embed creation timestamps, so their compressed size is
+    // not stable between two runs.
+    let backup_size = Regex::new(r#""size":\s*[0-9]+"#).unwrap();
+    // `filesystem.normalizeName` random suffix in upload validation messages.
+    let upload_rand = Regex::new(r"[a-z0-9]+_[a-z0-9]{10}\.zip").unwrap();
+    // Absolute filesystem paths leak into raw filesystem error messages.
+    let fs_path = Regex::new(r#"(?:/tmp|/Users|/home|/private)/[^\s"]+"#).unwrap();
+    // Auto-generated backup names (`pb_backup_<app>_<timestamp>.zip`).
+    let backup_name = Regex::new(r"pb_backup_[a-z0-9_]+_\d+\.zip").unwrap();
 
     let out = jwt.replace_all(input, "<jwt>");
     let out = secret.replace_all(&out, "<secret>");
@@ -144,8 +197,15 @@ fn normalize(input: &str) -> String {
     let out = temp_view.replace_all(&out, "temp_view_<random>");
     let out = temp_pbc.replace_all(&out, "pbc_<temp>$1");
     let out = clone.replace_all(&out, "_clone_<random>");
+    // `execTime` fractions can contain a 15-digit run, so normalize it before
+    // the generic record-id pattern (which would otherwise corrupt the JSON).
+    let out = exec_time.replace_all(&out, "\"execTime\":0");
     let out = ids.replace_all(&out, "<id>");
-    ts.replace_all(&out, "<ts>").to_string()
+    let out = ts.replace_all(&out, "<ts>");
+    let out = backup_size.replace_all(&out, "\"size\":0");
+    let out = upload_rand.replace_all(&out, "<rand>.zip");
+    let out = fs_path.replace_all(&out, "<path>");
+    backup_name.replace_all(&out, "pb_backup_<name>.zip").to_string()
 }
 
 fn substitute(value: &str, vars: &BTreeMap<String, String>) -> String {
@@ -160,7 +220,10 @@ fn substitute(value: &str, vars: &BTreeMap<String, String>) -> String {
 fn lookup<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut cur = value;
     for part in path.split('.') {
-        cur = cur.get(part)?;
+        cur = match part.parse::<usize>() {
+            Ok(index) => cur.get(index)?,
+            Err(_) => cur.get(part)?,
+        };
     }
     Some(cur)
 }
@@ -190,6 +253,18 @@ fn record(base: &str, scenario_path: &Path, out: &Path) -> Result<()> {
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
 
     for req in &scenario.requests {
+        if req.wait_for_next_minute {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let next = (now / 60_000 + 1) * 60_000;
+            std::thread::sleep(std::time::Duration::from_millis(
+                next - now + req.delay_ms,
+            ));
+        } else if req.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(req.delay_ms));
+        }
         let path = substitute(&req.path, &vars);
         let mut url = format!("{}{}", base.trim_end_matches('/'), path);
         if !req.query.is_empty() {
@@ -212,19 +287,42 @@ fn record(base: &str, scenario_path: &Path, out: &Path) -> Result<()> {
             call = call.set(k, &substitute(v, &vars));
         }
         let body = req.body.as_ref().map(|b| substitute(b, &vars));
-        // PocketBase only accepts JSON bodies; ureq would otherwise send
-        // `text/plain` and the oracle answers "Unsupported Content-Type."
-        if body.is_some()
-            && !req
-                .headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("content-type"))
-        {
-            call = call.set("content-type", "application/json");
-        }
-        let result = match &body {
-            Some(b) => call.send_string(b),
-            None => call.call(),
+        let result = if let Some(part) = &req.multipart {
+            use base64::Engine as _;
+            let content = base64::engine::general_purpose::STANDARD
+                .decode(substitute(&part.content_base64, &vars))
+                .with_context(|| format!("invalid base64 content for {}", req.name))?;
+            let boundary = "----harnessboundary7f3a";
+            let mut payload = Vec::new();
+            payload.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+                    part.field, part.filename, part.content_type
+                )
+                .as_bytes(),
+            );
+            payload.extend_from_slice(&content);
+            payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            call = call.set(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            );
+            call.send_bytes(&payload)
+        } else {
+            // PocketBase only accepts JSON bodies; ureq would otherwise send
+            // `text/plain` and the oracle answers "Unsupported Content-Type."
+            if body.is_some()
+                && !req
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"))
+            {
+                call = call.set("content-type", "application/json");
+            }
+            match &body {
+                Some(b) => call.send_string(b),
+                None => call.call(),
+            }
         };
 
         let (status, content_type, raw_body) = match result {
