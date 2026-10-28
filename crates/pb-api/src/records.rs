@@ -2797,6 +2797,24 @@ pub(crate) async fn create_inner(
         }
     }
 
+    // Ensure the storage folder matches the final record id (handles id
+    // regeneration by autogenerate or auth collections).
+    if let Some(rid) = &forced_id {
+        if record.id() != rid {
+            let root = crate::records::DATA_DIR
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::path::PathBuf::from("pb_data"))
+                .join("storage")
+                .join(&collection.id);
+            let old_dir = root.join(rid);
+            let new_dir = root.join(record.id());
+            if old_dir.exists() && !new_dir.exists() {
+                let _ = std::fs::rename(&old_dir, &new_dir);
+            }
+        }
+    }
+
     broadcast_record(&conn, &collection, &record, "create");
 
     // `pbSuperusersRecordSaveExec`: creating the first real superuser removes
