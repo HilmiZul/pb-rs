@@ -11,7 +11,7 @@ compatibility promise.
 | L2 On-disk | `pb_data/data.db` schema identical; `_migrations` rows identical; `_params.settings` byte-identical (incl. BLOB storage class); `_collections` identical modulo per-install secrets; installer superuser created on a fresh install | `tools/gate_m1.sh` |
 | L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{code,message,data}` | harness `basic` + per-domain scenarios; `tools/gate_m2.sh` for auth/settings/collections reads and collection create/delete/truncate |
 | L4 Auth | bcrypt hashes verify; JWT `HS256` with per-collection `authToken.secret`, claims `{collectionId,id,type,refreshable,exp}`; refresh, OTP, MFA, OAuth2, file tokens | cross-token test in `tools/gate_m2.sh`: a token minted by the oracle validates in the port and vice versa |
-| L5 Query | filter/sort/expand/fields syntax and semantics, including NULL and relation traversal | differential fuzz of the filter parser |
+| L5 Query | filter/sort/expand/fields syntax and semantics, including NULL and relation traversal, the filter limits (3500 bytes, 200 expressions) and sort limits (8 fields, 255 bytes/field) | `tools/filter_fuzz.py` (420 expressions), `tools/sort_fuzz.py` (165 expressions), `tools/rules_audit.py` (26 rule cases), all run by `tools/gate_m7.sh` |
 | L6 Realtime | `text/event-stream` framing, `PB_CONNECT` event, subscription payloads | SSE scenario |
 | L7 Static/UI | `/_/` serves the mirrored `ui/` tree with identical content types and SPA fallback | byte comparison of `ui/` |
 | L8 JSVM | **not promised in v1** | — |
@@ -48,6 +48,24 @@ compatibility promise.
    config and fails validation, while a partial object (`{"duration":120}`)
    merges onto the existing struct. Slices/maps zero to `[]`/`{}`. This is
    covered by `m2c-collections-write` (`create-auth-options-null`).
+
+## Query semantics (M7)
+
+* **Filter limits:** a raw filter longer than 3500 bytes is rejected, and more
+  than 200 expressions is rejected, with the oracle's messages.
+* **Sort limits:** more than 8 sort fields is rejected, as is a single field
+  longer than 255 bytes.
+* **NULL / empty operands:** `null`, `''`, and a missing `@request.auth.*`
+  resolve to the `NULL` identifier (no bound parameter). On either side of
+  `=`/`!=` they take the oracle's `resolveEqualExpr` fallback branches:
+  `("" = x OR x IS NULL)` for equality, `("" IS NOT x AND x IS NOT NULL)` for
+  inequality. This is what makes `team.members ?= @request.auth.id` match
+  records whose relation target is empty.
+* **LIKE casting:** `~`/`!~` cast every bound operand to text before wrapping it
+  in `%...%`, so numeric/boolean literals match the oracle.
+* **Math functions:** SQLite math functions are registered at connection open
+  (see D15); `geoDistance` binding is expanded to the six references the oracle
+  emits.
 
 ## Deliberate divergences
 
@@ -203,3 +221,39 @@ insert) keep `rusqlite`'s text.
 *Status:* partially resolved (index, collection DDL, truncate, and protected-file
 paths now translate rusqlite errors); remaining statements still use rusqlite
 text.
+
+### D14 — Serialized database access and synchronous request logging
+
+The port holds every API database operation behind one
+`Arc<Mutex<Connection>>`, and the activity logger calls `load_auth` again and
+writes the `_logs` row synchronously before the response is completed. The oracle
+uses a pooled connection and writes activity rows from a fire-and-forget
+goroutine.
+
+*Why:* a single connection keeps SQLite transaction semantics and `pb_data`
+compatibility simple; the pool/async writer is a performance optimization, not a
+correctness requirement.
+*Impact (debug build, same machine): authenticated list requests p50 ≈ 9 ms vs
+the oracle's ≈ 0.5 ms; under the M7 load test (8 workers × 40 mirrored ops)
+p50 ≈ 58 ms vs ≈ 0.9 ms. Status codes, final record sets, WAL mode, and
+`integrity_check` all match. Release builds narrow the gap but do not remove the
+serialization.
+*Proven harmless by:* `tools/load_wal.py` (606 requests, zero 5xx/transport
+errors, identical final state) and the full `tools/gate_m7.sh`.
+*Status:* documented divergence; candidate for a connection pool in v2.
+
+### D15 — SQL math functions are registered by the port
+
+The oracle's `mattn/go-sqlite3` build includes SQLite's math functions;
+`rusqlite`'s bundled build does not compile them in by default. The port enables
+rusqlite's `functions` feature and registers `acos`, `acosh`, `asin`, `asinh`,
+`atan`, `atan2`, `atanh`, `ceil`, `ceiling`, `cos`, `cosh`, `degrees`, `exp`,
+`floor`, `ln`, `log`, `log10`, `log2`, `mod`, `pi`, `pow`, `power`, `radians`,
+`sin`, `sinh`, `sqrt`, `tan`, `tanh`, and `trunc` at connection open, matching the
+oracle's set.
+
+*Why:* `geoDistance(...)` expands to `acos(...)`/`cos(...)`/`sin(...)`/
+`radians(...)` in the generated SQL; without them the oracle query succeeds and
+the port returned "no such function".
+*Proven harmless by:* the filter fuzz corpus includes `geoDistance` calls and
+direct math-function filters.

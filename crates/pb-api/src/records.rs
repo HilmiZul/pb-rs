@@ -1687,7 +1687,7 @@ fn build_filter_sql_raw(
     filter: &str,
     request: &RequestInfo,
 ) -> Result<search::SqlFilter, search::ParseError> {
-    let expr = search::parse(filter)?;
+    let expr = search::parse_limited(filter)?;
     let expr = search::resolve_request_fields(&expr, &request.search_data(), &ctx.types)?;
     search::build_sql_full_with_types(
         &expr,
@@ -2240,7 +2240,9 @@ pub async fn list(
         }
     }
     if let Some(filter) = request.query.get("filter") {
-        if !filter.trim().is_empty() {
+        if !filter.is_empty() {
+            // `search.Provider.Exec` checks the raw byte length before parsing.
+            search::check_filter_length(filter).map_err(|err| generic_bad_request_raw(err.0))?;
             let ctx = filter_context(&conn, &collection, request.is_superuser());
             let sf = build_filter_sql_raw(&ctx, filter, &request)
                 .map_err(|err| generic_bad_request_raw(err.0))?;
@@ -2517,17 +2519,24 @@ fn build_order(
     if sort.is_empty() {
         return Ok(String::new());
     }
+    // `search.ParseSortFromString` keeps empty entries (a trailing comma is a
+    // field with an empty name); `Provider.Exec` then applies both limits.
+    let tokens: Vec<&str> = sort.split(',').map(str::trim).collect();
+    if tokens.len() > search::DEFAULT_SORT_EXPR_LIMIT {
+        return Err(generic_bad_request_raw(search::ERR_SORT_EXPR_LIMIT));
+    }
     let mut parts = Vec::new();
-    for token in sort.split(',') {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
+    for token in tokens {
         let (desc, field) = if let Some(rest) = token.strip_prefix('-') {
             (true, rest)
+        } else if let Some(rest) = token.strip_prefix('+') {
+            (false, rest)
         } else {
             (false, token)
         };
+        if field.len() > search::MAX_SORT_FIELD_LENGTH {
+            return Err(generic_bad_request_raw(search::ERR_SORT_FIELD_LENGTH_LIMIT));
+        }
         let expr = match field {
             "@rowid" => "_rowid_".to_string(),
             "@random" => "RANDOM()".to_string(),
@@ -3254,7 +3263,9 @@ fn logs_filter_sql(filter: &str) -> Result<Option<search::SqlFilter>, ApiError> 
     if filter.is_empty() {
         return Ok(None);
     }
-    let expr = search::parse(filter).map_err(|err| generic_bad_request_raw(err.0))?;
+    // `search.Provider.Exec` limits apply to the logs list too.
+    search::check_filter_length(filter).map_err(|err| generic_bad_request_raw(err.0))?;
+    let expr = search::parse_limited(filter).map_err(|err| generic_bad_request_raw(err.0))?;
     search::build_sql_simple(&expr, &log_filter_fields(), true)
         .map(Some)
         .map_err(|err| generic_bad_request_raw(err.0))
@@ -3267,13 +3278,19 @@ fn logs_order(sort: &str) -> Result<String, ApiError> {
     }
     let fields = log_filter_fields();
     let resolver = search::SimpleFieldResolver::new(&fields, true);
+    let tokens: Vec<&str> = sort.split(',').map(str::trim).collect();
+    if tokens.len() > search::DEFAULT_SORT_EXPR_LIMIT {
+        return Err(generic_bad_request_raw(search::ERR_SORT_EXPR_LIMIT));
+    }
     let mut parts = Vec::new();
-    for raw in sort.split(',') {
-        let raw = raw.trim();
+    for raw in tokens {
         let (name, direction) = match raw.strip_prefix('-') {
             Some(rest) => (rest, "DESC"),
             None => (raw.strip_prefix('+').unwrap_or(raw), "ASC"),
         };
+        if name.len() > search::MAX_SORT_FIELD_LENGTH {
+            return Err(generic_bad_request_raw(search::ERR_SORT_FIELD_LENGTH_LIMIT));
+        }
         let expr = if name == "@random" {
             "RANDOM()".to_string()
         } else if name == "@rowid" {
@@ -3437,7 +3454,7 @@ pub async fn logs_stats(
     let filter_sql = if filter.is_empty() {
         None
     } else {
-        let expr = search::parse(filter).map_err(|err| {
+        let expr = search::parse_limited(filter).map_err(|err| {
             ApiError::bad_request("Invalid filter format.").with_raw_data(json!(err.0))
         })?;
         Some(

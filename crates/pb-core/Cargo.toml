@@ -12,5 +12,5 @@ rand = "0.8"
 regex = "1"
 bcrypt = "0.15"
 jsonwebtoken = "9"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 regex-syntax = "0.8"

@@ -189,7 +189,21 @@ pub async fn list(
         Some(raw) => parse_bool(raw)?,
         None => false,
     };
-    let sort = params.sort.as_deref().map(parse_sort).unwrap_or_default();
+    let sort = params
+        .sort
+        .as_deref()
+        .filter(|raw| !raw.is_empty())
+        .map(parse_sort)
+        .unwrap_or_default();
+    if sort.len() > pb_core::search::DEFAULT_SORT_EXPR_LIMIT {
+        return Err(search_error_raw(pb_core::search::ERR_SORT_EXPR_LIMIT));
+    }
+    if sort
+        .iter()
+        .any(|field| field.name.len() > pb_core::search::MAX_SORT_FIELD_LENGTH)
+    {
+        return Err(search_error_raw(pb_core::search::ERR_SORT_FIELD_LENGTH_LIMIT));
+    }
     validate_sort(&sort)?;
 
     // `Provider.Exec` normalization.
@@ -210,9 +224,12 @@ pub async fn list(
 
     // `filter` is resolved by `search.NewSimpleFieldResolver(...)` against the
     // `_collections` table itself.
-    if let Some(filter) = params.filter.as_deref().filter(|f| !f.trim().is_empty()) {
+    if let Some(filter) = params.filter.as_deref().filter(|f| !f.is_empty()) {
         let allowed: Vec<String> = SORT_FIELDS.iter().map(|f| f.to_string()).collect();
-        let expr = pb_core::search::parse(filter).map_err(|err| search_error_raw(err.0))?;
+        pb_core::search::check_filter_length(filter)
+            .map_err(|err| search_error_raw(err.0))?;
+        let expr =
+            pb_core::search::parse_limited(filter).map_err(|err| search_error_raw(err.0))?;
         let sf = pb_core::search::build_sql_simple(&expr, &allowed, false)
             .map_err(|err| search_error_raw(err.0))?;
         let sql = format!("SELECT id FROM _collections WHERE {}", sf.sql);

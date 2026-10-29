@@ -107,6 +107,24 @@ impl fmt::Display for CmpOp {
     }
 }
 
+/// `search.MaxFilterLength`.
+pub const MAX_FILTER_LENGTH: usize = 3500;
+/// `search.DefaultFilterExprLimit`.
+pub const DEFAULT_FILTER_EXPR_LIMIT: usize = 200;
+/// `search.DefaultSortExprLimit`.
+pub const DEFAULT_SORT_EXPR_LIMIT: usize = 8;
+/// `search.MaxSortFieldLength`.
+pub const MAX_SORT_FIELD_LENGTH: usize = 255;
+
+/// `search.ErrFilterLengthLimit`.
+pub const ERR_FILTER_LENGTH_LIMIT: &str = "max filter length limit reached";
+/// `search.ErrFilterExprLimit`.
+pub const ERR_FILTER_EXPR_LIMIT: &str = "max filter expressions limit reached";
+/// `search.ErrSortExprLimit`.
+pub const ERR_SORT_EXPR_LIMIT: &str = "max sort expressions limit reached";
+/// `search.ErrSortFieldLengthLimit`.
+pub const ERR_SORT_FIELD_LENGTH_LIMIT: &str = "max sort field length limit reached";
+
 #[derive(Debug)]
 pub struct ParseError(pub String);
 
@@ -132,6 +150,37 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
         return Err(ParseError(crate::fexpr::ERR_EMPTY.to_string()));
     }
     Ok(convert_groups(&groups))
+}
+
+/// Parse and apply `search.DefaultFilterExprLimit`.
+///
+/// The limit counts tokenized expressions, i.e. leaves of the parsed tree;
+/// grouping parentheses do not consume the budget.  This is what
+/// `FilterData.BuildExpr` does before resolving fields.
+pub fn parse_limited(input: &str) -> Result<Expr, ParseError> {
+    let expr = parse(input)?;
+    if expression_count(&expr) > DEFAULT_FILTER_EXPR_LIMIT {
+        return Err(ParseError(ERR_FILTER_EXPR_LIMIT.to_string()));
+    }
+    Ok(expr)
+}
+
+/// `search.Provider.Exec`: filters longer than `MaxFilterLength` bytes are
+/// rejected before parsing.
+pub fn check_filter_length(raw: &str) -> Result<(), ParseError> {
+    if raw.len() > MAX_FILTER_LENGTH {
+        return Err(ParseError(ERR_FILTER_LENGTH_LIMIT.to_string()));
+    }
+    Ok(())
+}
+
+fn expression_count(expr: &Expr) -> usize {
+    match expr {
+        Expr::Cmp { .. } => 1,
+        Expr::And(a, b) | Expr::Or(a, b) => expression_count(a) + expression_count(b),
+        Expr::Not(inner) => expression_count(inner),
+        _ => 0,
+    }
 }
 
 fn convert_groups(groups: &[crate::fexpr::ExprGroup]) -> Expr {
@@ -1246,6 +1295,15 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
                 .auth
                 .and_then(|a| a.data.get(path.as_str()).cloned())
                 .unwrap_or(serde_json::Value::Null);
+            // `processRequestAuthField`: a missing auth record (or missing
+            // field on it) resolves to the literal `NULL` identifier, not a
+            // bound NULL parameter.  `resolveEqualExpr` treats that identifier
+            // as an empty operand, which is what makes e.g.
+            // `team.members ?= @request.auth.id` match records whose `team`
+            // relation is empty.
+            if val.is_null() {
+                return Ok("NULL".into());
+            }
             ctx.params.push(val);
             Ok("?".into())
         }
@@ -1290,16 +1348,27 @@ fn build_geo_distance(args: &[Expr], ctx: &mut BuildCtx<'_>) -> Result<String, P
         )));
     }
 
-    let mut resolved = Vec::with_capacity(4);
+    let base = ctx.params.len();
+    let mut resolved: Vec<(String, Vec<serde_json::Value>)> = Vec::with_capacity(4);
     for (i, arg) in args.iter().enumerate() {
         if !matches!(arg, Expr::Field(_) | Expr::AuthField(_) | Expr::CollectionField(_) | Expr::Macro(_) | Expr::Literal(Literal::Number(_))) {
             return Err(ParseError(format!(
                 "[geoDistance] argument {i} must be an identifier or number"
             )));
         }
+        let start = ctx.params.len();
         let sql = build_expr(arg, ctx)
             .map_err(|e| ParseError(format!("[geoDistance] failed to resolve argument {i}: {e}")))?;
-        resolved.push(sql);
+        resolved.push((sql, ctx.params[start..].to_vec()));
+    }
+    ctx.params.truncate(base);
+
+    // The identifier is reused six times but PocketBase's dbx placeholders are
+    // named, so a literal argument binds once.  The port's placeholders are
+    // positional: duplicate the params in the exact order the expression
+    // references them (latA, latB, lonB, lonA, latA, latB).
+    for index in [1usize, 3, 2, 0, 1, 3] {
+        ctx.params.extend(resolved[index].1.iter().cloned());
     }
 
     // The clamping prevents floating point rounding errors for identical
@@ -1310,10 +1379,10 @@ fn build_geo_distance(args: &[Expr], ctx: &mut BuildCtx<'_>) -> Result<String, P
          cos(radians({lon_b}) - radians({lon_a})) + \
          sin(radians({lat_a})) * sin(radians({lat_b}))\
          ))))",
-        lon_a = resolved[0],
-        lat_a = resolved[1],
-        lon_b = resolved[2],
-        lat_b = resolved[3],
+        lon_a = resolved[0].0,
+        lat_a = resolved[1].0,
+        lon_b = resolved[2].0,
+        lat_b = resolved[3].0,
     ))
 }
 
@@ -1387,10 +1456,25 @@ enum OperandKind {
     Null,
 }
 
-fn static_kind(expr: &Expr) -> OperandKind {
+fn static_kind(expr: &Expr, ctx: &BuildCtx<'_>) -> OperandKind {
     match expr {
         Expr::Literal(Literal::Null) => OperandKind::Null,
         Expr::Literal(Literal::String(s)) if s.is_empty() => OperandKind::EmptyString,
+        // `null` is an identifier that `resolveToken` normalizes to the SQL
+        // `NULL` token.  It is an empty operand for `resolveEqualExpr`.
+        Expr::Field(name) if name.eq_ignore_ascii_case("null") => OperandKind::Null,
+        // A missing `@request.auth.*` resolves to `Identifier: "NULL"`.
+        Expr::AuthField(path) => {
+            let missing = ctx
+                .auth
+                .and_then(|a| a.data.get(path.as_str()))
+                .map_or(true, serde_json::Value::is_null);
+            if missing {
+                OperandKind::Null
+            } else {
+                OperandKind::Value
+            }
+        }
         _ => OperandKind::Value,
     }
 }
@@ -1401,13 +1485,26 @@ fn build_operand(
     expr: &Expr,
     ctx: &mut BuildCtx<'_>,
 ) -> Result<(String, OperandKind), ParseError> {
-    let kind = static_kind(expr);
-    match kind {
-        OperandKind::Null => Ok(("NULL".into(), kind)),
+    match static_kind(expr, ctx) {
+        OperandKind::Null => Ok(("NULL".into(), OperandKind::Null)),
         // `resolveEqualExpr` inlines empty strings as `''`, so no bound param
         // is emitted for this operand.
-        OperandKind::EmptyString => Ok(("''".into(), kind)),
-        OperandKind::Value => Ok((build_expr(expr, ctx)?, kind)),
+        OperandKind::EmptyString => Ok(("''".into(), OperandKind::EmptyString)),
+        OperandKind::Value => {
+            let start = ctx.params.len();
+            let sql = build_expr(expr, ctx)?;
+            // `hasEmptyParamValue`: a single NULL/empty parameter makes the
+            // operand empty for `NullFallbackAuto`.  Go still keeps the unused
+            // named parameter, but inline `''` is equivalent and keeps the
+            // port's positional parameter list consistent.
+            if ctx.params.len() == start + 1
+                && (ctx.params[start].is_null() || ctx.params[start].as_str() == Some(""))
+            {
+                ctx.params.truncate(start);
+                return Ok(("''".into(), OperandKind::EmptyString));
+            }
+            Ok((sql, OperandKind::Value))
+        }
     }
 }
 
@@ -1423,17 +1520,16 @@ fn compare_operands(
     right_start: usize,
     ctx: &mut BuildCtx<'_>,
 ) -> String {
-    if left_kind == OperandKind::EmptyString
-        && right_kind != OperandKind::EmptyString
-        && ctx.params.len() > right_start
-    {
+    // Empty operands are inlined (`''`/`NULL`) and the non-empty side is
+    // printed twice by `resolveEqualExpr`.  Named dbx placeholders are reused
+    // on the Go side; positional ones have to be duplicated here.
+    let left_empty = matches!(left_kind, OperandKind::Null | OperandKind::EmptyString);
+    let right_empty = matches!(right_kind, OperandKind::Null | OperandKind::EmptyString);
+    if left_empty && !right_empty && ctx.params.len() > right_start {
         let repeated = ctx.params[right_start..].to_vec();
         ctx.params.extend(repeated);
-    } else if right_kind == OperandKind::EmptyString
-        && left_kind != OperandKind::EmptyString
-        && ctx.params.len() > left_start
-    {
-        let repeated = ctx.params[left_start..].to_vec();
+    } else if right_empty && !left_empty && ctx.params.len() > left_start {
+        let repeated = ctx.params[left_start..right_start].to_vec();
         ctx.params.extend(repeated);
     }
     compare_sql(left, left_kind, op, right, right_kind)
@@ -1452,30 +1548,26 @@ fn compare_sql(
         _ => ("=", "OR", "IS NULL"),
     };
 
+    // `resolveEqualExpr` decides the shape from `isEmptyIdentifier`, which
+    // covers both the `''` token and the `NULL` identifier produced by missing
+    // `@request.auth.*` fields.  They therefore share the same fallback
+    // branches; only `NullFallbackDisabled` (JSON fields) skips them, and that
+    // case is handled by the caller.
+    let left_empty = matches!(left_kind, OperandKind::Null | OperandKind::EmptyString);
+    let right_empty = matches!(right_kind, OperandKind::Null | OperandKind::EmptyString);
+
     match op {
-        CmpOp::Eq | CmpOp::Ne => match (left_kind, right_kind) {
-            (OperandKind::Null, _) | (_, OperandKind::Null) => {
-                let not = op == CmpOp::Ne;
-                if left_kind == OperandKind::Null && right_kind == OperandKind::Null {
-                    // `null = null` -> `NULL IS NULL`; `null != null` -> `NULL IS NOT NULL`.
-                    if not { "NULL IS NOT NULL".into() } else { "NULL IS NULL".into() }
-                } else if left_kind == OperandKind::Null {
-                    format!("NULL {null_expr}")
-                } else {
-                    format!("{left} {null_expr}")
-                }
-            }
-            (OperandKind::EmptyString, OperandKind::EmptyString) => {
+        CmpOp::Eq | CmpOp::Ne => {
+            if left_empty && right_empty {
                 format!("'' {equal_op} ''")
+            } else if left_empty {
+                format!("('' {equal_op} {right} {concat} {right} {null_expr})")
+            } else if right_empty {
+                format!("({left} {equal_op} '' {concat} {left} {null_expr})")
+            } else {
+                format!("{left} {equal_op} {right}")
             }
-            (OperandKind::EmptyString, _) => format!(
-                "('' {equal_op} {right} {concat} {right} {null_expr})"
-            ),
-            (_, OperandKind::EmptyString) => format!(
-                "({left} {equal_op} '' {concat} {left} {null_expr})"
-            ),
-            _ => format!("{left} {equal_op} {right}"),
-        },
+        }
         CmpOp::Gt => format!("{left} > {right}"),
         CmpOp::Gte => format!("{left} >= {right}"),
         CmpOp::Lt => format!("{left} < {right}"),
@@ -1546,10 +1638,13 @@ fn like_sql(
     let r = build_expr(right, ctx)?;
     let keyword = if negate { "NOT LIKE" } else { "LIKE" };
     if ctx.params.len() > before {
+        // `wrapLikeParams` casts every param to string (numbers, bools, null
+        // included) before adding the wildcards.  Leaving a number as a
+        // numeric parameter changes SQLite's LIKE coercion and silently
+        // changes which rows match.
         for p in &mut ctx.params[before..] {
-            if let Some(text) = p.as_str() {
-                *p = serde_json::Value::String(wrap_like_param(text));
-            }
+            let text = crate::fields::cast_to_string(p);
+            *p = serde_json::Value::String(wrap_like_param(&text));
         }
         Ok(format!("{left} {keyword} {r} ESCAPE '\\'"))
     } else {
@@ -1773,11 +1868,10 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
     if ctx.simple.is_some() {
         let left_json = matches!(left, Expr::Field(name) if name.contains('.'));
         let right_json = matches!(right, Expr::Field(name) if name.contains('.'));
-        let left_kind = static_kind(left);
         let left_start = ctx.params.len();
         // `resolveTokenizedExpr`: both operands are resolved up-front and the
         // resolver error is wrapped with the raw token literal.
-        let l = build_expr(left, ctx)
+        let (l, left_kind) = build_operand(left, ctx)
             .map_err(|err| operand_error("left", left, err))?;
         return match base {
             CmpOp::Contains | CmpOp::NotContains => {
@@ -1831,7 +1925,6 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
             ));
         }
         let (from, col) = collection_from(path, ctx)?;
-        let left_kind = static_kind(left);
         let cmp_sql = |col: &str, ctx: &mut BuildCtx<'_>| -> Result<String, ParseError> {
             match base {
                 CmpOp::Contains => {
@@ -1843,7 +1936,7 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
                     Ok(format!("{l} NOT LIKE ('%' || {col} || '%') ESCAPE '\\'"))
                 }
                 _ => {
-                    let l = build_expr(left, ctx)?;
+                    let (l, left_kind) = build_operand(left, ctx)?;
                     Ok(compare_sql(&l, left_kind, base, col, OperandKind::Value))
                 }
             }
@@ -1936,9 +2029,8 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
         }
     }
 
-    let left_kind = static_kind(left);
     let left_start = ctx.params.len();
-    let l = build_expr(left, ctx)
+    let (l, left_kind) = build_operand(left, ctx)
         .map_err(|err| operand_error("left", left, err))?;
     match base {
         CmpOp::Contains | CmpOp::NotContains => {

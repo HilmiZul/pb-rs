@@ -106,14 +106,6 @@ Scope: record list/view/create/update/delete, `filter`/`sort`/`expand`/`fields`,
 collection rules (`@request.auth`, `@collection.*`), rate limits, plus the
 collection-level `filter` and `dry-run-view` deferred from M2e.
 
-## M3 — Records CRUD, filter/sort/expand, rules
-
-Scope: record list/view/create/update/delete, `filter`/`sort`/`expand`/`fields`,
-collection rules (`@request.auth`, `@collection.*`), rate limits.
-
-**Gate:** differential filter fuzz (generated expressions over a fixed dataset) with
-zero semantic differences; expand output byte-identical after normalization.
-
 ## M4 — Auth, files, tokens  ✅ done (core auth, files, tokens, impersonate, OAuth2 redirect broker):
 
 Scope: password, OTP, OAuth2, MFA, email change/verification/password reset,
@@ -132,7 +124,46 @@ batch transaction semantics match under partial failure.
 
 Only after M1–M5 are green. Target: documented hook surface, not full goja parity.
 
-## M7 — Hardening
+## M7 — Hardening  ✅ done
 
 Fuzz the filter parser, load test, audit the rules engine, document every remaining
 unknown in `docs/UNKNOWNS.md`.
+
+Deliverables:
+- `tools/filter_fuzz.py` — deterministic differential filter corpus: 407 generated
+  and hand-written expressions plus 13 guest (`@request.auth.id` = NULL) cases.
+  Covers NULL/empty operands, relation-path traversal, `@collection`, LIKE
+  escaping, date/number functions, malformed syntax, the 3500-byte filter limit
+  and the 200-expression limit.
+- `tools/sort_fuzz.py` — 165 sort expressions: ordinary fields, relation
+  traversal, `@rowid`/`@random`, empty entries, `+`/`-` prefixes, the
+  8-expression and 255-byte limits, invalid identifiers.
+- `tools/rules_audit.py` — 26 rule cases across guests, owners, team members,
+  unrelated users, relation traversal (`team.members ?= @request.auth.id`),
+  `@collection` macros, `@request.auth.<field>`, date macros, superuser bypass
+  and invalid-rule validation.
+- `tools/load_wal.py` — 8 workers × N mirrored list/create/update/delete
+  operations against both binaries, a second SQLite connection per install doing
+  write transactions and `wal_checkpoint`, plus `journal_mode` and
+  `integrity_check` verification.
+- `tools/gate_m7.sh` — wraps all four tools and the full `tools/gate_m3.sh`.
+
+Fixes found by the M7 tools:
+- `geoDistance(...)` failed on the bundled SQLite (no math functions) and bound
+  its four arguments once instead of the six references in the expression.
+- Whitespace-only filters returned 200 instead of the oracle's 400.
+- The filter-length (3500 bytes), expression-count (200), sort-count (8) and
+  sort-field-length (255) limits were missing.
+- `LIKE`/`~` operands were not cast to strings before `%...%` wrapping, changing
+  matches for numeric/boolean operands.
+- A missing `@request.auth.*` resolved to a bound NULL parameter instead of the
+  `NULL` identifier; combined with the synthetic left joins used for relation
+  traversal, this made `team.members ?= @request.auth.id` reject records whose
+  relation target was empty.
+- `null`/`''` operands on either side of `=`/`!=` now follow the oracle's
+  `resolveEqualExpr` fallback branches, including parameter duplication for
+  positional placeholders.
+
+**Gate (passed):** `tools/gate_m7.sh` — filter fuzz 420/420, sort fuzz 165/165,
+rules audit 26/26, load/WAL test (606 requests, 0 errors, identical final state,
+`wal` + `integrity_check=ok`), full `gate_m3.sh`, and `cargo test`.
