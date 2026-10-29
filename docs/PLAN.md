@@ -163,6 +163,12 @@ Fixes found by the M7 tools:
 - `null`/`''` operands on either side of `=`/`!=` now follow the oracle's
   `resolveEqualExpr` fallback branches, including parameter duplication for
   positional placeholders.
+- Restoring a backup whose default `users` collection had been renamed failed
+  with `UNIQUE constraint failed: _collections.id`: the seed step matched system
+  collections by `name` only and re-inserted `users` with the retained
+  `_pb_users_auth_` id. Seeding now treats the id as the identity (and still
+  skips an existing name), and `harness/scenarios/m5b-restore-renamed-users.json`
+  covers rename → backup → restore end-to-end.
 
 **Gate (passed):** `tools/gate_m7.sh` — filter fuzz 420/420, sort fuzz 165/165,
 rules audit 26/26, load/WAL test (606 requests, 0 errors, identical final state,

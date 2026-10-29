@@ -67,10 +67,18 @@ fn seed_collections(conn: &Connection) -> Result<()> {
             .as_str()
             .context("system collection without a name")?
             .to_string();
+        let id = collection["id"]
+            .as_str()
+            .context("system collection without an id")?;
 
+        // A system collection is identified by its id. The non-system `users`
+        // collection may have been renamed while keeping `_pb_users_auth_`;
+        // the oracle does not recreate it in that case, and inserting it again
+        // would trip the `_collections.id` primary key. The name is checked too
+        // because collection names are application-unique.
         let exists: i64 = conn.query_row(
-            "SELECT count(*) FROM _collections WHERE name = ?1",
-            [&name],
+            "SELECT count(*) FROM _collections WHERE id = ?1 OR name = ?2",
+            params![id, &name],
             |row| row.get(0),
         )?;
         if exists > 0 {
@@ -193,5 +201,67 @@ mod tests {
             .query_row("SELECT count(*) FROM _collections", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn renamed_users_collection_is_not_reseeded() {
+        // The default `users` collection is not `system`, so it can be renamed
+        // while keeping `_pb_users_auth_`. Restoring such a backup used to
+        // fail with "UNIQUE constraint failed: _collections.id".
+        let conn = fresh();
+        conn.execute(
+            "UPDATE _collections SET name = 'members' WHERE id = '_pb_users_auth_'",
+            [],
+        )
+        .unwrap();
+
+        seed(&conn).unwrap();
+
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM _collections WHERE id = '_pb_users_auth_'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "members");
+        let users: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM _collections WHERE name = 'users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(users, 0);
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM _collections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn an_existing_name_blocks_reseeding_that_collection() {
+        // Same name, different id: `_collections.name` is UNIQUE, so seed must
+        // not attempt the insert.
+        let conn = fresh();
+        conn.execute(
+            "DELETE FROM _collections WHERE id = '_pb_users_auth_'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _collections (id, type, name) VALUES ('custom_users_id', 'auth', 'users')",
+            [],
+        )
+        .unwrap();
+
+        seed(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM _collections WHERE name = 'users'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
