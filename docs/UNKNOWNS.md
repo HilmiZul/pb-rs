@@ -11,7 +11,7 @@ is out of scope for v1. These are gaps in evidence, not assumptions.
 | 4 | Realtime SSE framing over long sessions | the current harness reads whole bodies; SSE never terminates | add a streaming recorder (M5) |
 | 5 | `update` command behaviour | it would fetch and replace the executable | sandbox + local HTTP server replay |
 | 6 | Thumbnail generation byte output | depends on Go's image encoders; exact bytes may differ by codec | compare dimensions/format only, or accept divergence |
-| 7 | JSVM hook semantics | goja is out of scope for v1 | M6 |
+| 7 | JSVM hook semantics | goja is out of scope for v1; rquickjs covers the documented subset (M6a) | M6b (full goja parity deferred) |
 | 8 | Crash/fault-injection durability (kill -9 mid-write, disk-full, torn WAL) | the M7 load test covers steady-state concurrency only; no crash harness yet | run the load test with an external killer/`SIGKILL` loop and compare recovery (`integrity_check`, `-wal`/`-shm` state) |
 | 9 | Rate-limiter timing boundaries | wall-clock dependent | injectable clock in the port, record with the oracle |
 

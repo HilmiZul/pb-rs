@@ -11,6 +11,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 pb-core = { path = "../pb-core" }
+pb-js = { path = "../pb-js" }
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.5", features = ["fs", "cors"] }
@@ -22,3 +23,4 @@ image = "0.25"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+tracing = "0.1"

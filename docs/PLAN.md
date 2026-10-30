@@ -120,9 +120,52 @@ verification of hashes produced by the oracle.
 **Gate:** an official SDK client connects over SSE and receives identical events;
 batch transaction semantics match under partial failure.
 
-## M6 — JSVM (deferred)
+## M6a — JSVM hook subset  ✅ done
 
-Only after M1–M5 are green. Target: documented hook surface, not full goja parity.
+**Engine:** rquickjs 0.14 (QuickJS, bundled C build) in workspace crate
+`crates/pb-js`. One persistent worker thread, mpsc command channel, serialized
+calls. Installed from `pb-cli serve` via `OnceLock<Arc<pb_js::HookEngine>>`
+in `pb-api`; handlers no-op when no engine is installed.
+
+**Scope (documented hook surface, not full goja parity):**
+- Load `pb_hooks/*.pb.js` / `*.pb.ts` (sorted by filename).
+- 11 record hooks: create/view/update/delete request + after-success + after-error
+  (request + after-success for list).
+- Tags filter handlers (`CanTriggerOn` → `e.Next()` for non-matching tags).
+- `console`, JS error constructors, `$os`/`$security`/`$filepath` subset,
+  `$app.logger`/`$app.dataDir`, `__hooks`, `sleep`, `toString`.
+- `$os.writeFile` honors optional third `perm`; default is Go's `0`
+  (creates mode `000`).
+- Request-hook record mutations apply before submit; after-success mutations
+  apply to the response only.
+- Plain JS errors map to generic 400; explicit `ApiError` keeps status/message/data;
+  after-success plain errors map to operation-specific 400.
+
+**Gate:** `tools/gate_m6.sh` — 20 hook responses, 0 mismatches; 8 collections /
+21 schema objects; record rows and all four traces (create/update/delete/error)
+match; drop-in 7 responses, 0 mismatches.
+
+**Known divergences (see `docs/COMPATIBILITY.md`):**
+- Port treats `e.next()` as a no-op: the chain always runs to completion unless a
+  hook throws. Oracle stops the chain and can roll back the transaction / return
+  an empty 200.
+- Oracle `$app` is re-bound per handler to `e.app`; port's `$app` is fixed at
+  load (no per-handler rebinding), which does not matter for the supported subset
+  (`logger`, `dataDir`).
+- Oracle `e.error` in after-error hooks is a Go error object: `String(e.error)`
+  gives the raw message, while `.message`/`.data` are `undefined`. Port passes
+  `{message, data}`.
+- Oracle `onRecordsListRequest` mutations to `e.records` are not applied by the
+  port; port returns only `event.record`.
+- Oracle `--hooksWatch` defaults true and restarts on hooks-dir changes; port
+  accepts the flag but has no watcher. Gates always pass `--hooksWatch=false`.
+- Hook dirs are absolutized like `jsvm.go`; `$app.dataDir()` returns the CLI
+  `--dir` value unchanged (oracle `config.DataDir`).
+
+## M6b — deferred
+
+Full goja parity, hook watcher, `e.next()` transaction rollback, list-record
+mutations, per-handler `$app` rebinding. Not required for v1.
 
 ## M7 — Hardening  ✅ done
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["harness", "crates/pb-core", "crates/pb-api", "crates/pb-cli"]
+members = ["harness", "crates/pb-core", "crates/pb-api", "crates/pb-cli", "crates/pb-js"]
 
 [workspace.package]
 edition = "2021"

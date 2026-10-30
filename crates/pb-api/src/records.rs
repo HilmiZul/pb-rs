@@ -1546,6 +1546,146 @@ impl RequestInfo {
     }
 }
 
+/// Build the `e.requestInfo()` payload for JS hooks.
+fn hook_request_json(request: &RequestInfo, path: &str) -> Value {
+    let auth = request.auth.as_ref().map(|auth| {
+        Value::Object(auth.record.data.clone().into_iter().collect())
+    });
+    json!({
+        "method": request.method,
+        "path": path,
+        "body": request.body,
+        "query": request.query,
+        "headers": request.headers,
+        "context": request.context,
+        "auth": auth,
+    })
+}
+
+/// `router.ApiError` message/data normalization for errors thrown by hooks.
+///
+/// `NewApiError` runs `safeErrorsData`, which only keeps per-field
+/// `{code,message}` items for Go validation errors; plain JS values become the
+/// generic invalid-value item.
+fn hook_api_error(err: pb_js::HookError) -> ApiError {
+    // Plain JS errors are not `*router.ApiError`: `ToApiError` wraps them into
+    // a generic 400. ApiError constructors keep their own status/message.
+    if !err.api {
+        return ApiError::bad_request("Something went wrong while processing your request.");
+    }
+    let status = if err.status == 0 {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+    let data = match err.data {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, _)| {
+                    (
+                        key,
+                        json!({"code": "validation_invalid_value", "message": "Invalid value."}),
+                    )
+                })
+                .collect(),
+        ),
+        _ => json!({}),
+    };
+    ApiError::new(status, err.message, data)
+}
+
+/// Dispatch one record hook. Returns the record data exported by the hook
+/// (mutations included), or `None` when no engine is installed.
+#[allow(clippy::too_many_arguments)]
+fn run_record_hook(
+    hook: &str,
+    collection: &Collection,
+    record: Option<&RecordModel>,
+    records: Option<Value>,
+    request: &RequestInfo,
+    path: &str,
+    error: Option<Value>,
+    after_fallback: Option<&str>,
+) -> Result<Option<Map<String, Value>>, ApiError> {
+    let Some(engine) = crate::hook_engine() else {
+        return Ok(None);
+    };
+    let event = pb_js::HookEvent {
+        collection: Some(json!({
+            "id": collection.id,
+            "name": collection.name,
+            "type": collection.kind,
+        })),
+        record: record.map(|record| Value::Object(record.to_rule_data())),
+        records,
+        request: Some(hook_request_json(request, path)),
+        error,
+    };
+    let tags = vec![collection.name.clone(), collection.id.clone()];
+    let outcome = match engine.call(hook, &tags, event) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // After-success hooks run inside the oracle's form submit, so a
+            // plain error is wrapped with the operation-specific message.
+            if let Some(message) = after_fallback {
+                if !err.api {
+                    return Err(ApiError::bad_request(message));
+                }
+            }
+            return Err(hook_api_error(err));
+        }
+    };
+    Ok(outcome.record.and_then(|value| match value {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }))
+}
+
+/// Apply the fields a hook changed. Unchanged fields are skipped so that a
+/// hook that only reads the record cannot wipe password/hidden values.
+fn apply_hook_record(record: &mut RecordModel, data: &Map<String, Value>) {
+    let before = record.to_rule_data();
+    for (key, value) in data {
+        if key == "id" {
+            if let Some(id) = value.as_str() {
+                if id != record.id() {
+                    record.set_id(id);
+                }
+            }
+            continue;
+        }
+        if before.get(key) == Some(value) {
+            continue;
+        }
+        record.set_if_field_exists(key, value);
+    }
+}
+
+/// Error hooks cannot change the response; failures are only logged.
+fn run_error_hook(
+    hook: &str,
+    collection: &Collection,
+    record: &RecordModel,
+    request: &RequestInfo,
+    path: &str,
+    message: String,
+    data: Value,
+) {
+    let error = json!({"message": message, "data": data});
+    if let Err(err) = run_record_hook(
+        hook,
+        collection,
+        Some(record),
+        None,
+        request,
+        path,
+        Some(error),
+        None,
+    ) {
+        tracing::error!(hook, message = %err.message, "after-error hook failed");
+    }
+}
+
 /// `inflector.Snakecase` (used to normalize `@request.headers.*` keys).
 fn go_snakecase(input: &str) -> String {
     fn flush(word: &mut String, out: &mut String) {
@@ -2317,6 +2457,17 @@ pub async fn list(
     drop(rows);
     drop(stmt);
 
+    run_record_hook(
+        "onRecordsListRequest",
+        &collection,
+        None,
+        Some(Value::Array(records.clone())),
+        &request,
+        uri.path(),
+        None,
+        None,
+    )?;
+
     project_fields(
         &mut records,
         request.query.get("fields").map(String::as_str).unwrap_or(""),
@@ -2626,7 +2777,7 @@ pub async fn view(
         return Err(ApiError::forbidden("Only superusers can perform this action."));
     }
 
-    let record = RecordModel::find_by_id(&conn, &collection, &record_id)
+    let mut record = RecordModel::find_by_id(&conn, &collection, &record_id)
         .map_err(|e| ApiError::internal(format!("find failed: {e}")))?
         .ok_or_else(|| ApiError::not_found(NOT_FOUND_MESSAGE).with_raw_data(json!("sql: no rows in result set")))?;
 
@@ -2639,6 +2790,19 @@ pub async fn view(
                 }
             }
         }
+    }
+
+    if let Some(data) = run_record_hook(
+        "onRecordViewRequest",
+        &collection,
+        Some(&record),
+        None,
+        &request,
+        uri.path(),
+        None,
+        None,
+    )? {
+        apply_hook_record(&mut record, &data);
     }
 
     let mut records = vec![enrich_record(&conn, &collection, &record, &request)];
@@ -2791,19 +2955,64 @@ pub(crate) async fn create_inner(
         }
     }
 
+    if let Some(data) = run_record_hook(
+        "onRecordCreateRequest",
+        &collection,
+        Some(&record),
+        None,
+        &request,
+        uri_path,
+        None,
+        None,
+    )? {
+        apply_hook_record(&mut record, &data);
+    }
+
     match record.submit(&conn) {
         Ok(()) => {}
         Err(SubmitError::Validation(errors)) => {
+            let data = errors_to_value(&errors);
+            run_error_hook(
+                "onRecordAfterCreateError",
+                &collection,
+                &record,
+                &request,
+                uri_path,
+                "Failed to create record.".to_string(),
+                data.clone(),
+            );
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "Failed to create record.",
-                errors_to_value(&errors),
+                data,
             )
             .with_raw_data(pb_core::validation::errors_to_log_value(&errors)));
         }
         Err(SubmitError::Raw(_)) => {
+            run_error_hook(
+                "onRecordAfterCreateError",
+                &collection,
+                &record,
+                &request,
+                uri_path,
+                "Failed to create record.".to_string(),
+                json!({}),
+            );
             return Err(ApiError::bad_request("Failed to create record."));
         }
+    }
+
+    if let Some(data) = run_record_hook(
+        "onRecordAfterCreateSuccess",
+        &collection,
+        Some(&record),
+        None,
+        &request,
+        uri_path,
+        None,
+        Some("Failed to create record."),
+    )? {
+        apply_hook_record(&mut record, &data);
     }
 
     // Ensure the storage folder matches the final record id (handles id
@@ -2989,19 +3198,64 @@ pub(crate) async fn update_inner(
         }
     }
 
+    if let Some(data) = run_record_hook(
+        "onRecordUpdateRequest",
+        &collection,
+        Some(&record),
+        None,
+        &request,
+        uri_path,
+        None,
+        None,
+    )? {
+        apply_hook_record(&mut record, &data);
+    }
+
     match record.submit(&conn) {
         Ok(()) => {}
         Err(SubmitError::Validation(errors)) => {
+            let data = errors_to_value(&errors);
+            run_error_hook(
+                "onRecordAfterUpdateError",
+                &collection,
+                &record,
+                &request,
+                uri_path,
+                "Failed to update record.".to_string(),
+                data.clone(),
+            );
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "Failed to update record.",
-                errors_to_value(&errors),
+                data,
             )
             .with_raw_data(pb_core::validation::errors_to_log_value(&errors)));
         }
         Err(SubmitError::Raw(_)) => {
+            run_error_hook(
+                "onRecordAfterUpdateError",
+                &collection,
+                &record,
+                &request,
+                uri_path,
+                "Failed to update record.".to_string(),
+                json!({}),
+            );
             return Err(ApiError::bad_request("Failed to update record."));
         }
+    }
+
+    if let Some(data) = run_record_hook(
+        "onRecordAfterUpdateSuccess",
+        &collection,
+        Some(&record),
+        None,
+        &request,
+        uri_path,
+        None,
+        Some("Failed to update record."),
+    )? {
+        apply_hook_record(&mut record, &data);
     }
 
     // Replace old files: delete files that are no longer referenced.
@@ -3111,8 +3365,29 @@ pub(crate) async fn delete_inner(
         }
     }
 
+    if let Some(_) = run_record_hook(
+        "onRecordDeleteRequest",
+        &collection,
+        Some(&record),
+        None,
+        &request,
+        uri_path,
+        None,
+        None,
+    )? {}
+
     match pb_core::record_delete::delete_record(&mut conn, &collection, &record) {
         Ok(deleted) => {
+            run_record_hook(
+                "onRecordAfterDeleteSuccess",
+                &collection,
+                Some(&record),
+                None,
+                &request,
+                uri_path,
+                None,
+                Some("Failed to delete record. Make sure that the record is not part of a required relation reference."),
+            )?;
             for item in deleted {
                 broadcast_record(&conn, &item.collection, &item.record, "delete");
             }
@@ -3120,12 +3395,32 @@ pub(crate) async fn delete_inner(
         }
         // `firstApiError`: a hook's ApiError keeps its own message.
         Err(pb_core::record_delete::DeleteError::Api { message }) => {
+            run_error_hook(
+                "onRecordAfterDeleteError",
+                &collection,
+                &record,
+                &request,
+                uri_path,
+                "Failed to delete record. Make sure that the record is not part of a required relation reference.".to_string(),
+                json!({}),
+            );
             Err(ApiError::bad_request(message))
         }
-        Err(pb_core::record_delete::DeleteError::Raw(message)) => Err(ApiError::bad_request(
-            "Failed to delete record. Make sure that the record is not part of a required relation reference.",
-        )
-        .with_raw_data(json!(message))),
+        Err(pb_core::record_delete::DeleteError::Raw(message)) => {
+            run_error_hook(
+                "onRecordAfterDeleteError",
+                &collection,
+                &record,
+                &request,
+                uri_path,
+                "Failed to delete record. Make sure that the record is not part of a required relation reference.".to_string(),
+                json!({}),
+            );
+            Err(ApiError::bad_request(
+                "Failed to delete record. Make sure that the record is not part of a required relation reference.",
+            )
+            .with_raw_data(json!(message)))
+        }
     }
 }
 

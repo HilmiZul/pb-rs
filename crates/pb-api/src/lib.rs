@@ -32,6 +32,20 @@ pub mod sql;
 
 use auth::Db;
 
+/// Installed once by the CLI (`serve`). When absent, record handlers run
+/// without JS hooks, which is the behavior of every non-M6 call site and test.
+static HOOK_ENGINE: std::sync::OnceLock<std::sync::Arc<pb_js::HookEngine>> =
+    std::sync::OnceLock::new();
+
+/// Install the JS hook engine used by record handlers.
+pub fn install_hook_engine(engine: std::sync::Arc<pb_js::HookEngine>) {
+    let _ = HOOK_ENGINE.set(engine);
+}
+
+pub(crate) fn hook_engine() -> Option<&'static std::sync::Arc<pb_js::HookEngine>> {
+    HOOK_ENGINE.get()
+}
+
 /// `GET /api/health` — `{"message":"API is healthy.","code":200,"data":{}}`
 #[derive(Serialize)]
 struct HealthResponse {

@@ -14,7 +14,7 @@ compatibility promise.
 | L5 Query | filter/sort/expand/fields syntax and semantics, including NULL and relation traversal, the filter limits (3500 bytes, 200 expressions) and sort limits (8 fields, 255 bytes/field) | `tools/filter_fuzz.py` (420 expressions), `tools/sort_fuzz.py` (165 expressions), `tools/rules_audit.py` (26 rule cases), all run by `tools/gate_m7.sh` |
 | L6 Realtime | `text/event-stream` framing, `PB_CONNECT` event, subscription payloads | SSE scenario |
 | L7 Static/UI | `/_/` serves the mirrored `ui/` tree with identical content types and SPA fallback | byte comparison of `ui/` |
-| L8 JSVM | **not promised in v1** | — |
+| L8 JSVM | documented hook surface (M6a): load `pb_hooks/*.pb.js`/`*.pb.ts`, 11 record request/after hooks, tags, `console`, error constructors, `$os`/`$security`/`$filepath` subset, `$app.logger`/`$app.dataDir`, `__hooks`, `sleep`, `toString`; request-hook mutations before submit, after-success mutations to response | `tools/gate_m6.sh` (20 responses, 4 traces, rows, drop-in) |
 
 ## Rules
 
@@ -132,20 +132,51 @@ parsed and evaluated against the whitelisted collection fields.
 
 *Status:* resolved in M3.
 
-### D7 — JS migrations and hooks are not executed
+### D7 — JS migrations and hooks (partially resolved in M6a)
 
-The oracle's default JS migrations directory is `<dataDir>/../pb_migrations`
-(`plugins/jsvm`), and API collection changes are written there as `*.js` files.
-The port has no JSVM in v1, so those files are ignored: a database whose schema
-was produced by JS migrations must already contain the resulting collections.
+JS migrations (`pb_migrations/*.js`) are still ignored — the port has no goja
+runtime, so a database whose schema was produced by JS migrations must already
+contain the resulting collections. Hooks, however, are now supported for the
+documented subset (M6a): `pb_hooks/*.pb.js` / `*.pb.ts` are loaded by the
+rquickjs worker and the 11 record request/after hooks fire with tag filtering.
 
-*Why:* the JSVM (goja) is explicitly out of scope for v1 (tier (a) covers the API
-and the data model).
+*Why:* goja is out of scope for v1; rquickjs covers the documented hook surface.
 *Impact:* an install migrated only through JS files will look empty to the port.
-Probe/test installs must therefore be isolated per parent directory — a shared
-parent makes one install's auto-generated migrations leak into another, which is
-what the M2 gate now avoids by nesting each install under its own root.
-*Status:* pending v2 (JSVM). Revisit before claiming "hooks compatible".
+*Status:* partial (M6a). Full JS-migration execution remains deferred (M6b).
+
+### D16 — `e.next()` is a no-op in the port
+
+The oracle's hook chain stops when a handler returns without calling `e.next()`
+and can roll back the surrounding transaction / return an empty 200. The port
+always continues the chain unless a hook throws.
+
+*Why:* transactional rollback across the hook boundary is not implemented.
+*Impact:* hooks that intentionally short-circuit the chain (e.g. the oracle's
+empty-200 pattern) will not reproduce; port always submits and returns the record.
+*Status:* documented divergence (M6a).
+
+### D17 — `e.error` shape in after-error hooks
+
+Oracle `e.error` is a Go error object: `String(e.error)` yields the raw message
+(e.g. `req: cannot be blank.`) while `.message`/`.data` are `undefined`. The
+port passes `{ message, data }`, so JS reading `e.error.message`/`e.error.data`
+sees values where the oracle sees `undefined`.
+
+*Why:* the port normalizes the error into a JS object.
+*Impact:* hooks relying on `String(e.error)` still work; hooks reading
+`.message`/`.data` differ.
+*Status:* documented divergence (M6a).
+
+### D18 — List-hook record mutations and hooks watcher
+
+Oracle `onRecordsListRequest` mutations to `e.records` are not applied by the
+port (port returns only `event.record`). Oracle `--hooksWatch` defaults to true
+and restarts on hooks-dir changes; the port accepts the flag but has no watcher.
+
+*Why:* list-response reshaping and filesystem watching are out of M6a scope.
+*Impact:* list hooks can reject but cannot rewrite the result set; hook edits
+require a server restart on the port.
+*Status:* documented divergence (M6a).
 
 ### D8 — JSON request bodies are matched case-sensitively
 

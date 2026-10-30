@@ -168,6 +168,19 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
         tracing::info!("created the installer superuser");
     }
 
+    let hooks_dir = global.hooks_dir.clone().unwrap_or_else(|| {
+        global
+            .dir
+            .parent()
+            .map(|parent| parent.join("pb_hooks"))
+            .unwrap_or_else(|| PathBuf::from("pb_hooks"))
+    });
+    if pb_js::has_hooks(&hooks_dir) {
+        let engine = pb_js::HookEngine::load_with_data_dir(&hooks_dir, &global.dir)
+            .with_context(|| format!("load JS hooks from {}", hooks_dir.display()))?;
+        pb_api::install_hook_engine(std::sync::Arc::new(engine));
+    }
+
     let addr = resolve_addr(&args)?;
     let ui_dir = resolve_ui_dir();
 
