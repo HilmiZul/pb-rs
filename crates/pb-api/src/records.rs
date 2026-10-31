@@ -1720,6 +1720,7 @@ fn go_snakecase(input: &str) -> String {
 
 /// Everything the filter SQL builder needs: allowed field names, relation
 /// targets of the base collection, and metadata for `@collection.*` references.
+#[derive(Clone)]
 struct FilterContext {
     allowed: Vec<String>,
     relations: HashMap<String, search::RelationInfo>,
@@ -1727,6 +1728,8 @@ struct FilterContext {
     base_types: HashMap<String, String>,
     types: search::RequestFieldTypes,
 }
+
+// removed
 
 fn filter_context(
     conn: &rusqlite::Connection,
@@ -1782,7 +1785,8 @@ fn filter_context(
 
     let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
     for c in &all {
-        let mut field_types = HashMap::new();
+        let mut field_types: HashMap<String, String> = HashMap::new();
+        let mut field_types: HashMap<String, String> = HashMap::new();
         let mut hidden = std::collections::HashSet::new();
         for f in c.field_list().items() {
             let name = pb_core::fields::field_name(f).to_string();
