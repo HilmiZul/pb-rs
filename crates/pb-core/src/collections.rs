@@ -11,6 +11,9 @@
 //! Field order in the API shape follows the Go struct declaration order, so the
 //! keys are inserted in that order rather than alphabetically.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde_json::{Map, Value};
@@ -67,7 +70,16 @@ pub struct Collection {
     pub updated: String,
 }
 
+static COLLECTION_CACHE: LazyLock<Mutex<HashMap<usize, HashMap<String, Collection>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl Collection {
+    /// Clear the in-memory collection cache (call after any collection mutation).
+    pub fn invalidate_cache() {
+        if let Ok(mut cache) = COLLECTION_CACHE.lock() {
+            cache.clear();
+        }
+    }
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let options: String = row.get("options")?;
         let fields: String = row.get("fields")?;
@@ -135,25 +147,23 @@ impl Collection {
     /// `FindCachedCollectionByNameOrId`: lookup by id first, then by name.
     pub fn find(conn: &Connection, id_or_name: &str) -> Result<Option<Self>> {
         let by_id = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT id, system, type, name, fields, indexes, listRule, viewRule,
                         createRule, updateRule, deleteRule, options, created, updated
                  FROM _collections WHERE id = ?1",
-                [id_or_name],
-                Self::from_row,
-            )
+            )?
+            .query_row([id_or_name], Self::from_row)
             .optional()?;
         if by_id.is_some() {
             return Ok(by_id);
         }
         Ok(conn
-            .query_row(
+            .prepare_cached(
                 "SELECT id, system, type, name, fields, indexes, listRule, viewRule,
                         createRule, updateRule, deleteRule, options, created, updated
                  FROM _collections WHERE name = ?1",
-                [id_or_name],
-                Self::from_row,
-            )
+            )?
+            .query_row([id_or_name], Self::from_row)
             .optional()?)
     }
 

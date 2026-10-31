@@ -19,7 +19,7 @@ use crate::auth::{load_auth, AuthContext, Db};
 use crate::error::{validation_length, validation_required, ApiError};
 
 pub static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
-pub static AUX_DB: OnceLock<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> = OnceLock::new();
+pub static AUX_DB: OnceLock<crate::auth::Db> = OnceLock::new();
 
 /// `findAuthCollection`: 404 when the collection is missing or not an auth one.
 fn find_auth_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {

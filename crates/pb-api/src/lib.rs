@@ -7,7 +7,6 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
 use tower_http::services::{ServeDir, ServeFile};
@@ -78,14 +77,13 @@ async fn not_found(method: axum::http::Method) -> error::ApiError {
 ///
 /// `ui_dir` is the mirrored admin UI directory (`ui/_`); when present it is
 /// served under `/_/` with SPA fallback, exactly like the embedded FS.
-pub fn router(conn: Connection, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_conn: Option<Connection>, allowed_origins: Option<Vec<String>>) -> Router {
+pub fn router(db: auth::Db, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_db: Option<auth::Db>, allowed_origins: Option<Vec<String>>) -> Router {
     if let Some(dir) = data_dir {
         let _ = records::DATA_DIR.set(dir);
     }
-    if let Some(ac) = aux_conn {
-        let _ = records::AUX_DB.set(std::sync::Arc::new(std::sync::Mutex::new(ac)));
+    if let Some(ac) = aux_db {
+        let _ = records::AUX_DB.set(ac);
     }
-    let db: Db = std::sync::Arc::new(std::sync::Mutex::new(conn));
     let allowed_origins = allowed_origins.unwrap_or_default();
     let allowed_origins = if allowed_origins.is_empty() {
         vec!["*".to_string()]

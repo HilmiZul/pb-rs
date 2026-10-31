@@ -75,7 +75,8 @@ pub async fn set(
     settings::save(&conn, &settings)
         .map_err(|e| ApiError::internal(format!("failed to save settings: {e}")))?;
 
-    // `OnSettingsReload` destroys the rate limiter store.
+    // Invalidate settings cache and rate limiter store.
+    settings::invalidate_cache();
     crate::rate_limit::reset();
 
     let saved: Settings = settings::load(&conn)

@@ -5,6 +5,7 @@
 //! parsed *unverified* first to learn which collection/record it belongs to, and
 //! only then is the signature checked against `tokenKey + token secret`.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::http::HeaderMap;
@@ -28,7 +29,72 @@ impl AuthContext {
     }
 }
 
-pub type Db = Arc<Mutex<Connection>>;
+/// A small pool of SQLite connections so that concurrent requests are not
+/// serialized on a single `Mutex<Connection>` (the main latency bottleneck
+/// versus the Go oracle, which uses `database/sql`'s connection pool).
+#[derive(Clone)]
+pub struct Db {
+    path: std::sync::Arc<PathBuf>,
+    pool: Arc<Mutex<Vec<Connection>>>,
+}
+
+impl Db {
+    pub fn open(path: &Path, size: usize) -> anyhow::Result<Self> {
+        let mut conns = Vec::with_capacity(size.max(1));
+        for _ in 0..size.max(1) {
+            conns.push(pb_core::db::open(path)?);
+        }
+        Ok(Self {
+            path: std::sync::Arc::from(path.to_path_buf()),
+            pool: Arc::new(Mutex::new(conns)),
+        })
+    }
+
+    /// Check out one connection. The connection is returned to the pool when
+    /// the guard is dropped.
+    pub fn lock(&self) -> Result<PooledConn, ()> {
+        let mut guard = self.pool.lock().map_err(|_| ())?;
+        let conn = if let Some(c) = guard.pop() {
+            c
+        } else {
+            drop(guard);
+            // Pool exhausted: open a fresh connection on demand.
+            pb_core::db::open(&self.path).map_err(|_| ())?
+        };
+        Ok(PooledConn {
+            pool: self.pool.clone(),
+            conn: Some(conn),
+        })
+    }
+}
+
+pub struct PooledConn {
+    pool: Arc<Mutex<Vec<Connection>>>,
+    conn: Option<Connection>,
+}
+
+impl Drop for PooledConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            if let Ok(mut guard) = self.pool.lock() {
+                guard.push(conn);
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for PooledConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("pooled connection present")
+    }
+}
+
+impl std::ops::DerefMut for PooledConn {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("pooled connection present")
+    }
+}
 
 /// `getAuthTokenFromRequest`: the raw header, with an optional `Bearer ` prefix.
 pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {

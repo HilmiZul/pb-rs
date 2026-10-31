@@ -169,7 +169,7 @@ impl Record {
             quote_ident(&collection.name),
             quote_ident(column)
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query([value])?;
         match rows.next()? {
             Some(row) => Ok(Some(Self::from_row(collection, row)?)),

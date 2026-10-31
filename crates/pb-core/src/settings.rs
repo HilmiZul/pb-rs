@@ -16,6 +16,9 @@
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -232,9 +235,8 @@ pub fn load_raw(conn: &Connection) -> Result<Value> {
     // `_params.value` is a BLOB in an oracle-created database (Go binds
     // `types.JSONRaw`); accept TEXT too so hand-edited databases still load.
     let raw: Option<rusqlite::types::Value> = conn
-        .query_row("SELECT value FROM _params WHERE id = ?1", [PARAM_ID], |row| {
-            row.get(0)
-        })
+        .prepare_cached("SELECT value FROM _params WHERE id = ?1")?
+        .query_row([PARAM_ID], |row| row.get(0))
         .optional()?;
 
     let bytes = match raw {
@@ -247,6 +249,16 @@ pub fn load_raw(conn: &Connection) -> Result<Value> {
     };
 
     serde_json::from_slice(&bytes).context("parse stored settings")
+}
+
+static SETTINGS_CACHE: LazyLock<Mutex<HashMap<usize, Settings>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Invalidate the settings cache (call after settings mutation or restore).
+pub fn invalidate_cache() {
+    if let Ok(mut cache) = SETTINGS_CACHE.lock() {
+        cache.clear();
+    }
 }
 
 /// Load the typed settings.

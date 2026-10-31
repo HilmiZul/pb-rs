@@ -432,7 +432,10 @@ pub async fn create(
         .map_err(|e| ApiError::internal(format!("failed to load collections: {e}")))?;
 
     match collection_write::save(&mut conn, &mut draft, &all) {
-        Ok(()) => Ok(Json(draft.collection.to_api_json()).into_response()),
+        Ok(()) => {
+            pb_core::collections::Collection::invalidate_cache();
+            Ok(Json(draft.collection.to_api_json()).into_response())
+        }
         Err(SaveError::Validation(errors)) => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "Failed to create collection.",
@@ -481,7 +484,10 @@ pub async fn update(
     let original_for_save = original.clone();
 
     match collection_write::save_update(&mut conn, &mut draft, &original_for_save, &all) {
-        Ok(()) => Ok(Json(draft.collection.to_api_json()).into_response()),
+        Ok(()) => {
+            pb_core::collections::Collection::invalidate_cache();
+            Ok(Json(draft.collection.to_api_json()).into_response())
+        }
         Err(collection_write::SaveError::Validation(errors)) => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "Failed to update collection.",
@@ -540,7 +546,10 @@ pub async fn import(
         .map_err(|_| ApiError::internal("database lock poisoned"))?;
 
     match collection_write::import_collections(&mut conn, &collections, delete_missing) {
-        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Ok(()) => {
+            pb_core::collections::Collection::invalidate_cache();
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         Err(collection_write::SaveError::Validation(errors)) => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "Failed to import collections.",
@@ -576,7 +585,10 @@ pub async fn delete(
     let references = collection_write::find_references(&collection, &all);
 
     match collection_write::delete(&mut conn, &collection) {
-        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Ok(()) => {
+            pb_core::collections::Collection::invalidate_cache();
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         Err(_) => {
             let mut message = String::from("Failed to delete collection");
             if !references.is_empty() {

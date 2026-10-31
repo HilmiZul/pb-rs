@@ -187,18 +187,21 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
     tracing::info!(%addr, ui = ?ui_dir, "starting server");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(64)
         .enable_all()
         .build()?;
 
-    let aux_db = pb_core::db::open(&global.dir.join(pb_core::AUX_DB))?;
-    pb_core::migrations::migrate_aux(&aux_db)?;
+    let data_pool = pb_api::auth::Db::open(&global.dir.join(pb_core::DATA_DB), 32)
+        .context("open data db pool")?;
+    let aux_pool = pb_api::auth::Db::open(&global.dir.join(pb_core::AUX_DB), 8)
+        .context("open aux db pool")?;
 
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
         println!("Server started at http://{addr}");
-        let app = pb_api::router(data_db, ui_dir, Some(global.dir.clone()), Some(aux_db), args.origins.clone())
+        let app = pb_api::router(data_pool, ui_dir, Some(global.dir.clone()), Some(aux_pool), args.origins.clone())
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         pb_api::axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())

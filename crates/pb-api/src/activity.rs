@@ -250,10 +250,19 @@ pub async fn activity_logger(State(db): State<Db>, request: Request, next: Next)
         if let Some(details) = details {
             data.insert("details".into(), details);
         }
-        write_log(level, &message, &Value::Object(data));
+        let data_clone = Value::Object(data);
+        let message_clone = message.clone();
+        tokio::task::spawn_blocking(move || {
+            write_log(level, &message_clone, &data_clone);
+        });
         return Response::from_parts(parts, Body::from(bytes));
     }
 
-    write_log(level, &message, &Value::Object(data));
+    let data_clone = Value::Object(data);
+    let message_clone = message.clone();
+    tokio::task::spawn_blocking(move || {
+        write_log(level, &message_clone, &data_clone);
+    });
+
     response
 }
