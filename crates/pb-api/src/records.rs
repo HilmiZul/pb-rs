@@ -1786,7 +1786,6 @@ fn filter_context(
     let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
     for c in &all {
         let mut field_types: HashMap<String, String> = HashMap::new();
-        let mut field_types: HashMap<String, String> = HashMap::new();
         let mut hidden = std::collections::HashSet::new();
         for f in c.field_list().items() {
             let name = pb_core::fields::field_name(f).to_string();
