@@ -73,10 +73,16 @@ pub struct Collection {
 static COLLECTION_CACHE: LazyLock<Mutex<HashMap<usize, HashMap<String, Collection>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static LOAD_ALL_CACHE: LazyLock<Mutex<HashMap<usize, Vec<Collection>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl Collection {
     /// Clear the in-memory collection cache (call after any collection mutation).
     pub fn invalidate_cache() {
         if let Ok(mut cache) = COLLECTION_CACHE.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = LOAD_ALL_CACHE.lock() {
             cache.clear();
         }
     }
@@ -135,13 +141,23 @@ impl Collection {
     }
 
     pub fn load_all(conn: &Connection) -> Result<Vec<Self>> {
-        let mut stmt = conn.prepare(
+        let key = conn as *const Connection as usize;
+        if let Ok(cache) = LOAD_ALL_CACHE.lock() {
+            if let Some(v) = cache.get(&key) {
+                return Ok(v.clone());
+            }
+        }
+        let mut stmt = conn.prepare_cached(
             "SELECT id, system, type, name, fields, indexes, listRule, viewRule,
                     createRule, updateRule, deleteRule, options, created, updated
              FROM _collections ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map([], Self::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let result: Vec<Self> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Ok(mut cache) = LOAD_ALL_CACHE.lock() {
+            cache.insert(key, result.clone());
+        }
+        Ok(result)
     }
 
     /// `FindCachedCollectionByNameOrId`: lookup by id first, then by name.

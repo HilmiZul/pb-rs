@@ -1749,7 +1749,16 @@ fn filter_context(
         .map(|f| pb_core::fields::field_name(f).to_string())
         .collect();
 
-    let all = Collection::load_all(conn).unwrap_or_default();
+    let all = if collection
+        .field_list()
+        .items()
+        .iter()
+        .any(|f| pb_core::fields::field_type(f) == "relation")
+    {
+        Collection::load_all(conn).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let by_id: HashMap<&str, &Collection> = all.iter().map(|c| (c.id.as_str(), c)).collect();
 
     let relations_for = |c: &Collection| {
