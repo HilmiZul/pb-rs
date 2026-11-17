@@ -1804,28 +1804,129 @@ fn validate_relation_sub<'a>(
     Ok(())
 }
 
-fn relation_cmp_sql(
-    rel_alias: &str,
+/// Build the join chain for a relation path (`rel.sub[.sub...]`).
+///
+/// Returns the `FROM` fragment, the final column expression (with an optional
+/// `:lower` modifier applied) and whether any traversed relation is multiple.
+/// `alias_offset` keeps alias names unique when the same path is rendered a
+/// second time inside the multi-match check.
+fn relation_path_sql(
+    first: &str,
     sub: &str,
-    op: CmpOp,
-    right: &Expr,
-    ctx: &mut BuildCtx<'_>,
-) -> Result<String, ParseError> {
-    let (sub, modifier) = split_modifier(sub)?;
-    let column = format!("{}.{}", rel_alias, crate::records::quote_ident(sub));
-    let left = match modifier {
-        Some("lower") => format!("LOWER({column})"),
-        _ => column,
+    ctx: &BuildCtx<'_>,
+    alias_offset: usize,
+) -> Result<(String, String, bool), ParseError> {
+    let rel_alias = |hop: usize| {
+        let n = hop + alias_offset;
+        if n == 0 {
+            "__pb_rel".to_string()
+        } else {
+            format!("__pb_rel{}", n + 1)
+        }
     };
-    match op {
-        CmpOp::Contains | CmpOp::NotContains => {
-            like_sql(&left, right, ctx, op == CmpOp::NotContains)
+    let je_alias = |hop: usize| {
+        let n = hop + alias_offset;
+        if n == 0 {
+            "__pb_je".to_string()
+        } else {
+            format!("__pb_je{}", n + 1)
         }
-        _ => {
-            let (r, kind) = build_operand(right, ctx)?;
-            Ok(compare_sql(&left, OperandKind::Value, op, &r, kind))
-        }
+    };
+
+    let first_rel = ctx.relations.get(first).ok_or_else(|| {
+        ParseError(format!(
+            "field {} is not a valid relation",
+            crate::fields::go_quote(first)
+        ))
+    })?;
+    let mut active_info = ctx.collections.get(&first_rel.table).ok_or_else(|| {
+        ParseError(format!(
+            "failed to load field {} collection",
+            crate::fields::go_quote(first)
+        ))
+    })?;
+    let mut multiple = first_rel.multiple;
+
+    let mut from = String::from("(SELECT 1) AS __pb_one");
+    let mut active_alias = rel_alias(0);
+    if first_rel.multiple {
+        from.push_str(&format!(
+            " LEFT JOIN json_each({field}) AS {je} ON 1 \
+             LEFT JOIN {table} AS {alias} ON {alias}.id = {je}.value",
+            field = crate::records::quote_ident(first),
+            je = je_alias(0),
+            table = crate::records::quote_ident(&active_info.table),
+            alias = active_alias,
+        ));
+    } else {
+        from.push_str(&format!(
+            " LEFT JOIN {table} AS {alias} ON {alias}.id = {field}",
+            table = crate::records::quote_ident(&active_info.table),
+            alias = active_alias,
+            field = crate::records::quote_ident(first),
+        ));
     }
+
+    let props: Vec<&str> = sub.split('.').collect();
+    for (i, prop) in props.iter().enumerate() {
+        if i + 1 == props.len() {
+            let (name, modifier) = split_modifier(prop)?;
+            let column = format!("{}.{}", active_alias, crate::records::quote_ident(name));
+            let column = match modifier {
+                Some("lower") => format!("LOWER({column})"),
+                _ => column,
+            };
+            return Ok((from, column, multiple));
+        }
+
+        let relation = active_info.relations.get(*prop).ok_or_else(|| {
+            ParseError(format!(
+                "field {} is not a valid relation",
+                crate::fields::go_quote(prop)
+            ))
+        })?;
+
+        // "id" lookups optimization for single relations (same as PB's
+        // runner): compare the foreign key column directly instead of joining
+        // the target record.
+        if !relation.multiple && i + 2 == props.len() && props[i + 1] == "id" {
+            return Ok((
+                from,
+                format!("{}.{}", active_alias, crate::records::quote_ident(prop)),
+                multiple,
+            ));
+        }
+
+        let hop = i + 1;
+        let next_alias = rel_alias(hop);
+        let next_info = ctx.collections.get(&relation.table).ok_or_else(|| {
+            ParseError(format!(
+                "failed to load field {} collection",
+                crate::fields::go_quote(prop)
+            ))
+        })?;
+        let column = format!("{}.{}", active_alias, crate::records::quote_ident(prop));
+        if relation.multiple {
+            multiple = true;
+            from.push_str(&format!(
+                " LEFT JOIN json_each({column}) AS {je} ON 1 \
+                 LEFT JOIN {table} AS {alias} ON {alias}.id = {je}.value",
+                je = je_alias(hop),
+                table = crate::records::quote_ident(&next_info.table),
+                alias = next_alias,
+            ));
+        } else {
+            from.push_str(&format!(
+                " LEFT JOIN {table} AS {alias} ON {alias}.id = {column}",
+                table = crate::records::quote_ident(&next_info.table),
+                alias = next_alias,
+            ));
+        }
+        active_alias = next_alias;
+        active_info = next_info;
+    }
+
+    unreachable!("relation path always has at least one prop")
 }
 
 /// The original token text of an operand (`fexpr.Token.Literal`), used by
@@ -1990,36 +2091,20 @@ fn build_cmp(left: &Expr, op: CmpOp, right: &Expr, ctx: &mut BuildCtx<'_>) -> Re
                     };
                 }
 
-                let from = if info.multiple {
-                    format!(
-                        "(SELECT 1) AS __pb_one LEFT JOIN json_each({field}) AS __pb_je ON 1 \
-                         LEFT JOIN {table} AS __pb_rel ON __pb_rel.id = __pb_je.value",
-                        field = crate::records::quote_ident(field),
-                        table = crate::records::quote_ident(&info.table),
-                    )
-                } else {
-                    format!(
-                        "(SELECT 1) AS __pb_one LEFT JOIN {table} AS __pb_rel ON __pb_rel.id = {field}",
-                        table = crate::records::quote_ident(&info.table),
-                        field = crate::records::quote_ident(field),
-                    )
-                };
+                let (from, column, multiple) = relation_path_sql(field, sub, ctx, 0)
+                    .map_err(|err| operand_error("left", left, err))?;
 
-                let outer_cmp = relation_cmp_sql("__pb_rel", sub, base, right, ctx)
+                let outer_cmp = column_cmp_sql(&column, base, right, ctx)
                     .map_err(|err| operand_error("right", right, err))?;
                 let mut sql = format!("EXISTS (SELECT 1 FROM {from} WHERE {outer_cmp})");
 
                 // PB's multi-match check: no related value may fail the
                 // comparison. Only plain (non-`?`) operators get this.
-                if info.multiple && !any {
-                    let inner_cmp = relation_cmp_sql("__pb_rel2", sub, base, right, ctx)
+                if multiple && !any {
+                    let (from2, column2, _) = relation_path_sql(field, sub, ctx, 1)
+                        .map_err(|err| operand_error("left", left, err))?;
+                    let inner_cmp = column_cmp_sql(&column2, base, right, ctx)
                         .map_err(|err| operand_error("right", right, err))?;
-                    let from2 = format!(
-                        "(SELECT 1) AS __pb_one2 LEFT JOIN json_each({field}) AS __pb_je2 ON 1 \
-                         LEFT JOIN {table} AS __pb_rel2 ON __pb_rel2.id = __pb_je2.value",
-                        field = crate::records::quote_ident(field),
-                        table = crate::records::quote_ident(&info.table),
-                    );
                     sql = format!(
                         "({sql} AND NOT EXISTS (SELECT 1 FROM {from2} WHERE NOT ({inner_cmp})))"
                     );
@@ -2167,4 +2252,157 @@ pub fn build_rule_sql(
         &std::collections::HashMap::new(),
     )?;
     Ok(Some((sf.sql, sf.params)))
+}
+
+#[cfg(test)]
+mod relation_path_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn relation(table: &str, multiple: bool) -> RelationInfo {
+        RelationInfo {
+            table: table.to_string(),
+            multiple,
+        }
+    }
+
+    fn collection(
+        table: &str,
+        fields: &[&str],
+        types: &[(&str, &str)],
+        relations: &[(&str, RelationInfo)],
+    ) -> CollectionInfo {
+        CollectionInfo {
+            table: table.to_string(),
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+            field_types: types
+                .iter()
+                .map(|(name, ty)| (name.to_string(), ty.to_string()))
+                .collect(),
+            hidden: Default::default(),
+            relations: relations
+                .iter()
+                .map(|(name, info)| (name.to_string(), info.clone()))
+                .collect(),
+        }
+    }
+
+    fn fixture() -> (
+        HashMap<String, RelationInfo>,
+        HashMap<String, CollectionInfo>,
+        HashMap<String, String>,
+        Vec<String>,
+    ) {
+        let relations = HashMap::from([("idJurnal".to_string(), relation("jurnal", false))]);
+        let collections = HashMap::from([
+            (
+                "jurnal".to_string(),
+                collection(
+                    "jurnal",
+                    &["id", "siswa", "tags"],
+                    &[("id", "text"), ("siswa", "relation"), ("tags", "relation")],
+                    &[("siswa", relation("siswa", false)), ("tags", relation("tag", true))],
+                ),
+            ),
+            (
+                "siswa".to_string(),
+                collection(
+                    "siswa",
+                    &["id", "nama"],
+                    &[("id", "text"), ("nama", "text")],
+                    &[],
+                ),
+            ),
+            (
+                "tag".to_string(),
+                collection(
+                    "tag",
+                    &["id", "nama"],
+                    &[("id", "text"), ("nama", "text")],
+                    &[],
+                ),
+            ),
+        ]);
+        let base_types = HashMap::from([
+            ("idJurnal".to_string(), "relation".to_string()),
+            ("isOpen".to_string(), "bool".to_string()),
+        ]);
+        let allowed = vec![
+            "id".to_string(),
+            "idJurnal".to_string(),
+            "isOpen".to_string(),
+        ];
+        (relations, collections, base_types, allowed)
+    }
+
+    fn count_for(filter: &str) -> i64 {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE jurnal_komentar (id TEXT PRIMARY KEY, idJurnal TEXT, isOpen INTEGER);
+            CREATE TABLE jurnal (id TEXT PRIMARY KEY, siswa TEXT, tags TEXT);
+            CREATE TABLE siswa (id TEXT PRIMARY KEY, nama TEXT);
+            CREATE TABLE tag (id TEXT PRIMARY KEY, nama TEXT);
+            INSERT INTO siswa (id, nama) VALUES ('s1', 'Budi'), ('s2', 'Ani');
+            INSERT INTO tag (id, nama) VALUES ('t1', 'red'), ('t2', 'blue'), ('t3', 'red');
+            INSERT INTO jurnal (id, siswa, tags) VALUES
+                ('j1', 's1', '["t1","t2"]'), ('j2', 's2', '["t3"]');
+            INSERT INTO jurnal_komentar (id, idJurnal, isOpen) VALUES
+                ('k1', 'j1', 0), ('k2', 'j2', 1), ('k3', 'missing', 0), ('k4', '', 0);
+            "#,
+        )
+        .unwrap();
+
+        let (relations, collections, base_types, allowed) = fixture();
+        let expr = parse(filter).unwrap();
+        let sf = build_sql_full_with_types(
+            &expr,
+            &allowed,
+            None,
+            &relations,
+            &collections,
+            &base_types,
+        )
+        .unwrap();
+        let sql = format!("SELECT count(*) FROM \"jurnal_komentar\" WHERE {}", sf.sql);
+        let params: Vec<rusqlite::types::Value> = sf
+            .params
+            .iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone().into(),
+                serde_json::Value::Number(n) => n.as_i64().unwrap().into(),
+                serde_json::Value::Bool(b) => (*b as i64).into(),
+                serde_json::Value::Null => rusqlite::types::Value::Null,
+                other => other.to_string().into(),
+            })
+            .collect();
+        conn.query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn nested_relation_id_uses_direct_foreign_key() {
+        // `idJurnal.siswa.id` -> join jurnal, compare its `siswa` column.
+        assert_eq!(count_for(r#"idJurnal.siswa.id = "s1""#), 1);
+    }
+
+    #[test]
+    fn nested_relation_field_joins_each_level() {
+        assert_eq!(count_for(r#"idJurnal.siswa.nama = "Budi""#), 1);
+        // Missing/empty relations fall back to NULL and match `!=`.
+        assert_eq!(count_for(r#"idJurnal.siswa.nama != "Budi""#), 3);
+    }
+
+    #[test]
+    fn nested_relation_missing_relation_matches_empty() {
+        // Missing and empty foreign keys behave like PB's LEFT JOIN.
+        assert_eq!(count_for(r#"idJurnal.siswa.nama = """#), 2);
+    }
+
+    #[test]
+    fn nested_multiple_relation_applies_multi_match_check() {
+        // Plain `=` requires every related value to match, `?=` requires any.
+        assert_eq!(count_for(r#"idJurnal.tags.nama = "red""#), 1);
+        assert_eq!(count_for(r#"idJurnal.tags.nama ?= "red""#), 2);
+    }
 }
