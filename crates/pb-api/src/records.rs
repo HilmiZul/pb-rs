@@ -4203,6 +4203,19 @@ fn broadcast_record(
                 continue;
             };
 
+            // The SDK registers its SSE listener under the *raw* subscription
+            // string (including `?options=...`), so the event name must be the
+            // untouched topic. Only the rule/filter checks use the options.
+            let options = crate::realtime::subscription_options(topic);
+            let request = RequestInfo {
+                auth: auth.clone(),
+                body: Map::new(),
+                query: options.query.clone(),
+                headers: options.headers.clone(),
+                method: "GET".to_string(),
+                context: "realtime".to_string(),
+            };
+
             let rule = if specific {
                 collection.view_rule.as_deref()
             } else {
@@ -4216,14 +4229,6 @@ fn broadcast_record(
                     None => false,
                     Some("") => true,
                     Some(rule) => {
-                        let request = RequestInfo {
-                            auth: auth.clone(),
-                            body: Map::new(),
-                            query: HashMap::new(),
-                            headers: HashMap::new(),
-                            method: "GET".to_string(),
-                            context: "realtime".to_string(),
-                        };
                         let ctx = filter_context(conn, collection, is_superuser);
                         rule_matches_data(conn, rule, &record_data, &request, &ctx).unwrap_or(false)
                     }
@@ -4233,33 +4238,89 @@ fn broadcast_record(
                 continue;
             }
 
-            let mut payload = json!({
-                "record": record.to_api_json(),
-                "action": action,
-            });
-            // Optional `fields` projection from the subscription options.
-            if let Some(options) = topic.split_once("options=").map(|(_, v)| v) {
-                if let Ok(Value::Object(opts)) = serde_json::from_str::<Value>(
-                    &urlencoding::decode(options).unwrap_or_else(|_| options.into()),
+            // `subscription.filter`: an extra client-side filter evaluated
+            // against the stored record, in addition to the API rule.
+            if let Some(filter) = options.query.get("filter").filter(|f| !f.is_empty()) {
+                if !record_matches_filter(
+                    conn,
+                    collection,
+                    filter,
+                    &record_id,
+                    &request,
+                    is_superuser,
                 ) {
-                    if let Some(fields) = opts
-                        .get("query")
-                        .and_then(|q| q.get("fields"))
-                        .and_then(Value::as_str)
-                    {
-                        let mut records = vec![payload["record"].clone()];
-                        project_fields(&mut records, fields);
-                        payload["record"] = records.pop().unwrap_or(Value::Null);
-                    }
+                    continue;
                 }
             }
 
+            // Optional `expand` and `fields` from the subscription options.
+            let mut record_json = record.to_api_json();
+            let expand = options.query.get("expand").cloned().unwrap_or_default();
+            if !expand.trim().is_empty() {
+                let tree = build_expand_tree(&expand);
+                expand_record(conn, collection, &mut record_json, &tree, &request);
+            }
+            if let Some(fields) = options.query.get("fields").filter(|f| !f.is_empty()) {
+                let mut records = vec![record_json];
+                project_fields(&mut records, fields);
+                record_json = records.pop().unwrap_or(Value::Null);
+            }
+            // Go marshals the record as a map, so keys are alphabetical even
+            // after `expand`/`fields` augment the payload.
+            sort_top_level_keys(&mut record_json);
+
+            let payload = json!({
+                "record": record_json,
+                "action": action,
+            });
+
             let _ = client.sender.send(crate::realtime::Event {
-                name: crate::realtime::subscription_topic(topic).to_string(),
+                name: topic.clone(),
                 data: payload.to_string(),
             });
         }
     }
+}
+
+/// Sorts a JSON object's top-level keys (Go marshals `map[string]any` sorted).
+fn sort_top_level_keys(value: &mut Value) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    let mut sorted: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (key, item) in std::mem::take(map) {
+        sorted.insert(key, item);
+    }
+    for (key, item) in sorted {
+        map.insert(key, item);
+    }
+}
+
+/// `realtimeCanAccessRecord`'s subscription filter check: the filter is
+/// evaluated against the stored row, not the in-memory record copy.
+fn record_matches_filter(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    filter: &str,
+    record_id: &str,
+    request: &RequestInfo,
+    is_superuser: bool,
+) -> bool {
+    let ctx = filter_context(conn, collection, is_superuser);
+    let Ok(sf) = build_filter_sql_raw(&ctx, filter, request) else {
+        return false;
+    };
+    let sql = format!(
+        "SELECT 1 FROM {} WHERE {} = ? AND ({})",
+        quote_table(&collection.name),
+        pb_core::records::quote_ident("id"),
+        sf.sql
+    );
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::Text(record_id.to_string())];
+    params.extend(sf.params.iter().map(json_to_sqlite));
+    conn.query_row(&sql, rusqlite::params_from_iter(params), |_| Ok(()))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -4322,5 +4383,76 @@ mod tests {
         assert_eq!(content_type_for("a.svg"), "image/svg+xml");
         assert_eq!(content_type_for("a.jxl"), "image/jxl");
         assert_eq!(content_type_for("a.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn realtime_broadcast_keeps_the_raw_topic_and_applies_options() {
+        let mut conn = fresh();
+        let collection = create(
+            &mut conn,
+            json!({
+                "type": "base", "name": "rttopic",
+                "fields": [{"name": "title", "type": "text"}],
+                "listRule": "", "viewRule": ""
+            }),
+        );
+        let record_id = "rttopicrecord01";
+        conn.execute(
+            &format!(
+                "INSERT INTO {} ({}, {}) VALUES (?1, ?2)",
+                quote_table(&collection.name),
+                pb_core::records::quote_ident("id"),
+                pb_core::records::quote_ident("title"),
+            ),
+            rusqlite::params![record_id, "match"],
+        )
+        .unwrap();
+        let record = pb_core::record_upsert::RecordModel::find_by_id(&conn, &collection, record_id)
+            .unwrap()
+            .unwrap();
+
+        let broker = crate::realtime::broker();
+        let suffix = pb_core::ids::random_string(10);
+        let client_id = format!("test-{suffix}");
+        let mut rx = broker.register(&client_id, "127.0.0.1");
+        let plain = format!("rttopic/*?options={}", "%7B%7D");
+        let filtered = format!(
+            "rttopic/*?options={}",
+            urlencoding::encode(&json!({"query": {"filter": "title = 'match'"}}).to_string())
+        );
+        broker.set_subscriptions(
+            &client_id,
+            vec![plain.clone(), filtered.clone()],
+            None,
+            "127.0.0.1",
+        );
+
+        broadcast_record(&conn, &collection, &record, "create");
+
+        let first = rx.try_recv().expect("plain topic event");
+        assert_eq!(first.name, plain);
+        let second = rx.try_recv().expect("filtered topic event");
+        assert_eq!(second.name, filtered);
+
+        // The subscription filter suppresses records that don't match.
+        conn.execute(
+            &format!(
+                "UPDATE {} SET {} = ?1 WHERE {} = ?2",
+                quote_table(&collection.name),
+                pb_core::records::quote_ident("title"),
+                pb_core::records::quote_ident("id"),
+            ),
+            rusqlite::params!["other", record_id],
+        )
+        .unwrap();
+        let record = pb_core::record_upsert::RecordModel::find_by_id(&conn, &collection, record_id)
+            .unwrap()
+            .unwrap();
+        broadcast_record(&conn, &collection, &record, "update");
+
+        let first = rx.try_recv().expect("plain topic still receives");
+        assert_eq!(first.name, plain);
+        assert!(rx.try_recv().is_err(), "filtered topic must be suppressed");
+        broker.unregister(&client_id);
     }
 }

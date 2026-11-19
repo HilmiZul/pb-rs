@@ -8,7 +8,7 @@ is out of scope for v1. These are gaps in evidence, not assumptions.
 | 1 | SMTP delivery, templates, retry behaviour | no mail server; `smtp.enabled=false` in the seed | run a local sink (MailHog) and record |
 | 2 | S3 storage backend semantics (incl. the v0.42.3 `CompleteMultipartUpload` error-body check) | requires an S3-compatible endpoint | run MinIO, record |
 | 3 | OAuth2 provider flows end-to-end; `auth-methods` provider metadata (state/PKCE/authURL) | requires real provider credentials; the port's endpoint is a documented stub (COMPATIBILITY D19) | mock the token endpoint and record |
-| 4 | Realtime SSE framing over long sessions | the current harness reads whole bodies; SSE never terminates | add a streaming recorder (M5) |
+| 4 | Realtime SSE framing over long sessions | connect/subscribe/create/update/delete and options are covered by streaming probes, but idle/`ping` timing and reconnects over multi-minute sessions are not compared | extend the streaming recorder with idle/reconnect cases |
 | 5 | `update` command behaviour | it fetches from `ganigeorgiev.com` (v0.42.3 channel API) and replaces the executable; the port has no self-update | sandbox + local HTTP server replay |
 | 6 | Thumbnail generation byte output | depends on Go's image encoders; exact bytes may differ by codec | compare dimensions/format only, or accept divergence |
 | 7 | JSVM hook semantics | goja is out of scope for v1; rquickjs covers the documented subset (M6a) | M6b (full goja parity deferred) |

@@ -121,6 +121,14 @@ verification of hashes produced by the oracle.
 **Gate:** an official SDK client connects over SSE and receives identical events;
 batch transaction semantics match under partial failure.
 
+v0.42.3 realtime fix: events are emitted under the **raw subscription string**
+(the SDK registers its listener under `collection/*?options=…`), so the broker
+must not strip the options suffix. Subscription options are parsed like
+`DefaultClient.Subscribe` (`query`/`headers`, snakecased headers) and applied to
+the rule check, the per-subscription `filter`, `fields` projection and `expand`.
+Covered by `crates/pb-api` tests and streaming probes for
+create/update/delete with authenticated subscribers.
+
 ## M6a — JSVM hook subset  ✅ done
 
 **Engine:** rquickjs 0.14 (QuickJS, bundled C build) in workspace crate
@@ -270,6 +278,13 @@ scenario harness did not cover: `POST /api/files/token` now uses the route's
 `RequireAuth` message, an empty bad-request message falls back to
 `Something went wrong while processing your request.`, and `GET /_` returns
 Go's `http.Redirect` HTML body instead of an empty 307 body.
+
+A live realtime probe then caught that the broker stripped the `?options=…`
+suffix from event names. The official SDK registers its SSE listener under the
+raw subscription string (it sends `?options={}` whenever the caller passes an
+options object), so no record event ever reached the app. Events now use the
+raw topic, and subscription options drive the rule check, `filter`, `fields`
+and `expand` exactly like v0.42.3.
 
 The S3 multipart check, SMTP/sendmail fixes, `Event.Extra`, `StartBannerFunc`
 and the new `update` host remain out of scope (`docs/UNKNOWNS.md`).

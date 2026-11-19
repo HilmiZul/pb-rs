@@ -170,6 +170,85 @@ pub fn subscription_topic(raw: &str) -> &str {
     raw.split('?').next().unwrap_or(raw)
 }
 
+/// `tools/subscriptions.DefaultClient.Subscribe` options: the `options` query
+/// parameter holds a JSON object with `query` and `headers` maps.
+#[derive(Clone, Debug, Default)]
+pub struct SubscriptionOptions {
+    pub query: std::collections::HashMap<String, String>,
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// Go's `cast.ToString` for the JSON values accepted in subscription options.
+fn option_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// `X-Token` -> `x_token` (the oracle normalizes option header names with
+/// `inflector.Snakecase`).
+fn snakecase_header(name: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in name.chars().enumerate() {
+        if matches!(ch, '-' | ' ') {
+            out.push('_');
+        } else if ch.is_ascii_uppercase() {
+            if index > 0 && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Parses `topic?options=<urlencoded json>` into the normalized query/headers.
+pub fn subscription_options(raw: &str) -> SubscriptionOptions {
+    let Some((_, query_string)) = raw.split_once('?') else {
+        return SubscriptionOptions::default();
+    };
+    let mut encoded = None;
+    for pair in query_string.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "options" {
+            encoded = Some(value);
+            break;
+        }
+    }
+    let Some(encoded) = encoded else {
+        return SubscriptionOptions::default();
+    };
+    let decoded = urlencoding::decode(encoded)
+        .map(|text| text.into_owned())
+        .unwrap_or_else(|_| encoded.to_string());
+    let Ok(serde_json::Value::Object(mut root)) =
+        serde_json::from_str::<serde_json::Value>(&decoded)
+    else {
+        return SubscriptionOptions::default();
+    };
+
+    let mut options = SubscriptionOptions::default();
+    if let Some(serde_json::Value::Object(query)) = root.remove("query") {
+        for (key, value) in query {
+            options.query.insert(key, option_string(&value));
+        }
+    }
+    if let Some(serde_json::Value::Object(headers)) = root.remove("headers") {
+        for (key, value) in headers {
+            options
+                .headers
+                .insert(snakecase_header(&key), option_string(&value));
+        }
+    }
+    options
+}
+
 /// Returns `Some(specific)` when `topic` targets the given record:
 /// `specific = true` for `collection/recordId`, `false` for
 /// `collection`/`collection/*` (list topics).
@@ -187,4 +266,40 @@ pub fn topic_matches(topic: &str, collection_id: &str, collection_name: &str, re
         return Some(true);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_options_are_normalized() {
+        let raw = "posts/*?options=%7B%22query%22%3A%7B%22filter%22%3A%22title%20%3D%20%27x%27%22%7D%2C%22headers%22%3A%7B%22X-Token%22%3A%22abc%22%7D%7D";
+        let options = subscription_options(raw);
+        assert_eq!(options.query.get("filter").unwrap(), "title = 'x'");
+        assert_eq!(options.headers.get("x_token").unwrap(), "abc");
+
+        // The SDK sends `{}` when the caller passes an empty options object.
+        let empty = subscription_options("posts/*?options=%7B%7D");
+        assert!(empty.query.is_empty());
+        assert!(empty.headers.is_empty());
+
+        // No options / invalid JSON falls back to empty maps.
+        assert!(subscription_options("posts/*").query.is_empty());
+        assert!(subscription_options("posts/*?options=nope")
+            .query
+            .is_empty());
+    }
+
+    #[test]
+    fn topics_match_with_options_suffix() {
+        assert_eq!(
+            topic_matches("posts/*?options=%7B%7D", "pbc_1", "posts", "rec"),
+            Some(false)
+        );
+        assert_eq!(
+            topic_matches("posts/rec?options=%7B%7D", "pbc_1", "posts", "rec"),
+            Some(true)
+        );
+    }
 }
