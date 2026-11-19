@@ -40,6 +40,9 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path, size: usize) -> anyhow::Result<Self> {
+        // A fresh pool means a fresh process-level view of `_collections`;
+        // drop anything cached for a database path that was reopened.
+        pb_core::collections::Collection::invalidate_cache();
         let mut conns = Vec::with_capacity(size.max(1));
         for _ in 0..size.max(1) {
             conns.push(pb_core::db::open(path)?);

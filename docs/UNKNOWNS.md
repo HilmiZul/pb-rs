@@ -37,7 +37,8 @@ is out of scope for v1. These are gaps in evidence, not assumptions.
 - M7 load/WAL coverage is bounded at 8 workers × 40 mirrored operations plus one
   external writer per install (`tools/load_wal.py`). It shows matching status
   codes and final record sets, `journal_mode=wal`, and `integrity_check=ok`; it
-  does not prove fairness or throughput parity. The port uses a small SQLite
-  connection pool and writes request logs on a blocking task, so concurrent
-  latency is still higher than the oracle's (see COMPATIBILITY.md D14). This is a
-  performance divergence, not a correctness gap.
+  does not prove fairness or throughput parity. Earlier runs measured concurrent
+  latency above the oracle's; that gap was traced to per-request collection and
+  expand work, not to the pool (see `docs/PERF-LIST-EXPAND.md`). The port is now
+  faster in the measured list/expand cases, but this remains a bounded
+  measurement rather than a proof of throughput parity for every endpoint.

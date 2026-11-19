@@ -12,7 +12,8 @@
 //! keys are inserted in that order rather than alphabetically.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row};
@@ -70,21 +71,107 @@ pub struct Collection {
     pub updated: String,
 }
 
-static COLLECTION_CACHE: LazyLock<Mutex<HashMap<usize, HashMap<String, Collection>>>> =
+/// Immutable per-database view of `_collections`.
+///
+/// The Go oracle keeps `[]*Collection` in its app store and hands out pointers
+/// (`FindCachedCollectionByNameOrId`).  The port mirrors that: entries are
+/// shared through `Arc`, never deep-cloned per request.  `all` itself is an
+/// `Arc` so returning the whole list costs one refcount bump.
+struct CollectionRegistry {
+    all: Arc<Vec<Arc<Collection>>>,
+    by_id: HashMap<String, Arc<Collection>>,
+    by_name: HashMap<String, Arc<Collection>>,
+}
+
+/// Registry keyed by database path (not by connection address: pooled
+/// `rusqlite::Connection` values are moved in and out of the pool, so their
+/// address is not a stable identity).
+static REGISTRY: LazyLock<Mutex<HashMap<String, Arc<CollectionRegistry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static LOAD_ALL_CACHE: LazyLock<Mutex<HashMap<usize, Vec<Collection>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Bumped on every collection mutation.  Downstream caches (e.g. the API
+/// filter context) compare it and drop their entries when it changes.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic counter used to invalidate derived caches.
+pub fn cache_generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+/// Stable per-database key.  `None` for in-memory databases, where a path is
+/// not available and caching by pointer would be unsafe.
+fn registry_key(conn: &Connection) -> Option<String> {
+    conn.path().map(str::to_string)
+}
+
+fn load_registry(conn: &Connection) -> Result<Arc<CollectionRegistry>> {
+    let Some(key) = registry_key(conn) else {
+        return Ok(Arc::new(read_registry(conn)?));
+    };
+    if let Ok(cache) = REGISTRY.lock() {
+        if let Some(registry) = cache.get(&key) {
+            return Ok(registry.clone());
+        }
+    }
+    let registry = Arc::new(read_registry(conn)?);
+    if let Ok(mut cache) = REGISTRY.lock() {
+        cache.insert(key, registry.clone());
+    }
+    Ok(registry)
+}
+
+fn read_registry(conn: &Connection) -> Result<CollectionRegistry> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, system, type, name, fields, indexes, listRule, viewRule,
+                createRule, updateRule, deleteRule, options, created, updated
+         FROM _collections ORDER BY rowid ASC",
+    )?;
+    let rows = stmt.query_map([], Collection::from_row)?;
+    let all: Vec<Arc<Collection>> = rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    let mut by_id = HashMap::with_capacity(all.len());
+    let mut by_name = HashMap::with_capacity(all.len());
+    for collection in &all {
+        by_id.insert(collection.id.clone(), collection.clone());
+        by_name.insert(collection.name.clone(), collection.clone());
+    }
+    Ok(CollectionRegistry {
+        all: Arc::new(all),
+        by_id,
+        by_name,
+    })
+}
 
 impl Collection {
     /// Clear the in-memory collection cache (call after any collection mutation).
     pub fn invalidate_cache() {
-        if let Ok(mut cache) = COLLECTION_CACHE.lock() {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut cache) = REGISTRY.lock() {
             cache.clear();
         }
-        if let Ok(mut cache) = LOAD_ALL_CACHE.lock() {
-            cache.clear();
+    }
+
+    /// Shared, read-only collection lookup (`FindCachedCollectionByNameOrId`).
+    ///
+    /// Returns a pointer into the per-database registry, so callers can reuse
+    /// the parsed fields/options without copying them.
+    pub fn find_shared(conn: &Connection, id_or_name: &str) -> Result<Option<Arc<Collection>>> {
+        let registry = load_registry(conn)?;
+        if let Some(collection) = registry.by_id.get(id_or_name) {
+            return Ok(Some(collection.clone()));
         }
+        if let Some(collection) = registry.by_name.get(id_or_name) {
+            return Ok(Some(collection.clone()));
+        }
+        Ok(None)
+    }
+
+    /// Shared `FindAllCollections`: one `Arc` clone, no row re-parsing.
+    pub fn load_all_shared(conn: &Connection) -> Result<Arc<Vec<Arc<Collection>>>> {
+        Ok(load_registry(conn)?.all.clone())
     }
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let options: String = row.get("options")?;
@@ -140,24 +227,16 @@ impl Collection {
             .unwrap_or_default()
     }
 
+    /// Uncached full read.  Kept for write paths (transactions must observe
+    /// their own uncommitted collection rows); read-only request paths should
+    /// use [`Collection::load_all_shared`].
     pub fn load_all(conn: &Connection) -> Result<Vec<Self>> {
-        let key = conn as *const Connection as usize;
-        if let Ok(cache) = LOAD_ALL_CACHE.lock() {
-            if let Some(v) = cache.get(&key) {
-                return Ok(v.clone());
-            }
-        }
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, system, type, name, fields, indexes, listRule, viewRule,
-                    createRule, updateRule, deleteRule, options, created, updated
-             FROM _collections ORDER BY rowid ASC",
-        )?;
-        let rows = stmt.query_map([], Self::from_row)?;
-        let result: Vec<Self> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        if let Ok(mut cache) = LOAD_ALL_CACHE.lock() {
-            cache.insert(key, result.clone());
-        }
-        Ok(result)
+        let registry = read_registry(conn)?;
+        Ok(registry
+            .all
+            .iter()
+            .map(|collection| (**collection).clone())
+            .collect())
     }
 
     /// `FindCachedCollectionByNameOrId`: lookup by id first, then by name.

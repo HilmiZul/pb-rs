@@ -1867,7 +1867,63 @@ struct FilterContext {
 
 // removed
 
+/// Per-database cache of built filter contexts.
+///
+/// Building one walks every collection in the database, so it must happen once
+/// per collection version instead of once per request (and, previously, once
+/// per record per expanded relation) like the Go oracle's cached collections.
+struct FilterCache {
+    generation: u64,
+    entries: std::collections::HashMap<(String, String, bool), std::sync::Arc<FilterContext>>,
+}
+
+static FILTER_CACHE: std::sync::LazyLock<std::sync::Mutex<FilterCache>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(FilterCache {
+            generation: u64::MAX,
+            entries: std::collections::HashMap::new(),
+        })
+    });
+
 fn filter_context(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    include_hidden: bool,
+) -> std::sync::Arc<FilterContext> {
+    // In-memory databases have no stable identity, so they are never cached.
+    let Some(db_key) = conn.path().map(str::to_string) else {
+        return std::sync::Arc::new(build_filter_context(conn, collection, include_hidden));
+    };
+
+    let generation = pb_core::collections::cache_generation();
+    let key = (db_key, collection.id.clone(), include_hidden);
+
+    if let Ok(mut cache) = FILTER_CACHE.lock() {
+        if cache.generation != generation {
+            cache.entries.clear();
+            cache.generation = generation;
+        }
+        if let Some(ctx) = cache.entries.get(&key) {
+            return ctx.clone();
+        }
+    }
+
+    let ctx = std::sync::Arc::new(build_filter_context(conn, collection, include_hidden));
+
+    if let Ok(mut cache) = FILTER_CACHE.lock() {
+        // Only store when the collection registry did not change mid-build.
+        if cache.generation != generation {
+            cache.entries.clear();
+            cache.generation = generation;
+        } else {
+            cache.entries.insert(key, ctx.clone());
+        }
+    }
+
+    ctx
+}
+
+fn build_filter_context(
     conn: &rusqlite::Connection,
     collection: &Collection,
     include_hidden: bool,
@@ -1893,8 +1949,9 @@ fn filter_context(
     // (e.g. `listRule: "@collection.teams.members ?= @request.auth.id"`), so
     // the referenced-collection metadata is always needed. `load_all` is
     // cached per connection, which keeps the common case cheap.
-    let all = Collection::load_all(conn).unwrap_or_default();
-    let by_id: HashMap<&str, &Collection> = all.iter().map(|c| (c.id.as_str(), c)).collect();
+    let all = Collection::load_all_shared(conn).unwrap_or_default();
+    let by_id: HashMap<&str, &std::sync::Arc<Collection>> =
+        all.iter().map(|c| (c.id.as_str(), c)).collect();
 
     let relations_for = |c: &Collection| {
         let mut relations: HashMap<String, search::RelationInfo> = HashMap::new();
@@ -1916,7 +1973,7 @@ fn filter_context(
     };
 
     let mut collections: HashMap<String, search::CollectionInfo> = HashMap::new();
-    for c in &all {
+    for c in all.iter() {
         let mut field_types: HashMap<String, String> = HashMap::new();
         let mut hidden = std::collections::HashSet::new();
         for f in c.field_list().items() {
@@ -2026,8 +2083,11 @@ pub(crate) fn go_parse_bool_error(raw: &str) -> String {
 }
 
 /// `findCollection`: 404 when the collection is missing.
-fn find_collection(conn: &rusqlite::Connection, id_or_name: &str) -> Result<Collection, ApiError> {
-    Collection::find(conn, id_or_name)
+fn find_collection(
+    conn: &rusqlite::Connection,
+    id_or_name: &str,
+) -> Result<std::sync::Arc<Collection>, ApiError> {
+    Collection::find_shared(conn, id_or_name)
         .map_err(|e| ApiError::internal(format!("failed to load collection: {e}")))?
         .ok_or_else(|| ApiError::not_found("Missing collection context.").with_raw_data(json!("sql: no rows in result set")))
 }
@@ -2398,6 +2458,16 @@ fn has_auth_manage_access_record(
     record_rule_matches(conn, collection, rule, record_id, request, ctx).unwrap_or(false)
 }
 
+/// `Record` visibility with every field unhidden (superuser view).
+fn superuser_visibility(collection: &Collection) -> Visibility {
+    let mut visibility = Visibility::default();
+    visibility.ignore_email_visibility = true;
+    for field in collection.field_list().items() {
+        visibility.unhide(pb_core::fields::field_name(field));
+    }
+    visibility
+}
+
 /// `autoResolveRecordsFlags` + `PublicExport` visibility for one record.
 fn visibility_for_record(
     conn: &rusqlite::Connection,
@@ -2409,11 +2479,7 @@ fn visibility_for_record(
     let mut visibility = Visibility::default();
 
     if request.is_superuser() {
-        visibility.ignore_email_visibility = true;
-        for field in collection.field_list().items() {
-            visibility.unhide(pb_core::fields::field_name(field));
-        }
-        return visibility;
+        return superuser_visibility(collection);
     }
 
     if !collection.is_auth() {
@@ -2570,8 +2636,10 @@ pub async fn list(
         where_clause,
         order_clause
     );
+    // The admin UI reuses the exact same SQL text between requests; caching the
+    // prepared statement skips SQLite's parse/plan step.
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare_cached(&sql)
         .map_err(|e| ApiError::internal(format!("prepare failed: {e}")))?;
     let mut all_params: Vec<rusqlite::types::Value> =
         filter_params.iter().map(json_to_sqlite).collect();
@@ -2584,33 +2652,48 @@ pub async fn list(
     let ctx = filter_context(&conn, &collection, true);
     let expand = request.query.get("expand").cloned().unwrap_or_default();
     let tree = build_expand_tree(&expand);
+    // A superuser sees every field of every record, so the visibility mask is
+    // identical for the whole page (this used to be rebuilt per record).
+    let shared_visibility = request.is_superuser().then(|| superuser_visibility(&collection));
     let mut records = Vec::new();
     while let Some(row) = rows
         .next()
         .map_err(|e| ApiError::internal(format!("row failed: {e}")))?
     {
-        let record = RecordModel::from_row(&collection, row)
+        let record = RecordModel::from_row_shared(collection.clone(), row)
             .map_err(|e| ApiError::internal(format!("from_row failed: {e}")))?;
-        let visibility = visibility_for_record(&conn, &collection, &record, &request, &ctx);
-        let mut json = record.to_api_json_with(&visibility);
-        if !tree.is_empty() {
-            expand_record(&conn, &collection, &mut json, &tree, &request);
-        }
-        records.push(json);
+        let record_visibility;
+        let visibility = match &shared_visibility {
+            Some(visibility) => visibility,
+            None => {
+                record_visibility =
+                    visibility_for_record(&conn, &collection, &record, &request, &ctx);
+                &record_visibility
+            }
+        };
+        records.push(record.to_api_json_with(visibility));
     }
     drop(rows);
     drop(stmt);
 
-    run_record_hook(
-        "onRecordsListRequest",
-        &collection,
-        None,
-        Some(Value::Array(records.clone())),
-        &request,
-        uri.path(),
-        None,
-        None,
-    )?;
+    // Expand in one pass over the page (one query per relation path) instead
+    // of rebuilding collection metadata per record per relation.
+    if !tree.is_empty() {
+        expand_records(&conn, &collection, &mut records, &tree, &request);
+    }
+
+    if crate::hook_engine().is_some() {
+        run_record_hook(
+            "onRecordsListRequest",
+            &collection,
+            None,
+            Some(Value::Array(records.clone())),
+            &request,
+            uri.path(),
+            None,
+            None,
+        )?;
+    }
 
     project_fields(
         &mut records,
@@ -2664,87 +2747,200 @@ fn can_view_expanded(
     }
 }
 
-fn expand_record(
-    conn: &rusqlite::Connection,
-    collection: &Collection,
-    rec: &mut Value,
-    tree: &std::collections::BTreeMap<String, Vec<String>>,
-    request: &RequestInfo,
-) {
-    let mut expand_obj = Map::new();
-    let Some(obj) = rec.as_object_mut() else {
-        return;
+/// Relation ids referenced by one record for `field_name`.
+fn relation_ids(rec: &Value, field_name: &str, is_multiple: bool) -> Vec<String> {
+    let Some(value) = rec.as_object().and_then(|obj| obj.get(field_name)) else {
+        return Vec::new();
     };
-    for (field_name, nested) in tree {
-        let rel_field = {
-            let fl = collection.field_list();
-            fl.items()
-                .iter()
-                .find(|f| {
-                    pb_core::fields::field_name(f) == field_name
-                        && pb_core::fields::field_type(f) == "relation"
-                })
-                .cloned()
-        };
-        let Some(rel_field) = rel_field else {
+    if is_multiple {
+        value
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        value
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default()
+    }
+}
+
+/// Fetch every related record of one expand path with a single query
+/// (`WHERE id IN (...)`), mirroring `app.FindRecordsByIds`.
+fn fetch_records_by_ids(
+    conn: &rusqlite::Connection,
+    collection: &std::sync::Arc<Collection>,
+    ids: &[String],
+) -> std::collections::HashMap<String, RecordModel> {
+    let mut out = std::collections::HashMap::with_capacity(ids.len());
+    // Keep the parameter count well below SQLite's variable limit.
+    for chunk in ids.chunks(400) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} IN ({})",
+            pb_core::records::quote_ident(&collection.name),
+            pb_core::records::quote_ident("id"),
+            placeholders
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
         };
-        let coll_id = pb_core::fields::field_str(&rel_field, "collectionId");
-        let Ok(Some(rel_coll)) = Collection::find(conn, coll_id) else {
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let Ok(mut rows) = stmt.query(params.as_slice()) else {
             continue;
         };
-        let is_multiple = pb_core::fields::is_multiple(&rel_field);
-        let val = obj.get(field_name).cloned().unwrap_or(Value::Null);
-        let child_tree = build_expand_tree(&nested.join(","));
-        let rel_ctx = filter_context(conn, &rel_coll, true);
-
-        let resolve = |rid: &str, expand_obj: &mut Map<String, Value>| {
-            let Ok(Some(rel)) = RecordModel::find_by_id(conn, &rel_coll, rid) else {
-                return;
-            };
-            if !can_view_expanded(conn, &rel_coll, &rel, request, &rel_ctx) {
-                return;
-            }
-            let visibility = visibility_for_record(conn, &rel_coll, &rel, request, &rel_ctx);
-            let mut rv = rel.to_api_json_with(&visibility);
-            if !child_tree.is_empty() {
-                expand_record(conn, &rel_coll, &mut rv, &child_tree, request);
-            }
-            match expand_obj.get_mut(field_name) {
-                Some(Value::Array(items)) => items.push(rv),
-                Some(slot) => *slot = rv,
-                None => {
-                    if is_multiple {
-                        expand_obj.insert(field_name.clone(), Value::Array(vec![rv]));
-                    } else {
-                        expand_obj.insert(field_name.clone(), rv);
-                    }
-                }
-            }
-        };
-
-        if is_multiple {
-            let ids: Vec<String> = val
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
-            for rid in &ids {
-                resolve(rid, &mut expand_obj);
-            }
-        } else if let Some(rid) = val.as_str() {
-            if !rid.is_empty() {
-                resolve(rid, &mut expand_obj);
+        while let Ok(Some(row)) = rows.next() {
+            if let Ok(record) = RecordModel::from_row_shared(collection.clone(), row) {
+                out.insert(record.id().to_string(), record);
             }
         }
     }
+    out
+}
+
+/// Single-record convenience wrapper around [`expand_records`].
+fn expand_record(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    record: &mut Value,
+    tree: &std::collections::BTreeMap<String, Vec<String>>,
+    request: &RequestInfo,
+) {
+    expand_records(conn, collection, std::slice::from_mut(record), tree, request);
+}
+
+/// Expand a whole page of records.
+///
+/// The oracle expands path-by-path over the full result set: one relation
+/// lookup and one `FindRecordsByIds` query per expand expression.  Doing the
+/// same here keeps the cost O(#expand paths) instead of
+/// O(#records × #relations) and lets the cached filter context be reused.
+fn expand_records(
+    conn: &rusqlite::Connection,
+    collection: &Collection,
+    records: &mut [Value],
+    tree: &std::collections::BTreeMap<String, Vec<String>>,
+    request: &RequestInfo,
+) {
+    if records.is_empty() {
+        return;
+    }
+
+    let mut expand_maps: Vec<Map<String, Value>> =
+        (0..records.len()).map(|_| Map::new()).collect();
+
+    for (field_name, nested) in tree {
+        let rel_field = collection
+            .field_list()
+            .items()
+            .iter()
+            .find(|field| {
+                pb_core::fields::field_name(field) == field_name
+                    && pb_core::fields::field_type(field) == "relation"
+            })
+            .cloned();
+        let Some(rel_field) = rel_field else {
+            continue;
+        };
+        let coll_id = pb_core::fields::field_str(&rel_field, "collectionId").to_string();
+        let Ok(Some(rel_collection)) = Collection::find_shared(conn, &coll_id) else {
+            continue;
+        };
+        let is_multiple = pb_core::fields::is_multiple(&rel_field);
+        let child_tree = build_expand_tree(&nested.join(","));
+        let rel_ctx = filter_context(conn, &rel_collection, true);
+        let shared_visibility = request
+            .is_superuser()
+            .then(|| superuser_visibility(&rel_collection));
+
+        // Ids referenced by each record, plus the deduplicated fetch set.
+        let mut per_record_ids: Vec<Vec<String>> = Vec::with_capacity(records.len());
+        let mut fetch_ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rec in records.iter() {
+            let ids = relation_ids(rec, field_name, is_multiple);
+            for id in &ids {
+                if seen.insert(id.clone()) {
+                    fetch_ids.push(id.clone());
+                }
+            }
+            per_record_ids.push(ids);
+        }
+
+        if fetch_ids.is_empty() {
+            continue;
+        }
+
+        let fetched = fetch_records_by_ids(conn, &rel_collection, &fetch_ids);
+
+        // Build the child JSON values once so nested expands can batch too.
+        let mut children: Vec<Value> = Vec::new();
+        let mut slots: Vec<Vec<usize>> = (0..records.len()).map(|_| Vec::new()).collect();
+        for (index, ids) in per_record_ids.iter().enumerate() {
+            for id in ids {
+                let Some(related) = fetched.get(id) else {
+                    continue;
+                };
+                if !can_view_expanded(conn, &rel_collection, related, request, &rel_ctx) {
+                    continue;
+                }
+                let record_visibility;
+                let visibility = match &shared_visibility {
+                    Some(visibility) => visibility,
+                    None => {
+                        record_visibility = visibility_for_record(
+                            conn,
+                            &rel_collection,
+                            related,
+                            request,
+                            &rel_ctx,
+                        );
+                        &record_visibility
+                    }
+                };
+                children.push(related.to_api_json_with(visibility));
+                slots[index].push(children.len() - 1);
+            }
+        }
+
+        if !child_tree.is_empty() {
+            expand_records(conn, &rel_collection, &mut children, &child_tree, request);
+        }
+
+        for (index, child_slots) in slots.into_iter().enumerate() {
+            if child_slots.is_empty() {
+                continue;
+            }
+            let mut values: Vec<Value> = child_slots
+                .into_iter()
+                .map(|child| std::mem::take(&mut children[child]))
+                .collect();
+            let value = if is_multiple {
+                Value::Array(values)
+            } else {
+                values.pop().expect("non-empty relation slot")
+            };
+            expand_maps[index].insert(field_name.clone(), value);
+        }
+    }
+
     // The oracle always includes `expand` (even as `{}`) when expansion was
-    // requested for the record.
-    obj.insert("expand".into(), Value::Object(expand_obj));
+    // requested for the record, appended after the record's own keys.
+    for (rec, expand_obj) in records.iter_mut().zip(expand_maps) {
+        if let Some(obj) = rec.as_object_mut() {
+            obj.insert("expand".into(), Value::Object(expand_obj));
+        }
+    }
 }
 
 /// `fields` projection (`picker.Pick`): keep exactly the requested keys.

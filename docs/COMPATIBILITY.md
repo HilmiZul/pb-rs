@@ -273,9 +273,13 @@ fire-and-forget goroutine.
 *Why:* a small pool keeps SQLite transaction semantics and `pb_data`
 compatibility simple while avoiding a single global lock; the async writer is a
 performance optimization, not a correctness requirement.
-*Impact (debug build, same machine): the measured p50 latency in the M7 load test
-is higher than the oracle's; status codes, final record sets, WAL mode and
-`integrity_check` all match. Release builds narrow the gap.
+*Impact:* earlier release-build comparisons showed the port slower on list +
+expand requests, but the cause was per-request/per-record metadata rebuilding,
+not the pool (see `docs/PERF-LIST-EXPAND.md`). After the shared collection
+registry, cached filter contexts and batch expand, the release build is faster
+than the oracle on every measured list/expand case (admin UI 40 rows + 3
+expands: 1.31 ms vs 2.40 ms p50; 3161 vs 1279 requests/s over 8 threads).
+Status codes, final record sets, WAL mode and `integrity_check` still match.
 *Proven harmless by:* `tools/load_wal.py` (606 requests, zero 5xx/transport
 errors, identical final state) and the full `tools/gate_m7.sh`.
 

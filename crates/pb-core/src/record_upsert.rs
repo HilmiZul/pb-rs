@@ -15,6 +15,7 @@
 //! round-trip exactly like the oracle.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -171,7 +172,9 @@ impl Visibility {
 /// `core.Record` with the parts needed by the create/update pipeline.
 #[derive(Clone, Debug)]
 pub struct RecordModel {
-    pub collection: Collection,
+    /// Shared with the collection registry: read paths never deep-clone the
+    /// collection (fields/options/indexes) per record.
+    pub collection: Arc<Collection>,
     data: BTreeMap<String, FieldValue>,
     original: BTreeMap<String, FieldValue>,
     pub is_new: bool,
@@ -190,8 +193,13 @@ pub struct RecordModel {
 impl RecordModel {
     /// `core.NewRecord(collection)`.
     pub fn new(collection: &Collection) -> Self {
+        Self::new_shared(Arc::new(collection.clone()))
+    }
+
+    /// Same as [`RecordModel::new`] but reuses a registry-owned collection.
+    pub fn new_shared(collection: Arc<Collection>) -> Self {
         let mut original = BTreeMap::new();
-        for field in fields_of(collection) {
+        for field in fields_of(&collection) {
             let name = field_name(field);
             if name == FIELD_NAME_ID {
                 continue;
@@ -199,7 +207,7 @@ impl RecordModel {
             original.insert(name.to_string(), prepare_value(field, None));
         }
         Self {
-            collection: collection.clone(),
+            collection,
             data: BTreeMap::new(),
             original,
             is_new: true,
@@ -217,26 +225,41 @@ impl RecordModel {
     /// `newRecordFromNullStringMap`: every column is scanned as a string and
     /// normalized through the field's `PrepareValue`.
     pub fn from_row(collection: &Collection, row: &rusqlite::Row<'_>) -> Result<Self> {
-        let mut record = Self::new(collection);
-        record.original.clear();
-        record.is_new = false;
+        Self::from_row_shared(Arc::new(collection.clone()), row)
+    }
 
-        let columns: Vec<String> = row
-            .as_ref()
-            .column_names()
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
+    /// Same as [`RecordModel::from_row`] but reuses a registry-owned
+    /// collection instead of copying it for every row.
+    pub fn from_row_shared(collection: Arc<Collection>, row: &rusqlite::Row<'_>) -> Result<Self> {
+        let field_source = collection.clone();
+        let mut record = Self {
+            collection,
+            data: BTreeMap::new(),
+            original: BTreeMap::new(),
+            is_new: false,
+            last_saved_pk: String::new(),
+            pk: String::new(),
+            access_level: AccessLevel::Default,
+            password: String::new(),
+            password_confirm: String::new(),
+            old_password: String::new(),
+            disable_password_validations: false,
+            uploaded_files: Vec::new(),
+        };
 
-        for field in fields_of(collection) {
+        // `column_names()` is a borrowed view of the prepared statement, so
+        // this costs one small Vec per row instead of one String per column.
+        let columns = row.as_ref().column_names();
+
+        for field in fields_of(&field_source) {
             let name = field_name(field);
             let raw = columns
                 .iter()
-                .position(|c| c == name)
+                .position(|c| *c == name)
                 .and_then(|idx| row.get_ref(idx).ok())
                 .and_then(column_to_string);
-            let value = match &raw {
-                Some(text) => prepare_value(field, Some(&Value::String(text.clone()))),
+            let value = match raw {
+                Some(text) => prepare_value(field, Some(&Value::String(text))),
                 None => prepare_value(field, None),
             };
             if name == FIELD_NAME_ID {
@@ -258,15 +281,25 @@ impl RecordModel {
         collection: &Collection,
         id: &str,
     ) -> Result<Option<Self>> {
+        Self::find_by_id_shared(conn, &Arc::new(collection.clone()), id)
+    }
+
+    /// Same as [`RecordModel::find_by_id`] but reuses a registry-owned
+    /// collection.
+    pub fn find_by_id_shared(
+        conn: &Connection,
+        collection: &Arc<Collection>,
+        id: &str,
+    ) -> Result<Option<Self>> {
         let sql = format!(
             "SELECT * FROM {} WHERE {} = ?1 LIMIT 1",
             crate::records::quote_ident(&collection.name),
             crate::records::quote_ident(FIELD_NAME_ID)
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query([id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(Self::from_row(collection, row)?)),
+            Some(row) => Ok(Some(Self::from_row_shared(collection.clone(), row)?)),
             None => Ok(None),
         }
     }
@@ -1151,7 +1184,13 @@ impl RecordModel {
                 continue;
             }
             visible = true;
-            out.insert(name.to_string(), self.get_json(name));
+            // `get_json` re-scans the collection for the field; here the field
+            // is already in hand, so only the value conversion is needed.
+            let value = match self.get_raw(name) {
+                Some(value) => value.to_json(is_multiple(field)),
+                None => Value::Null,
+            };
+            out.insert(name.to_string(), value);
         }
 
         if self.collection.is_auth() {
@@ -1162,12 +1201,10 @@ impl RecordModel {
             }
         }
 
-        let sorted: BTreeMap<_, _> = out.into_iter().collect();
-        let mut ordered = Map::new();
-        for (k, v) in sorted {
-            ordered.insert(k, v);
-        }
-        Value::Object(ordered)
+        // Go marshals the export map deterministically (alphabetical keys).
+        let mut entries: Vec<(String, Value)> = out.into_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Value::Object(entries.into_iter().collect())
     }
 
     /// Convenience wrapper without visibility overrides.
