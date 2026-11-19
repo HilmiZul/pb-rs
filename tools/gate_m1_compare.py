@@ -264,6 +264,13 @@ def compare_dropin(
         )
 
         for table in tables(before):
+            # Both binaries append a request-log row for the readiness probe
+            # (`GET /api/health`) used to start the server, so `_logs` is
+            # expected to grow by one in either direction. Every other
+            # auxiliary table must remain untouched.
+            if db_name == "auxiliary.db" and table == "_logs":
+                continue
+
             def dump(path, table=table):
                 db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
                 try:

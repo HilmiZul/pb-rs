@@ -145,8 +145,11 @@ pub async fn file_token(
     State(db): State<Db>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let auth = crate::auth::load_auth(&db, &headers)
-        .ok_or_else(|| ApiError::unauthorized("Missing auth context."))?;
+    // `file.go` binds `RequireAuth()` on this route, so a missing/unknown token
+    // uses the standard record-auth message (not the global one).
+    let auth = crate::auth::load_auth(&db, &headers).ok_or_else(|| {
+        ApiError::unauthorized("The request requires valid record authorization token.")
+    })?;
     let file_token = pb_core::tokens::new_jwt(
         &pb_core::tokens::RecordClaims {
             kind: pb_core::tokens::TYPE_FILE.into(),
@@ -189,6 +192,118 @@ fn is_protected_file(collection: &Collection, record: &Record, filename: &str) -
         }
     }
     false
+}
+
+/// `inlineServeContentTypes`: content types served with
+/// `Content-Disposition: inline` (unless `?download=true` is used).
+const INLINE_CONTENT_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpg",
+    "image/jpeg",
+    "image/jxl",
+    "image/gif",
+    "image/webp",
+    "image/x-icon",
+    "image/bmp",
+    "video/webm",
+    "video/mp4",
+    "video/3gpp",
+    "video/quicktime",
+    "video/x-ms-wmv",
+    "audio/basic",
+    "audio/aiff",
+    "audio/mpeg",
+    "audio/midi",
+    "audio/mp3",
+    "audio/wave",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/x-mpeg",
+    "audio/x-m4a",
+    "audio/aac",
+    "application/pdf",
+    "application/x-pdf",
+];
+
+/// `manualExtensionContentTypes`: extensions that force a specific content
+/// type regardless of what the storage layer detected.
+fn manual_extension_content_type(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "svg" => Some("image/svg+xml"),
+        "css" => Some("text/css"),
+        "js" | "mjs" => Some("text/javascript"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        _ => None,
+    }
+}
+
+/// Best-effort content type lookup for locally stored files.
+fn content_type_for(name: &str) -> &'static str {
+    if let Some(manual) = manual_extension_content_type(name) {
+        return manual;
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "jxl" => "image/jxl",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "webm" => "video/webm",
+        "mp4" => "video/mp4",
+        "3gpp" | "3gp" => "video/3gpp",
+        "mov" => "video/quicktime",
+        "wmv" => "video/x-ms-wmv",
+        "basic" => "audio/basic",
+        "aiff" => "audio/aiff",
+        "mp3" => "audio/mp3",
+        "midi" => "audio/midi",
+        "m4a" => "audio/x-m4a",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        // Common text/data files that the oracle's mimetype detector maps
+        // consistently from their bytes.
+        "txt" | "log" | "md" | "ini" | "toml" | "yaml" | "yml" => {
+            "text/plain; charset=utf-8"
+        }
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "xml" => "text/xml; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Go's `strconv.ParseBool` (invalid values parse to `false`).
+fn go_parse_bool_loose(value: &str) -> bool {
+    matches!(value, "1" | "t" | "T" | "TRUE" | "true" | "True")
+}
+
+/// Go's `strconv.Quote` for a header value (JSON string escaping is close
+/// enough for the file names PocketBase accepts).
+fn go_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// `PB_THUMBS_MAX_SOURCE_PIXELS`, default `100 << 20`.
+fn thumbs_max_source_pixels() -> i64 {
+    let max = std::env::var("PB_THUMBS_MAX_SOURCE_PIXELS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if max <= 0 {
+        100 << 20
+    } else {
+        max
+    }
 }
 
 pub async fn file_download(
@@ -294,19 +409,27 @@ pub async fn file_download(
                 .join(format!("thumbs_{}", filename));
             let thumb_path = thumb_dir.join(format!("{}_{}", thumb_size, filename));
             if !thumb_path.exists() {
-                // generate
-                let img = image::open(&file_path).ok();
-                if let Some(img) = img {
-                    // parse size
-                    let size_str = thumb_size.trim_end_matches(['t', 'b', 'f']);
-                    let parts: Vec<&str> = size_str.split('x').collect();
-                    if parts.len() == 2 {
-                        let w: u32 = parts[0].parse().unwrap_or(0);
-                        let h: u32 = parts[1].parse().unwrap_or(0);
-                        if w > 0 && h > 0 {
-                            let thumb = img.thumbnail(w, h);
-                            std::fs::create_dir_all(&thumb_dir).ok();
-                            let _ = thumb.save(&thumb_path);
+                // Refuse to decode images that exceed the configured pixel limit
+                // (default 100 << 20) to reduce the OOM risk.
+                let dimensions = image::image_dimensions(&file_path).ok();
+                let max_pixels = thumbs_max_source_pixels();
+                let exceeds_limit = dimensions
+                    .map(|(w, h)| i64::from(w) * i64::from(h) > max_pixels)
+                    .unwrap_or(false);
+                if !exceeds_limit {
+                    let img = image::open(&file_path).ok();
+                    if let Some(img) = img {
+                        // parse size
+                        let size_str = thumb_size.trim_end_matches(['t', 'b', 'f']);
+                        let parts: Vec<&str> = size_str.split('x').collect();
+                        if parts.len() == 2 {
+                            let w: u32 = parts[0].parse().unwrap_or(0);
+                            let h: u32 = parts[1].parse().unwrap_or(0);
+                            if w > 0 && h > 0 {
+                                let thumb = img.thumbnail(w, h);
+                                std::fs::create_dir_all(&thumb_dir).ok();
+                                let _ = thumb.save(&thumb_path);
+                            }
                         }
                     }
                 }
@@ -321,21 +444,34 @@ pub async fn file_download(
     let data = std::fs::read(&served_path)
         .map_err(|_| ApiError::not_found("The requested resource wasn't found."))?;
 
-    let content_type = if served_name.ends_with(".png") {
-        "image/png"
-    } else if served_name.ends_with(".jpg") || served_name.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if served_name.ends_with(".gif") {
-        "image/gif"
-    } else if served_name.ends_with(".webp") {
-        "image/webp"
+    // `filesystem.System.Serve`: inline known-safe types, force attachment for
+    // `?download=<truthy>`, and always send a disposition header.
+    let force_attachment = params
+        .get("download")
+        .map(|raw| go_parse_bool_loose(raw))
+        .unwrap_or(false);
+    let content_type = content_type_for(&served_name);
+    let disposition = if !force_attachment && INLINE_CONTENT_TYPES.contains(&content_type) {
+        "inline"
     } else {
-        "application/octet-stream"
+        "attachment"
     };
 
     let resp = axum::response::Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("{disposition}; filename={}", go_quote(&served_name)),
+        )
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox",
+        )
+        .header(
+            header::CACHE_CONTROL,
+            "max-age=2592000, stale-while-revalidate=86400",
+        )
         .body(axum::body::Body::from(data))
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(resp)
@@ -1752,16 +1888,12 @@ fn filter_context(
         .map(|f| pb_core::fields::field_name(f).to_string())
         .collect();
 
-    let all = if collection
-        .field_list()
-        .items()
-        .iter()
-        .any(|f| pb_core::fields::field_type(f) == "relation")
-    {
-        Collection::load_all(conn).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    // `@collection.<name>.*` references can appear in API rules or in a
+    // request filter even when the base collection has no relation field
+    // (e.g. `listRule: "@collection.teams.members ?= @request.auth.id"`), so
+    // the referenced-collection metadata is always needed. `load_all` is
+    // cached per connection, which keeps the common case cheap.
+    let all = Collection::load_all(conn).unwrap_or_default();
     let by_id: HashMap<&str, &Collection> = all.iter().map(|c| (c.id.as_str(), c)).collect();
 
     let relations_for = |c: &Collection| {
@@ -3900,6 +4032,7 @@ pub async fn realtime_connect(
 
 pub async fn realtime_subscribe(
     State(db): State<Db>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -3975,7 +4108,18 @@ pub async fn realtime_subscribe(
         }
     }
 
-    broker.set_subscriptions(client_id, subscriptions, current_auth);
+    let settings = {
+        let conn = db
+            .lock()
+            .map_err(|_| ApiError::internal("database lock poisoned"))?;
+        pb_core::settings::load(&conn).unwrap_or_default()
+    };
+    let addr = connect_info.map(|info| info.0);
+    let real_ip = crate::rate_limit::real_ip(&headers, &settings, addr);
+
+    // The first `@oauth2` subscription stores its IP so the redirect handler
+    // can accept it as a fallback for multi-interface clients.
+    broker.set_subscriptions(client_id, subscriptions, current_auth, &real_ip);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4115,5 +4259,68 @@ fn broadcast_record(
                 data: payload.to_string(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fresh() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        pb_core::migrations::migrate_data(&conn).unwrap();
+        pb_core::seed::seed(&conn).unwrap();
+        conn
+    }
+
+    fn create(conn: &mut rusqlite::Connection, body: serde_json::Value) -> Collection {
+        let (kind, name) = pb_core::collection_write::factory_extract(&body).unwrap();
+        let mut draft = pb_core::collection_write::factory(&kind, &name);
+        pb_core::collection_write::apply_request(&mut draft, &body).unwrap();
+        let all = Collection::load_all(conn).unwrap();
+        pb_core::collection_write::save(conn, &mut draft, &all).unwrap();
+        draft.collection
+    }
+
+    #[test]
+    fn at_collection_refs_are_loaded_for_non_relation_bases() {
+        let mut conn = fresh();
+        create(
+            &mut conn,
+            json!({
+                "type": "base", "name": "refteams",
+                "fields": [{"name": "members", "type": "text"}]
+            }),
+        );
+        let base = create(
+            &mut conn,
+            json!({
+                "type": "base", "name": "refopen",
+                "fields": [{"name": "title", "type": "text"}],
+                "listRule": "@collection.refteams.members ?= @request.auth.id"
+            }),
+        );
+
+        // The base has no relation field of its own, but the rule still needs
+        // the referenced collection's metadata.
+        assert!(!base
+            .field_list()
+            .items()
+            .iter()
+            .any(|f| pb_core::fields::field_type(f) == "relation"));
+        let ctx = filter_context(&conn, &base, false);
+        assert!(ctx.collections.contains_key("refteams"));
+    }
+
+    #[test]
+    fn content_types_cover_the_common_extensions() {
+        assert_eq!(content_type_for("a.txt"), "text/plain; charset=utf-8");
+        assert_eq!(content_type_for("a.json"), "application/json");
+        assert_eq!(content_type_for("a.html"), "text/html; charset=utf-8");
+        assert_eq!(content_type_for("a.xml"), "text/xml; charset=utf-8");
+        assert_eq!(content_type_for("a.svg"), "image/svg+xml");
+        assert_eq!(content_type_for("a.jxl"), "image/jxl");
+        assert_eq!(content_type_for("a.unknown"), "application/octet-stream");
     }
 }

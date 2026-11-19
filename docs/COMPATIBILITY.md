@@ -9,7 +9,7 @@ compatibility promise.
 |---|---|---|
 | L1 CLI | `serve`, `superuser {create,update,upsert,delete,otp,ips}`, `migrate`, `version` accept the same flags and produce the same exit codes | scenario: CLI matrix |
 | L2 On-disk | `pb_data/data.db` schema identical; `_migrations` rows identical; `_params.settings` byte-identical (incl. BLOB storage class); `_collections` identical modulo per-install secrets; installer superuser created on a fresh install | `tools/gate_m1.sh` |
-| L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{code,message,data}` | harness `basic` + per-domain scenarios; `tools/gate_m2.sh` for auth/settings/collections reads and collection create/delete/truncate |
+| L3 HTTP | 54 routes, same methods, same status codes, same JSON envelope `{data,message,status}` (validation leaves keep `{code,message}` inside `data`) | harness `basic` + per-domain scenarios; `tools/gate_m2.sh` for auth/settings/collections reads and collection create/delete/truncate |
 | L4 Auth | bcrypt hashes verify; JWT `HS256` with per-collection `authToken.secret`, claims `{collectionId,id,type,refreshable,exp}`; refresh, OTP, MFA, OAuth2, file tokens | cross-token test in `tools/gate_m2.sh`: a token minted by the oracle validates in the port and vice versa |
 | L5 Query | filter/sort/expand/fields syntax and semantics, including NULL and relation traversal, the filter limits (3500 bytes, 200 expressions) and sort limits (8 fields, 255 bytes/field) | `tools/filter_fuzz.py` (420 expressions), `tools/sort_fuzz.py` (165 expressions), `tools/rules_audit.py` (26 rule cases), all run by `tools/gate_m7.sh` |
 | L6 Realtime | `text/event-stream` framing, `PB_CONNECT` event, subscription payloads | SSE scenario |
@@ -48,6 +48,14 @@ compatibility promise.
    config and fails validation, while a partial object (`{"duration":120}`)
    merges onto the existing struct. Slices/maps zero to `[]`/`{}`. This is
    covered by `m2c-collections-write` (`create-auth-options-null`).
+7. **An unknown token is an error, not a guest.** Since v0.42.0 a non-empty
+   `Authorization` value that does not resolve to an auth record returns `401`.
+   The global message is `Missing or invalid authentication.`; routes that bind
+   their own auth middleware keep `The request requires valid record
+   authorization token.` (the oracle's `rejectUnknownToken` runs at priority
+   `9999`, after those middlewares). An empty header is treated as no header.
+   CORS preflight and `/_` → `/_/` are exempt. The activity log records the raw
+   `details` value `unknown authorization token`.
 
 ## Query semantics (M7)
 
@@ -74,10 +82,11 @@ harmless. Everything not listed here is expected to match the oracle exactly.
 
 ### D1 — Historical migrations are not replayed
 
-A fresh install is created directly at the v0.40 schema shape; the intermediate
+A fresh install is created directly at the v0.42.3 schema shape; the intermediate
 v0.22 → v0.23 transformations (`1717233556..1717233559`) are not executed. The
 eight `_migrations` rows are still recorded, so the oracle sees a fully migrated
-database and never re-runs them.
+database and never re-runs them. (The v0.40.6 → v0.42.3 delta added no migration:
+the schema, migration chain and settings seed are unchanged.)
 
 *Why:* replaying history would add a large amount of code whose only output is the
 final schema, which is already reproduced verbatim from the oracle.
@@ -253,25 +262,22 @@ insert) keep `rusqlite`'s text.
 paths now translate rusqlite errors); remaining statements still use rusqlite
 text.
 
-### D14 — Serialized database access and synchronous request logging
+### D14 — Pooled database access and request logging
 
-The port holds every API database operation behind one
-`Arc<Mutex<Connection>>`, and the activity logger calls `load_auth` again and
-writes the `_logs` row synchronously before the response is completed. The oracle
-uses a pooled connection and writes activity rows from a fire-and-forget
-goroutine.
+The port opens a small pool of SQLite connections (`Db`) shared by request
+handlers; operations on one connection are serialized by that connection's
+guard. The activity logger calls `load_auth` again and writes the `_logs` row on
+a `spawn_blocking` task. The oracle uses `database/sql`'s pool and a
+fire-and-forget goroutine.
 
-*Why:* a single connection keeps SQLite transaction semantics and `pb_data`
-compatibility simple; the pool/async writer is a performance optimization, not a
-correctness requirement.
-*Impact (debug build, same machine): authenticated list requests p50 ≈ 9 ms vs
-the oracle's ≈ 0.5 ms; under the M7 load test (8 workers × 40 mirrored ops)
-p50 ≈ 58 ms vs ≈ 0.9 ms. Status codes, final record sets, WAL mode, and
-`integrity_check` all match. Release builds narrow the gap but do not remove the
-serialization.
+*Why:* a small pool keeps SQLite transaction semantics and `pb_data`
+compatibility simple while avoiding a single global lock; the async writer is a
+performance optimization, not a correctness requirement.
+*Impact (debug build, same machine): the measured p50 latency in the M7 load test
+is higher than the oracle's; status codes, final record sets, WAL mode and
+`integrity_check` all match. Release builds narrow the gap.
 *Proven harmless by:* `tools/load_wal.py` (606 requests, zero 5xx/transport
 errors, identical final state) and the full `tools/gate_m7.sh`.
-*Status:* documented divergence; candidate for a connection pool in v2.
 
 ### D15 — SQL math functions are registered by the port
 
@@ -288,3 +294,33 @@ oracle's set.
 the port returned "no such function".
 *Proven harmless by:* the filter fuzz corpus includes `geoDistance` calls and
 direct math-function filters.
+
+### D19 — `auth-methods` OAuth2 provider list is empty
+
+`GET /api/collections/{collection}/auth-methods` reports the password, OTP and
+MFA configuration correctly, but always returns
+`"oauth2":{"providers":[],"enabled":false}` and an empty `authProviders` array.
+The oracle builds one entry per configured provider, including its
+`state`/PKCE verifier and provider `authURL`.
+
+*Why:* producing those values requires the per-provider OAuth2 auth-code flow
+(state + PKCE generation) rather than a static payload. The admin UI's OAuth2
+"all in one" flow is the only consumer observed so far.
+*Impact:* a collection with `oauth2.providers` configured will not expose them
+through `auth-methods`; the OAuth2 redirect broker itself is implemented.
+*Status:* documented gap; tracked in `docs/UNKNOWNS.md`.
+
+### D20 — File content type is inferred from the extension
+
+Uploaded files do not store the mimetype metadata separately in this port, so
+`GET /api/files/{collection}/{record}/{filename}` derives the content type from
+the file extension (common text/data types plus the oracle's manual overrides
+for `.svg`, `.css`, `.js`/`.mjs`, `.xlsx`, `.docx`, `.pptx`). Names with an
+unknown extension fall back to `application/octet-stream`.
+
+*Why:* the on-disk storage layer keeps only the file blob; a sidecar metadata
+store would change the `pb_data` layout.
+*Impact:* an upload whose extension disagrees with its bytes is served with the
+extension's type. Inline/attachment selection, `?download`, the CSP and cache
+headers match the oracle for the types it detects.
+*Status:* documented divergence.

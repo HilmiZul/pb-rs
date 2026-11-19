@@ -19,7 +19,7 @@ import re
 PATH_RE = re.compile(rb"^[A-Za-z0-9_.@/+-]+$")
 EXTS = sorted(
     [b".webmanifest", b".woff2", b".woff", b".html", b".json", b".css", b".svg",
-     b".png", b".ico", b".txt", b".map", b".js"],
+     b".png", b".ico", b".txt", b".map", b".js", b".md"],
     key=len,
     reverse=True,
 )

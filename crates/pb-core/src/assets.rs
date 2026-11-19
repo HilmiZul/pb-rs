@@ -1,7 +1,7 @@
 //! Static API payloads that the oracle serves verbatim.
 //!
 //! Both files were recorded from the reference binary
-//! (v0.40.6, commit 9d281cca):
+//! (v0.42.3, commit c5003ce6; unchanged from the v0.40.6 baseline):
 //!
 //! * `collection_scaffolds.json` — `GET /api/collections/meta/scaffolds`
 //! * `oauth2_providers.json` — `GET /api/collections/meta/oauth2-providers`

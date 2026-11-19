@@ -1,7 +1,7 @@
 //! PocketBase-compatible CLI.
 //!
 //! Flag names, defaults and subcommand names mirror the cobra definitions of the
-//! reference binary (v0.40.6). `serve` and `--version` are functional in M1;
+//! reference binary (v0.42.3). `serve` and `--version` are functional in M1;
 //! `superuser`, `migrate` and `update` are declared so scripts fail loudly
 //! instead of hitting an unknown-command path.
 
@@ -13,7 +13,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "pocketbase",
-    version = "version 0.40.6",
+    version = "version 0.42.3",
     about = "pocketbase CLI",
     disable_help_subcommand = true
 )]

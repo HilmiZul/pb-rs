@@ -10,6 +10,10 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio::sync::mpsc;
 
+/// `oauth2SubscriptionTopic`: the special subscription used by the OAuth2
+/// "all in one" flow.
+pub const OAUTH2_SUBSCRIPTION_TOPIC: &str = "@oauth2";
+
 /// A single SSE message (`subscriptions.Message`).
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -30,6 +34,9 @@ pub struct ClientHandle {
 struct ClientEntry {
     id: String,
     ip: String,
+    /// `RealtimeOAuth2SubscriptionClientIPKey`: the IP of the first `@oauth2`
+    /// subscription request, used as an OAuth2 redirect fallback.
+    oauth2_subscription_ip: Option<String>,
     subscriptions: Vec<String>,
     auth: Option<(String, String)>,
     sender: mpsc::UnboundedSender<Event>,
@@ -56,6 +63,7 @@ impl Broker {
                 ClientEntry {
                     id: id.to_string(),
                     ip: ip.to_string(),
+                    oauth2_subscription_ip: None,
                     subscriptions: Vec::new(),
                     auth: None,
                     sender: tx,
@@ -72,11 +80,16 @@ impl Broker {
     }
 
     /// Returns `false` when the client id is unknown.
+    ///
+    /// `real_ip` is stored as the `@oauth2` subscription IP when this is the
+    /// first subscription and it targets `@oauth2`
+    /// (`RealtimeOAuth2SubscriptionClientIPKey`).
     pub fn set_subscriptions(
         &self,
         id: &str,
         subscriptions: Vec<String>,
         auth: Option<(String, String)>,
+        real_ip: &str,
     ) -> bool {
         let Ok(mut clients) = self.clients.lock() else {
             return false;
@@ -84,6 +97,12 @@ impl Broker {
         let Some(client) = clients.get_mut(id) else {
             return false;
         };
+        if client.subscriptions.is_empty()
+            && subscriptions.len() == 1
+            && subscriptions[0] == OAUTH2_SUBSCRIPTION_TOPIC
+        {
+            client.oauth2_subscription_ip = Some(real_ip.to_string());
+        }
         client.subscriptions = subscriptions;
         client.auth = auth;
         true
@@ -95,6 +114,12 @@ impl Broker {
         clients
             .get(id)
             .map(|c| (c.ip.clone(), c.auth.clone()))
+    }
+
+    /// `RealtimeOAuth2SubscriptionClientIPKey` of an existing client.
+    pub fn oauth2_subscription_ip(&self, id: &str) -> Option<String> {
+        let clients = self.clients.lock().ok()?;
+        clients.get(id).and_then(|c| c.oauth2_subscription_ip.clone())
     }
 
     pub fn subscriptions(&self, id: &str) -> Option<Vec<String>> {

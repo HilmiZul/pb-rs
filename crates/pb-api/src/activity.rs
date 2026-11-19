@@ -160,6 +160,29 @@ fn error_attributes(
     }
 }
 
+/// Errors that are usually returned after a successful response was already
+/// written. The oracle treats requests in a `2xx`/`3xx` state whose error can
+/// be ignored as "OK" (logged at INFO, and skipped entirely for routes bound
+/// to `SkipSuccessActivityLog`).
+const BENIGN_ERRORS: &[&str] = &[
+    "http2: request body closed due to handler exiting",
+    "http2: stream closed",
+    "write: broken pipe",
+    "write error: client disconnected",
+];
+
+#[allow(dead_code)]
+fn is_benign_error(message: &str) -> bool {
+    BENIGN_ERRORS.iter().any(|benign| message.contains(benign))
+}
+
+/// The oracle's `isOKState`: `200 <= status < 400` (and, when an error is
+/// present, a benign one). This port logs from an already-built response, so
+/// the benign case is limited to success-ish statuses.
+fn is_ok_state(status: StatusCode) -> bool {
+    (200..400).contains(&status.as_u16())
+}
+
 /// Axum middleware mirroring PocketBase's activity logger.
 pub async fn activity_logger(State(db): State<Db>, request: Request, next: Next) -> Response {
     let started = Instant::now();
@@ -177,7 +200,7 @@ pub async fn activity_logger(State(db): State<Db>, request: Request, next: Next)
     let response = next.run(request).await;
     let status = response.status();
 
-    if status.is_success() && skips_success_log(uri.path(), &method) {
+    if is_ok_state(status) && skips_success_log(uri.path(), &method) {
         return response;
     }
 

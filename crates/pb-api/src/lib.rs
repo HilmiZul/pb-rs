@@ -228,6 +228,13 @@ pub fn router(db: auth::Db, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, 
         // Layer order: the last layer added is the outermost. CORS runs first so
         // preflight OPTIONS requests never hit the rate limiters or activity log.
         .layer(axum::middleware::from_fn(redirect_underscore_slash))
+        // `rejectUnknownToken` runs after the route-specific auth checks in the
+        // oracle (priority 9999). The middleware keeps those routes' own `401`
+        // messages and rejects every other unknown/invalid token.
+        .layer(axum::middleware::from_fn_with_state(
+            db.clone(),
+            auth::reject_unknown_token,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             allowed_origins.clone(),
             cors_middleware,
@@ -320,7 +327,16 @@ async fn redirect_underscore_slash(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if req.uri().path() == "/_" {
-        return axum::response::Redirect::temporary("/_/").into_response();
+        // Match `http.Redirect`'s response body byte-for-byte (Axum's
+        // `Redirect` sends an empty body).
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+            .header(axum::http::header::LOCATION, "/_/")
+            .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(axum::body::Body::from(
+                "<a href=\"/_/\">Temporary Redirect</a>.\n\n",
+            ))
+            .unwrap_or_else(|_| axum::http::StatusCode::TEMPORARY_REDIRECT.into_response());
     }
     next.run(req).await
 }

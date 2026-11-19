@@ -19,15 +19,23 @@ against it by a differential harness — not by reading documentation.
 ## Oracle identity
 
 ```
-binary   ~/lab/pb/pocketbase
-sha256   d313ba59879e96a5ab566c6763f4ae9b63dc62e9fee78782276407808905d54f
-build    Go 1.27.3, darwin/arm64, CGO_ENABLED=0, -s -w
-version  v0.40.6  (github.com/pocketbase/pocketbase)
-commit   9d281ccaba65f2686eb7b0b614ccda72d1116a1b   (= refs/heads/master at extraction time)
+release   v0.42.3  (ganigeorgiev.com/pocketbase/pocketbase)
+source    ganigeorgiev.com/pocketbase/pocketbase@v0.42.3
+commit    c5003ce63deee71cc6821f338f0d4e1994b3db40
+download  https://ganigeorgiev.com/meta/pocketbase/pocketbase/download/v0.42.3/pocketbase_0.42.3_darwin_arm64.zip
+zip sha256 232c0d5bbb05185b70eb8b37fa3cd8be0ae9b5ae5cf94cbec6d93f98733e0893
+binary sha256 1b046021fd7c9d060ec1cb7d1bdcd00fcb16e998f246516ed87173f315dff0f9
+build     Go 1.27.4, darwin/arm64, CGO_ENABLED=0, -s -w
 ```
 
 `vcs.modified=false` — the shipped binary is an unmodified upstream build, so the
 upstream source at that commit is valid semantic reference material (MIT licensed).
+
+> v0.40.6 was the last release published on GitHub. v0.41.0 and later live only on
+> `ganigeorgiev.com`; the Go module path also changed from
+> `github.com/pocketbase/pocketbase` to `ganigeorgiev.com/pocketbase/pocketbase`.
+> The previous baseline (v0.40.6, commit `9d281cca`) is still available in
+> `.upstream/` for deltas.
 
 ## Layout
 
@@ -40,7 +48,7 @@ spec/               machine-readable specs extracted from the oracle
   schema.sql            exact DDL of a fresh pb_data/data.db
   system/               settings seed, system collections, migrations, field types,
                         validation keys, JSVM typings
-ui/                 embedded admin UI, mirrored 1:1 from the oracle (94 files)
+ui/                 embedded admin UI, mirrored 1:1 from the oracle (97 files)
 tools/              extraction scripts (re-runnable)
 docs/               plan and compatibility contract
 ```

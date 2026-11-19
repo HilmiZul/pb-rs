@@ -6,14 +6,16 @@ is out of scope for v1. These are gaps in evidence, not assumptions.
 | # | Unknown | Why it is open | How to close it |
 |---|---|---|---|
 | 1 | SMTP delivery, templates, retry behaviour | no mail server; `smtp.enabled=false` in the seed | run a local sink (MailHog) and record |
-| 2 | S3 storage backend semantics | requires an S3-compatible endpoint | run MinIO, record |
-| 3 | OAuth2 provider flows end-to-end | requires real provider credentials | mock the token endpoint and record |
+| 2 | S3 storage backend semantics (incl. the v0.42.3 `CompleteMultipartUpload` error-body check) | requires an S3-compatible endpoint | run MinIO, record |
+| 3 | OAuth2 provider flows end-to-end; `auth-methods` provider metadata (state/PKCE/authURL) | requires real provider credentials; the port's endpoint is a documented stub (COMPATIBILITY D19) | mock the token endpoint and record |
 | 4 | Realtime SSE framing over long sessions | the current harness reads whole bodies; SSE never terminates | add a streaming recorder (M5) |
-| 5 | `update` command behaviour | it would fetch and replace the executable | sandbox + local HTTP server replay |
+| 5 | `update` command behaviour | it fetches from `ganigeorgiev.com` (v0.42.3 channel API) and replaces the executable; the port has no self-update | sandbox + local HTTP server replay |
 | 6 | Thumbnail generation byte output | depends on Go's image encoders; exact bytes may differ by codec | compare dimensions/format only, or accept divergence |
 | 7 | JSVM hook semantics | goja is out of scope for v1; rquickjs covers the documented subset (M6a) | M6b (full goja parity deferred) |
 | 8 | Crash/fault-injection durability (kill -9 mid-write, disk-full, torn WAL) | the M7 load test covers steady-state concurrency only; no crash harness yet | run the load test with an external killer/`SIGKILL` loop and compare recovery (`integrity_check`, `-wal`/`-shm` state) |
 | 9 | Rate-limiter timing boundaries | wall-clock dependent | injectable clock in the port, record with the oracle |
+| 10 | Logs `VACUUM` timing at the 50k threshold | the cleanup job runs every six hours; forcing the threshold needs a seeded `auxiliary.db` | seed >50k logs, run `POST /api/crons/__pbLogsCleanup__`, compare `auxiliary.db` size/WAL |
+| 11 | JXL/WebM decoding and thumbnails | the `image` crate has no JPEG-XL decoder; the oracle does not thumb JXL either | compare served bytes/content types only |
 
 ## Known-bounded negative results
 
@@ -35,7 +37,7 @@ is out of scope for v1. These are gaps in evidence, not assumptions.
 - M7 load/WAL coverage is bounded at 8 workers × 40 mirrored operations plus one
   external writer per install (`tools/load_wal.py`). It shows matching status
   codes and final record sets, `journal_mode=wal`, and `integrity_check=ok`; it
-  does not prove fairness or throughput parity. The port serializes all API
-  database access through one `Arc<Mutex<Connection>>` and writes request logs
-  synchronously, so concurrent latency is much higher than the oracle's (see
-  COMPATIBILITY.md D14). This is a performance divergence, not a correctness gap.
+  does not prove fairness or throughput parity. The port uses a small SQLite
+  connection pool and writes request logs on a blocking task, so concurrent
+  latency is still higher than the oracle's (see COMPATIBILITY.md D14). This is a
+  performance divergence, not a correctness gap.

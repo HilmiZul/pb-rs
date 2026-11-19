@@ -92,8 +92,14 @@ impl ApiError {
     /// Like [`ApiError::validation`] but with a custom (usually empty) message.
     pub fn form_validation(message: impl Into<String>, data: Value) -> Self {
         let raw_data = data.clone();
-        Self::new(StatusCode::BAD_REQUEST, message, sentenize_value(data))
-            .with_raw_data(raw_data)
+        let message = message.into();
+        // `router.NewBadRequestError("", err)` substitutes the default message.
+        let message = if message.is_empty() {
+            "Something went wrong while processing your request.".to_string()
+        } else {
+            message
+        };
+        Self::new(StatusCode::BAD_REQUEST, message, sentenize_value(data)).with_raw_data(raw_data)
     }
 
     /// `e.BadRequestError("An error occurred while loading the submitted data.", err)`
@@ -192,6 +198,18 @@ mod tests {
         assert_eq!(
             validation_length(1, 255)["message"],
             "the length must be between 1 and 255"
+        );
+    }
+
+    #[test]
+    fn empty_bad_request_message_uses_the_default() {
+        let err = ApiError::form_validation(
+            "",
+            json!({"field": {"code": "validation_required", "message": "cannot be blank"}}),
+        );
+        assert_eq!(
+            err.message,
+            "Something went wrong while processing your request."
         );
     }
 }

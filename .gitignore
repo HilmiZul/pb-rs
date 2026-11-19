@@ -11,3 +11,7 @@
 # Local env
 .env
 .DS_Store
+
+# Python bytecode from the verification tools
+__pycache__/
+*.pyc

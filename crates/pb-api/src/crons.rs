@@ -4,6 +4,7 @@
 //! aligns to the next UTC minute, runs every due job fire-and-forget, then
 //! ticks once per minute.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,16 @@ fn delete_expired(
     Ok(())
 }
 
+/// `totalDeletedSinceVacuum`: the number of deleted logs since the last aux
+/// `VACUUM`. The oracle only vacuums after 50k rows to avoid running too often.
+static LOGS_DELETED_SINCE_VACUUM: AtomicI64 = AtomicI64::new(0);
+const LOGS_VACUUM_THRESHOLD: i64 = 50_000;
+
+fn count_logs(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM _logs", [], |row| row.get(0))
+        .unwrap_or(0)
+}
+
 fn cleanup_logs(conn: &rusqlite::Connection) -> Result<(), String> {
     let Some(aux) = crate::records::AUX_DB.get() else {
         return Ok(());
@@ -109,11 +120,26 @@ fn cleanup_logs(conn: &rusqlite::Connection) -> Result<(), String> {
         let settings = settings::load(conn).map_err(|e| e.to_string())?;
         settings.logs.max_days
     };
+
+    // Drivers are not required to report affected rows, so count manually.
+    let old_count = count_logs(&aux);
     aux.execute(
         "DELETE FROM _logs WHERE created <= strftime('%Y-%m-%d %H:%M:%fZ','now', ?1)",
         [format!("-{max_days} days")],
     )
     .map_err(|e| e.to_string())?;
+    let new_count = count_logs(&aux);
+
+    let deleted = (old_count - new_count).max(0);
+    let total = LOGS_DELETED_SINCE_VACUUM.fetch_add(deleted, Ordering::SeqCst) + deleted;
+    if total >= LOGS_VACUUM_THRESHOLD {
+        LOGS_DELETED_SINCE_VACUUM.store(0, Ordering::SeqCst);
+        // A VACUUM failure is only logged by the oracle; never fail the job.
+        let _ = aux.execute_batch("VACUUM");
+    }
+
+    // Force a checkpoint to minimize excessive WAL growth after the delete.
+    let _ = aux.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
     Ok(())
 }
 

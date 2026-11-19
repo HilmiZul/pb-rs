@@ -131,13 +131,18 @@ pub async fn oauth2_redirect(
     let subs = broker.subscriptions(&data.state).unwrap_or_default();
     let has_oauth = subs
         .iter()
-        .any(|s| realtime::subscription_topic(s) == "@oauth2");
+        .any(|s| realtime::subscription_topic(s) == realtime::OAUTH2_SUBSCRIPTION_TOPIC);
     if !has_oauth {
         return failure_redirect(method);
     }
 
-    // IP check.
-    if !stored_ip.is_empty() && stored_ip != real_ip {
+    // IP check. Besides the connection IP, the oracle also accepts the IP of
+    // the first `@oauth2` subscription request as a fallback to cover clients
+    // using multiple network interfaces during the OAuth2 flow.
+    let subscription_ip = broker
+        .oauth2_subscription_ip(&data.state)
+        .unwrap_or_default();
+    if !stored_ip.is_empty() && stored_ip != real_ip && real_ip != subscription_ip {
         return failure_redirect(method);
     }
 
@@ -169,11 +174,11 @@ pub async fn oauth2_redirect(
     .unwrap_or_default();
 
     let msg = realtime::Event {
-        name: "@oauth2".to_string(),
+        name: realtime::OAUTH2_SUBSCRIPTION_TOPIC.to_string(),
         data: encoded,
     };
     broker.send(&data.state, msg);
-    broker.unsubscribe(&data.state, "@oauth2");
+    broker.unsubscribe(&data.state, realtime::OAUTH2_SUBSCRIPTION_TOPIC);
 
     if !data.error.is_empty() || data.code.is_empty() {
         return redirect_response(method, "../_/#/auth/oauth2-redirect-failure");

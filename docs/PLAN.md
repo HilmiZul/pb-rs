@@ -14,7 +14,8 @@ Deliverables:
 - `spec/system/` — settings seed, system collections (fields/indexes/rules/options incl.
   all auth token secrets + durations), migration chain, field types, validation keys,
   JSVM typings.
-- `ui/` — the embedded admin UI mirrored 1:1 (94/94 files verified present).
+- `ui/` — the embedded admin UI mirrored 1:1 (97/97 files verified present for
+  v0.42.3; the v0.40.6 baseline had 94).
 - `harness/` — `record` + `diff` with explicit normalization.
 
 **Gate (passed):** the harness records the oracle and self-diffs with 0 mismatches
@@ -216,3 +217,59 @@ Fixes found by the M7 tools:
 **Gate (passed):** `tools/gate_m7.sh` — filter fuzz 420/420, sort fuzz 165/165,
 rules audit 26/26, load/WAL test (606 requests, 0 errors, identical final state,
 `wal` + `integrity_check=ok`), full `gate_m3.sh`, and `cargo test`.
+
+## M8 — v0.40.6 → v0.42.3 upgrade  ✅ done
+
+Baseline moved from the last GitHub release (v0.40.6, commit `9d281cca`) to the
+current release on the new host (v0.42.3, commit `c5003ce6`). The upgrade is a
+behaviour delta port, not a rewrite: 54 routes, 8 migrations, the fresh
+`data.db` schema, the `_params.settings` seed and the system collections are
+unchanged, so existing `pb_data` directories remain drop-in compatible.
+
+Ported production changes:
+
+1. **Global unknown-token rejection** (`apis/middlewares.go`, `apis/base.go`).
+   A non-empty `Authorization` header that does not resolve to an auth record now
+   returns `401 {"data":{},"message":"Missing or invalid authentication.","status":401}`
+   on every route, including `/api/health`, record CRUD, batch, realtime,
+   `oauth2-redirect`, `/` and `/_/`. Routes that bind their own auth middleware
+   (`settings`, `collections` management, `backups` except `GET /api/backups/{key}`,
+   `logs`, `crons`, `sql`, `files/token`, and the record-auth
+   `auth-refresh`/`request-email-change`/`impersonate` handlers) keep their specific
+   `"The request requires valid record authorization token."` message, because the
+   oracle's `rejectUnknownToken` runs at priority `9999` (after route middleware).
+   CORS preflight and the `/_` → `/_/` redirect are exempt. The activity log
+   records `details: "unknown authorization token"`.
+2. **Realtime OAuth2 IP fallback** (`apis/realtime.go`,
+   `apis/record_auth_with_oauth2_redirect.go`). The subscription-time IP equality
+   check was removed. The first `@oauth2` subscription stores its IP; the redirect
+   handler accepts either the connection IP or that subscription IP.
+3. **Logs cleanup** (`core/base.go`, `core/log_query.go`). `__pbLogsCleanup__`
+   counts rows before/after the delete, accumulates deletions, runs `VACUUM` on
+   `auxiliary.db` once 50 000 rows have been deleted, then forces
+   `PRAGMA wal_checkpoint(TRUNCATE)`.
+4. **Activity logger** (`apis/middlewares.go`). `SkipSuccessActivityLog` now
+   applies to `2xx`/`3xx` states (not only `is_success()`), and the benign
+   disconnect errors (`broken pipe`, `client disconnected`, HTTP/2 stream closed)
+   are documented as INFO-level signals.
+5. **File serving** (`apis/file.go`, `tools/filesystem/filesystem.go`).
+   `image/jxl` and the other inline types are served with
+   `Content-Disposition: inline`; `?download=<truthy>` forces `attachment`.
+   Thumbnails refuse source images above `PB_THUMBS_MAX_SOURCE_PIXELS`
+   (default `100 << 20`, was `250 << 20`).
+6. **Admin UI and typings**. `ui/` regenerated from the v0.42.3 `ui/dist`
+   (94 → 97 files) and `crates/pb-core/assets/types.d.ts` replaced with the
+   v0.42.3 fresh-install file (803 467 bytes).
+
+Verification also caught a pre-existing regression from the collection-cache
+optimization: `@collection.<name>.<field>` rules failed for base collections
+without a relation field (`unknown collection`). Filter building now always
+loads the (per-connection cached) collection metadata, with a regression test.
+The live unknown-token probe additionally aligned three responses that the
+scenario harness did not cover: `POST /api/files/token` now uses the route's
+`RequireAuth` message, an empty bad-request message falls back to
+`Something went wrong while processing your request.`, and `GET /_` returns
+Go's `http.Redirect` HTML body instead of an empty 307 body.
+
+The S3 multipart check, SMTP/sendmail fixes, `Event.Extra`, `StartBannerFunc`
+and the new `update` host remain out of scope (`docs/UNKNOWNS.md`).

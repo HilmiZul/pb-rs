@@ -1,7 +1,7 @@
 //! Core of the PocketBase-compatible Rust server.
 //!
 //! Everything here is driven by facts extracted from the reference binary
-//! (v0.40.6, commit 9d281cca) and verified by the differential harness.
+//! (v0.42.3, commit c5003ce6) and verified by the differential harness.
 
 /// Re-exported so downstream crates do not need to depend on `rusqlite`
 /// directly (and always share the same version/features).
@@ -32,7 +32,7 @@ pub mod view;
 
 /// API version reported to clients. Must match the oracle, because the admin UI
 /// and SDKs gate features on it.
-pub const VERSION: &str = "0.40.6";
+pub const VERSION: &str = "0.42.3";
 
 /// The PocketBase data directory layout (relative to `--dir`).
 pub const DATA_DB: &str = "data.db";
