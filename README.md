@@ -1,4 +1,7 @@
-# pb-rs — PocketBase-compatible server in Rust
+# PocketBase-compatible server in Rust
+
+> This PocketBase (Rust) I used for my personal side project. I really love PocketBase project: simple. lightweight. fast.
+Thanks to Gani Georgiev for creating this cool project.
 
 A from-scratch Rust implementation of the PocketBase HTTP/data layer, built to be a
 **drop-in replacement**: it must open an existing `pb_data/` directory, serve the
