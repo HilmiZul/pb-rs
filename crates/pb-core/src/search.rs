@@ -522,6 +522,32 @@ pub fn resolve_request_fields(
     })
 }
 
+/// Value of a `@request.auth.<path>` field.
+///
+/// The Go resolver builds `staticRequestInfo["auth"]` from
+/// `Record.PublicExport()` after unhiding every schema field, so the auth
+/// context always exposes the synthetic `collectionId`/`collectionName`
+/// properties in addition to the record's fields (while `password` and
+/// `tokenKey` remain stripped for auth records).
+fn auth_field_value(auth: Option<&PbRecord>, path: &str) -> serde_json::Value {
+    let Some(auth) = auth else {
+        return serde_json::Value::Null;
+    };
+
+    match path {
+        "collectionId" => return serde_json::Value::String(auth.collection.id.clone()),
+        "collectionName" => return serde_json::Value::String(auth.collection.name.clone()),
+        // `Record.PublicExport` never exposes these for auth records.
+        "password" | "tokenKey" => return serde_json::Value::Null,
+        _ => {}
+    }
+
+    auth.data
+        .get(path)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn request_field_value(
     name: &str,
     request: &RequestData,
@@ -1291,10 +1317,7 @@ fn build_expr(expr: &Expr, ctx: &mut BuildCtx<'_>) -> Result<String, ParseError>
             })
         }
         Expr::AuthField(path) => {
-            let val = ctx
-                .auth
-                .and_then(|a| a.data.get(path.as_str()).cloned())
-                .unwrap_or(serde_json::Value::Null);
+            let val = auth_field_value(ctx.auth, path);
             // `processRequestAuthField`: a missing auth record (or missing
             // field on it) resolves to the literal `NULL` identifier, not a
             // bound NULL parameter.  `resolveEqualExpr` treats that identifier
@@ -1465,11 +1488,7 @@ fn static_kind(expr: &Expr, ctx: &BuildCtx<'_>) -> OperandKind {
         Expr::Field(name) if name.eq_ignore_ascii_case("null") => OperandKind::Null,
         // A missing `@request.auth.*` resolves to `Identifier: "NULL"`.
         Expr::AuthField(path) => {
-            let missing = ctx
-                .auth
-                .and_then(|a| a.data.get(path.as_str()))
-                .map_or(true, serde_json::Value::is_null);
-            if missing {
+            if auth_field_value(ctx.auth, path).is_null() {
                 OperandKind::Null
             } else {
                 OperandKind::Value
@@ -2191,9 +2210,7 @@ pub fn transform_eval(
             })
         }
         Expr::AuthField(path) => {
-            let val = auth
-                .and_then(|a| a.data.get(path.as_str()).cloned())
-                .unwrap_or(serde_json::Value::Null);
+            let val = auth_field_value(auth, path);
             Expr::Literal(match val {
                 serde_json::Value::Null => Literal::Null,
                 serde_json::Value::Bool(b) => Literal::Bool(b),
@@ -2252,6 +2269,53 @@ pub fn build_rule_sql(
         &std::collections::HashMap::new(),
     )?;
     Ok(Some((sf.sql, sf.params)))
+}
+
+#[cfg(test)]
+mod auth_field_tests {
+    use super::*;
+    use crate::{collections::Collection, migrations, seed};
+    use rusqlite::Connection;
+    use std::collections::BTreeMap;
+
+    fn auth_record() -> PbRecord {
+        let conn = Connection::open_in_memory().unwrap();
+        migrations::migrate_data(&conn).unwrap();
+        seed::seed(&conn).unwrap();
+        let collection = Collection::find(&conn, "users").unwrap().unwrap();
+        let mut data = BTreeMap::new();
+        data.insert("id".to_string(), serde_json::json!("user1"));
+        data.insert("email".to_string(), serde_json::json!("a@b.co"));
+        data.insert("password".to_string(), serde_json::json!("hash"));
+        data.insert("tokenKey".to_string(), serde_json::json!("secret"));
+        PbRecord { collection, data }
+    }
+
+    #[test]
+    fn exposes_collection_metadata_and_fields() {
+        let record = auth_record();
+        assert_eq!(
+            auth_field_value(Some(&record), "collectionName"),
+            serde_json::json!(record.collection.name)
+        );
+        assert_eq!(
+            auth_field_value(Some(&record), "collectionId"),
+            serde_json::json!(record.collection.id)
+        );
+        assert_eq!(
+            auth_field_value(Some(&record), "email"),
+            serde_json::json!("a@b.co")
+        );
+    }
+
+    #[test]
+    fn hides_auth_secrets_and_missing_values() {
+        let record = auth_record();
+        assert!(auth_field_value(Some(&record), "password").is_null());
+        assert!(auth_field_value(Some(&record), "tokenKey").is_null());
+        assert!(auth_field_value(Some(&record), "missing").is_null());
+        assert!(auth_field_value(None, "collectionName").is_null());
+    }
 }
 
 #[cfg(test)]
