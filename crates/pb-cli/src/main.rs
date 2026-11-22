@@ -184,7 +184,7 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
     let addr = resolve_addr(&args)?;
     let ui_dir = resolve_ui_dir();
 
-    tracing::info!(%addr, ui = ?ui_dir, "starting server");
+    // tracing::info!(%addr, ui = ?ui_dir, "starting server");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(64)
@@ -200,7 +200,9 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
-        println!("Server started at http://{addr}");
+        // println!("Server started at http://{addr}");
+        println!("REST API: http://{addr}/api");
+        println!("UI: http://{addr}/_");
         let app = pb_api::router(data_pool, ui_dir, Some(global.dir.clone()), Some(aux_pool), args.origins.clone())
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         pb_api::axum::serve(listener, app)
