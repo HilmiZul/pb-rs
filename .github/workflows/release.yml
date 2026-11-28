@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.2.0). Leave empty to bump the patch version automatically."
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
+      release_body: ${{ steps.notes.outputs.content }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          bash .github/scripts/compute-version.sh \
+            "${GITHUB_REF_TYPE}" \
+            "${GITHUB_REF_NAME}" \
+            "${REQUESTED_VERSION}"
+
+      - name: Generate release notes
+        if: steps.version.outputs.skip != 'true'
+        id: notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: ${{ steps.version.outputs.cliff_args }}
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Generate CHANGELOG.md
+        if: steps.version.outputs.skip != 'true'
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.version.outputs.tag }}
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Upload changelog
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: CHANGELOG.md
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary: pocketbase
+            python: python3
+          - os: darwin
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: pocketbase
+            python: python3
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: pocketbase
+            python: python3
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: pocketbase
+            python: python3
+          - os: windows
+            arch: amd64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: pocketbase.exe
+            python: python
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: pocketbase.exe
+            python: python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p pb-cli --target ${{ matrix.target }}
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+
+      - name: Package archive
+        run: >-
+          ${{ matrix.python }} .github/scripts/package.py
+          --binary "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          --version "${{ needs.prepare.outputs.version }}"
+          --os "${{ matrix.os }}"
+          --arch "${{ matrix.arch }}"
+          --changelog CHANGELOG.md
+          --license LICENSE.md
+          --readme README.md
+          --out-dir dist
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocketbase-rs_${{ needs.prepare.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pocketbase-rs_*
+          path: dist
+          merge-multiple: true
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: dist
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum ./*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body: ${{ needs.prepare.outputs.release_body }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/*.zip
+            dist/CHANGELOG.md
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: true
