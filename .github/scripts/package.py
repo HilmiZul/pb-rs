@@ -26,8 +26,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
     parser.add_argument("--license", type=Path, default=Path("LICENSE.md"))
     parser.add_argument("--readme", type=Path, default=Path("README.md"))
-    parser.add_argument("--ui-dir", type=Path, default=Path("ui/_"),
-                        help="directory with the admin UI assets (ui/_)")
     return parser.parse_args()
 
 
@@ -51,13 +49,6 @@ def main() -> int:
     if args.readme.is_file():
         files.append(args.readme)
 
-    ui_files: list[tuple[Path, str]] = []
-    if args.ui_dir.is_dir():
-        for path in sorted(args.ui_dir.rglob("*")):
-            if path.is_file():
-                rel = path.relative_to(args.ui_dir).as_posix()
-                ui_files.append((path, f"ui/_/{rel}"))
-
     args.out_dir.mkdir(parents=True, exist_ok=True)
     archive = args.out_dir / (
         f"pocketbase-rs_{args.version}_{args.os_name}_{args.arch}.zip"
@@ -66,14 +57,10 @@ def main() -> int:
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for path in files:
             zf.write(path, arcname=path.name)
-        for path, arcname in ui_files:
-            zf.write(path, arcname=arcname)
 
     print(f"created {archive} ({archive.stat().st_size} bytes)")
     for path in files:
         print(f"  + {path.name}")
-    for _path, arcname in ui_files:
-        print(f"  + {arcname}")
     return 0
 
 

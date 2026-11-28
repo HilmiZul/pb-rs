@@ -185,9 +185,9 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
     let ui_dir = resolve_ui_dir();
 
     // PocketBase's install flow: when no real superuser exists, mint a
-    // short-lived auth token for the installer placeholder and print the
-    // `/_/#/pbinstall/<token>` URL so the user can register their first
-    // superuser through the admin UI.
+    // short-lived auth token for the installer placeholder, print (and open)
+    // the `/_/#/pbinstall/<token>` URL, and redirect the UI there automatically.
+    let mut install_token: Option<String> = None;
     if pb_core::superusers::needs_installer_superuser(&data_db).unwrap_or(false) {
         if let Ok(Some(col)) =
             pb_core::collections::Collection::find(&data_db, pb_core::superusers::COLLECTION_NAME_SUPERUSERS)
@@ -212,6 +212,7 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
                     );
                     println!();
                     open_in_browser(&url);
+                    install_token = Some(token);
                 }
             }
         }
@@ -236,7 +237,7 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
         // println!("Server started at http://{addr}");
         println!("REST API: http://{addr}/api");
         println!("UI: http://{addr}/_");
-        let app = pb_api::router(data_pool, ui_dir, Some(global.dir.clone()), Some(aux_pool), args.origins.clone())
+        let app = pb_api::router(data_pool, ui_dir, Some(global.dir.clone()), Some(aux_pool), args.origins.clone(), install_token)
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         pb_api::axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())

@@ -77,7 +77,7 @@ async fn not_found(method: axum::http::Method) -> error::ApiError {
 ///
 /// `ui_dir` is the mirrored admin UI directory (`ui/_`); when present it is
 /// served under `/_/` with SPA fallback, exactly like the embedded FS.
-pub fn router(db: auth::Db, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_db: Option<auth::Db>, allowed_origins: Option<Vec<String>>) -> Router {
+pub fn router(db: auth::Db, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, aux_db: Option<auth::Db>, allowed_origins: Option<Vec<String>>, install_token: Option<String>) -> Router {
     if let Some(dir) = data_dir {
         let _ = records::DATA_DIR.set(dir);
     }
@@ -251,6 +251,15 @@ pub fn router(db: auth::Db, ui_dir: Option<PathBuf>, data_dir: Option<PathBuf>, 
             db.clone(),
             activity::activity_logger,
         ))
+        // On a fresh install (no real superuser) redirect the landing page to
+        // the installer URL so the user lands on the registration form.
+        .layer(axum::middleware::from_fn_with_state(
+            InstallRedirectState {
+                db: db.clone(),
+                token: install_token.clone(),
+            },
+            install_redirect,
+        ))
         .with_state(db)
 }
 async fn cors_middleware(
@@ -322,6 +331,51 @@ async fn cors_middleware(
     let _ = headers.insert("Access-Control-Allow-Origin", allow_origin.parse().unwrap());
     resp
 }
+#[derive(Clone)]
+struct InstallRedirectState {
+    db: auth::Db,
+    token: Option<String>,
+}
+
+async fn install_redirect(
+    State(state): State<InstallRedirectState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{Method, StatusCode};
+
+    if let Some(token) = &state.token {
+        let path = req.uri().path();
+        if req.method() == Method::GET && path == "/"
+        {
+            let needs_install = state
+                .db
+                .lock()
+                .ok()
+                .map(|conn| {
+                    conn.query_row(
+                        "SELECT count(*) FROM _superusers WHERE email <> ?1",
+                        [pb_core::superusers::DEFAULT_INSTALLER_EMAIL],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                        == 0
+                })
+                .unwrap_or(false);
+
+            if needs_install {
+                let location = format!("/_/#/pbinstall/{}", token);
+                return axum::response::Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header(axum::http::header::LOCATION, location)
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| StatusCode::TEMPORARY_REDIRECT.into_response());
+            }
+        }
+    }
+    next.run(req).await
+}
+
 async fn redirect_underscore_slash(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
