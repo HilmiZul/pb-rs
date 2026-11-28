@@ -184,6 +184,39 @@ fn serve(global: Global, args: ServeArgs) -> Result<()> {
     let addr = resolve_addr(&args)?;
     let ui_dir = resolve_ui_dir();
 
+    // PocketBase's install flow: when no real superuser exists, mint a
+    // short-lived auth token for the installer placeholder and print the
+    // `/_/#/pbinstall/<token>` URL so the user can register their first
+    // superuser through the admin UI.
+    if pb_core::superusers::needs_installer_superuser(&data_db).unwrap_or(false) {
+        if let Ok(Some(col)) =
+            pb_core::collections::Collection::find(&data_db, pb_core::superusers::COLLECTION_NAME_SUPERUSERS)
+        {
+            if let Ok(Some(rec)) =
+                pb_core::records::Record::find_by_email(&data_db, &col, pb_core::superusers::DEFAULT_INSTALLER_EMAIL)
+            {
+                let secret = col.token_secret("authToken").unwrap_or("");
+                let key = pb_core::tokens::signing_key(rec.token_key(), secret);
+                let claims = pb_core::tokens::RecordClaims::auth(rec.id(), &col.id, false);
+                if let Ok(token) = pb_core::tokens::new_jwt(&claims, &key, 30 * 60) {
+                    let base_url = format!("http://{}", addr);
+                    let url = format!("{}/_/#/pbinstall/{}", base_url.trim_end_matches('/'), token);
+                    println!();
+                    println!("(!) Launch the URL below in the browser if it hasn't been open already to create your first superuser account:");
+                    println!("{}", url);
+                    println!(
+                        "(you can also create your first superuser by running: {} superuser upsert EMAIL PASS)",
+                        std::env::current_exe()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "pocketbase".to_string())
+                    );
+                    println!();
+                    open_in_browser(&url);
+                }
+            }
+        }
+    }
+
     // tracing::info!(%addr, ui = ?ui_dir, "starting server");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -463,6 +496,20 @@ fn resolve_ui_dir() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("ui/_"));
     candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Best-effort attempt to open the installer URL in the default browser.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let _ = url;
 }
 
 async fn shutdown_signal() {
