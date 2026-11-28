@@ -31,8 +31,9 @@ matching `vX.Y.Z` tag and publishes a GitHub release.
 
 Each archive contains the `pocketbase` binary (`pocketbase.exe` on Windows),
 `CHANGELOG.md`, `LICENSE.md`, `README.md` and the admin UI under `ui/_/`.
-Extract the **whole** archive and run the binary from that folder — the UI is
-loaded from `ui/_` next to the executable.
+The binary is **self-contained** — the admin UI is embedded, so it runs even
+if moved out of the archive — but extracting the whole archive keeps `ui/_`
+next to it, which lets you override/customize the UI.
 
 On the first run with an empty data directory the server creates an installer
 superuser and prints a `/_/#/pbinstall/<token>` URL. Open it (or follow the

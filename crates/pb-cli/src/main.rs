@@ -485,7 +485,14 @@ fn normalize_addr(value: &str) -> String {
     }
 }
 
+/// Embedded copy of the admin UI (`ui/_`), compiled into the binary so a
+/// single executable works even when the `ui/_` directory is not present on
+/// disk (e.g. a release binary moved out of its archive).
+const EMBEDDED_UI: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../ui/_");
+
 /// Prefer the mirrored UI next to the executable, then the working directory.
+/// Fall back to the copy embedded in the binary.
 fn resolve_ui_dir() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -495,7 +502,34 @@ fn resolve_ui_dir() -> Option<PathBuf> {
         }
     }
     candidates.push(PathBuf::from("ui/_"));
-    candidates.into_iter().find(|p| p.is_dir())
+    if let Some(found) = candidates.into_iter().find(|p| p.is_dir()) {
+        return Some(found);
+    }
+
+    // No on-disk UI: extract the embedded copy to a per-process temp dir.
+    let dest = std::env::temp_dir().join(format!("pocketbase-ui-{}", std::process::id()));
+    if !dest.exists() {
+        if let Err(err) = std::fs::create_dir_all(&dest) {
+            tracing::warn!(?err, "could not create temp UI dir");
+            return None;
+        }
+        if let Err(err) = EMBEDDED_UI.extract(&dest) {
+            tracing::warn!(?err, "could not extract embedded UI");
+            return None;
+        }
+    }
+    let ui = dest.join("ui/_");
+    // include_dir extracts the contents of `ui/_` directly into `dest`? Check:
+    // include_dir!(".../ui/_") embeds the directory itself, and extract()
+    // recreates its contents under dest. The ServeDir expects `ui/_` layout,
+    // so if `dest/index.html` exists, point at dest.
+    if dest.join("index.html").is_file() {
+        Some(dest)
+    } else if ui.is_dir() {
+        Some(ui)
+    } else {
+        None
+    }
 }
 
 /// Best-effort attempt to open the installer URL in the default browser.
