@@ -699,10 +699,17 @@ pub fn build_sql_full(
         relations,
         collections,
         &std::collections::HashMap::new(),
+        "",
     )
 }
 
-/// Like [`build_sql_full`] but with the queried collection's field types.
+/// Like [`build_sql_full`] but with the queried collection's field types and
+/// table name.
+///
+/// `base_table` qualifies outer-column references inside relation-path
+/// subqueries. Without it, `rel.sub` on a target table that has a column with
+/// the same name as `rel` resolves the unqualified name to the *joined* table
+/// (SQLite prefers the innermost FROM entry in `ON`), producing an empty join.
 pub fn build_sql_full_with_types(
     expr: &Expr,
     allowed_fields: &[String],
@@ -710,6 +717,7 @@ pub fn build_sql_full_with_types(
     relations: &std::collections::HashMap<String, RelationInfo>,
     collections: &std::collections::HashMap<String, CollectionInfo>,
     base_types: &std::collections::HashMap<String, String>,
+    base_table: &str,
 ) -> Result<SqlFilter, ParseError> {
     let mut ctx = BuildCtx {
         params: Vec::new(),
@@ -718,6 +726,7 @@ pub fn build_sql_full_with_types(
         relations,
         collections,
         base_types,
+        base_table,
         simple: None,
     };
     let sql = build_expr(expr, &mut ctx)?;
@@ -741,6 +750,7 @@ pub fn build_sql_simple(
         relations: &relations,
         collections: &collections,
         base_types: &empty_types,
+        base_table: "",
         simple: Some(SimpleMode { json_paths }),
     };
     let sql = build_expr(expr, &mut ctx)?;
@@ -1237,6 +1247,9 @@ struct BuildCtx<'a> {
     /// Field name -> field type for the queried collection, used to
     /// distinguish JSON paths from invalid relation traversals.
     base_types: &'a std::collections::HashMap<String, String>,
+    /// Table name of the queried collection. Qualifies outer-column references
+    /// inside relation-path subqueries (`""` disables qualification).
+    base_table: &'a str,
     /// Set for `search.SimpleFieldResolver` queries (logs). The collection
     /// resolver ignores dotted JSON paths.
     simple: Option<SimpleMode>,
@@ -1866,13 +1879,27 @@ fn relation_path_sql(
     })?;
     let mut multiple = first_rel.multiple;
 
+    // Qualify the outer relation column with the base table. Inside the
+    // correlated subquery the unqualified name would resolve to the joined
+    // target when both tables have a column with the same name (e.g.
+    // `jurnal.siswa` -> `student_users.siswa`), silently breaking the join.
+    let outer_field = if ctx.base_table.is_empty() {
+        crate::records::quote_ident(first)
+    } else {
+        format!(
+            "{}.{}",
+            crate::records::quote_ident(ctx.base_table),
+            crate::records::quote_ident(first)
+        )
+    };
+
     let mut from = String::from("(SELECT 1) AS __pb_one");
     let mut active_alias = rel_alias(0);
     if first_rel.multiple {
         from.push_str(&format!(
             " LEFT JOIN json_each({field}) AS {je} ON 1 \
              LEFT JOIN {table} AS {alias} ON {alias}.id = {je}.value",
-            field = crate::records::quote_ident(first),
+            field = outer_field,
             je = je_alias(0),
             table = crate::records::quote_ident(&active_info.table),
             alias = active_alias,
@@ -1882,7 +1909,7 @@ fn relation_path_sql(
             " LEFT JOIN {table} AS {alias} ON {alias}.id = {field}",
             table = crate::records::quote_ident(&active_info.table),
             alias = active_alias,
-            field = crate::records::quote_ident(first),
+            field = outer_field,
         ));
     }
 
@@ -2426,6 +2453,7 @@ mod relation_path_tests {
             &relations,
             &collections,
             &base_types,
+            "jurnal_komentar",
         )
         .unwrap();
         let sql = format!("SELECT count(*) FROM \"jurnal_komentar\" WHERE {}", sf.sql);
@@ -2468,5 +2496,92 @@ mod relation_path_tests {
         // Plain `=` requires every related value to match, `?=` requires any.
         assert_eq!(count_for(r#"idJurnal.tags.nama = "red""#), 1);
         assert_eq!(count_for(r#"idJurnal.tags.nama ?= "red""#), 2);
+    }
+
+    #[test]
+    fn nested_relation_qualifies_outer_column_with_same_name() {
+        // Mirrors `jurnal.siswa -> student_users.siswa -> siswa.id`: both the
+        // base and the first target have a `siswa` column, so the first-hop
+        // join must reference the outer table explicitly.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE jurnal (id TEXT PRIMARY KEY, siswa TEXT);
+            CREATE TABLE student_users (id TEXT PRIMARY KEY, siswa TEXT);
+            CREATE TABLE siswa (id TEXT PRIMARY KEY, nama TEXT);
+            INSERT INTO siswa (id, nama) VALUES ('s1', 'Budi'), ('s2', 'Ani');
+            INSERT INTO student_users (id, siswa) VALUES ('u1', 's1'), ('u2', 's2');
+            INSERT INTO jurnal (id, siswa) VALUES ('j1', 'u1'), ('j2', 'u2');
+            "#,
+        )
+        .unwrap();
+
+        let relations = HashMap::from([("siswa".to_string(), relation("student_users", false))]);
+        let collections = HashMap::from([
+            (
+                "jurnal".to_string(),
+                collection(
+                    "jurnal",
+                    &["id", "siswa"],
+                    &[("id", "text"), ("siswa", "relation")],
+                    &[("siswa", relation("student_users", false))],
+                ),
+            ),
+            (
+                "student_users".to_string(),
+                collection(
+                    "student_users",
+                    &["id", "siswa"],
+                    &[("id", "text"), ("siswa", "relation")],
+                    &[("siswa", relation("siswa", false))],
+                ),
+            ),
+            (
+                "siswa".to_string(),
+                collection(
+                    "siswa",
+                    &["id", "nama"],
+                    &[("id", "text"), ("nama", "text")],
+                    &[],
+                ),
+            ),
+        ]);
+        let base_types = HashMap::from([
+            ("id".to_string(), "text".to_string()),
+            ("siswa".to_string(), "relation".to_string()),
+        ]);
+        let allowed = vec!["id".to_string(), "siswa".to_string()];
+
+        let count = |filter: &str| {
+            let expr = parse(filter).unwrap();
+            let sf = build_sql_full_with_types(
+                &expr,
+                &allowed,
+                None,
+                &relations,
+                &collections,
+                &base_types,
+                "jurnal",
+            )
+            .unwrap();
+            let sql = format!("SELECT count(*) FROM \"jurnal\" WHERE {}", sf.sql);
+            let params: Vec<rusqlite::types::Value> = sf
+                .params
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone().into(),
+                    serde_json::Value::Number(n) => n.as_i64().unwrap().into(),
+                    serde_json::Value::Bool(b) => (*b as i64).into(),
+                    serde_json::Value::Null => rusqlite::types::Value::Null,
+                    other => other.to_string().into(),
+                })
+                .collect();
+            conn.query_row(&sql, rusqlite::params_from_iter(params), |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+
+        assert_eq!(count(r#"siswa.siswa.id = "s1""#), 1);
+        assert_eq!(count(r#"siswa.siswa.nama = "Budi""#), 1);
+        assert_eq!(count(r#"siswa.siswa.nama != "Budi""#), 1);
     }
 }

@@ -1858,6 +1858,7 @@ fn go_snakecase(input: &str) -> String {
 /// targets of the base collection, and metadata for `@collection.*` references.
 #[derive(Clone)]
 struct FilterContext {
+    table: String,
     allowed: Vec<String>,
     relations: HashMap<String, search::RelationInfo>,
     collections: HashMap<String, search::CollectionInfo>,
@@ -2014,6 +2015,7 @@ fn build_filter_context(
     base_types.insert("id".to_string(), "text".to_string());
 
     FilterContext {
+        table: collection.name.clone(),
         allowed,
         relations: relations_for(collection),
         collections,
@@ -2037,6 +2039,7 @@ fn build_filter_sql_raw(
         &ctx.relations,
         &ctx.collections,
         &ctx.base_types,
+        &ctx.table,
     )
 }
 
@@ -3056,11 +3059,16 @@ fn build_order(
                     if !exists {
                         return Err(invalid_sort_field(other));
                     }
+                    // Qualify `head` with the base table: inside the
+                    // correlated subquery an unqualified name resolves to the
+                    // target table when both have a column with that name
+                    // (e.g. `sort=siswa.email` -> `student_users.siswa`).
                     format!(
-                        "(SELECT {} FROM {} WHERE {} = {})",
+                        "(SELECT {} FROM {} WHERE {} = {}.{})",
                         pb_core::records::quote_ident(sub),
                         quote_table(&target.name),
                         pb_core::records::quote_ident("id"),
+                        quote_table(&collection.name),
                         pb_core::records::quote_ident(head)
                     )
                 } else {
@@ -4568,6 +4576,118 @@ mod tests {
             .any(|f| pb_core::fields::field_type(f) == "relation"));
         let ctx = filter_context(&conn, &base, false);
         assert!(ctx.collections.contains_key("refteams"));
+    }
+
+    #[test]
+    fn relation_sort_qualifies_outer_column_with_same_name() {
+        let mut conn = fresh();
+        let students = create(
+            &mut conn,
+            json!({"type": "base", "name": "sort_students"}),
+        );
+        // The target has a `siswa` column too, which used to shadow the outer
+        // `sort_jurnal.siswa` reference inside the correlated sort subquery.
+        let users = create(
+            &mut conn,
+            json!({
+                "type": "base",
+                "name": "sort_users",
+                "fields": [
+                    {"name": "email", "type": "text"},
+                    {"name": "siswa", "type": "relation", "collectionId": students.id}
+                ]
+            }),
+        );
+        let jurnal = create(
+            &mut conn,
+            json!({
+                "type": "base",
+                "name": "sort_jurnal",
+                "fields": [
+                    {"name": "siswa", "type": "relation", "collectionId": users.id}
+                ]
+            }),
+        );
+
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO {students} (id) VALUES ('st1'), ('st2');
+            INSERT INTO {users} (id, email, siswa) VALUES
+                ('su1', 'a@x.test', 'st1'), ('su2', 'b@x.test', 'st2');
+            INSERT INTO {jurnal} (id, siswa) VALUES ('r1', 'su2'), ('r2', 'su1');
+            "#,
+            students = quote_table(&students.name),
+            users = quote_table(&users.name),
+            jurnal = quote_table(&jurnal.name),
+        ))
+        .unwrap();
+
+        let order = build_order(&conn, &jurnal, "siswa.email").unwrap();
+        let sql = format!("SELECT id FROM {} {}", quote_table(&jurnal.name), order);
+        let ids: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["r2".to_string(), "r1".to_string()]);
+    }
+
+    #[test]
+    fn nested_relation_filter_qualifies_outer_column_with_same_name() {
+        let mut conn = fresh();
+        let students = create(
+            &mut conn,
+            json!({"type": "base", "name": "filter_students"}),
+        );
+        let users = create(
+            &mut conn,
+            json!({
+                "type": "base",
+                "name": "filter_users",
+                "fields": [
+                    {"name": "siswa", "type": "relation", "collectionId": students.id}
+                ]
+            }),
+        );
+        let jurnal = create(
+            &mut conn,
+            json!({
+                "type": "base",
+                "name": "filter_jurnal",
+                "fields": [
+                    {"name": "siswa", "type": "relation", "collectionId": users.id}
+                ]
+            }),
+        );
+
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO {students} (id) VALUES ('st1'), ('st2');
+            INSERT INTO {users} (id, siswa) VALUES ('su1', 'st1'), ('su2', 'st2');
+            INSERT INTO {jurnal} (id, siswa) VALUES ('r1', 'su2'), ('r2', 'su1');
+            "#,
+            students = quote_table(&students.name),
+            users = quote_table(&users.name),
+            jurnal = quote_table(&jurnal.name),
+        ))
+        .unwrap();
+
+        let request = RequestInfo::new(None, Map::new(), HashMap::new(), &HeaderMap::new(), "GET");
+        let ctx = filter_context(&conn, &jurnal, true);
+        let sf = build_filter_sql_raw(&ctx, "siswa.siswa.id = 'st1'", &request).unwrap();
+        let sql = format!("SELECT id FROM {} WHERE {}", quote_table(&jurnal.name), sf.sql);
+        let params: Vec<rusqlite::types::Value> =
+            sf.params.iter().map(json_to_sqlite).collect();
+        let ids: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(params), |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["r2".to_string()]);
     }
 
     #[test]

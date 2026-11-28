@@ -2783,6 +2783,7 @@ fn validate_rule(
         &relations,
         &collections,
         &base.field_types,
+        &base.table,
     )
     .map(|_| ())
     .map_err(|e| e.0)
