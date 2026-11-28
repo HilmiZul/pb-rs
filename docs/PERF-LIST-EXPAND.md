@@ -23,7 +23,7 @@ GET /api/collections/pemetaan/records
 Method: both servers on the same machine, same dataset copied from
 `target/release/pb_data`, superuser auth, 30 warm-up requests then 300 timed
 requests over one keep-alive connection (p50 unless stated otherwise). The Go
-binary is PocketBase v0.42.3 (`~/lab/sch/epkl4-pb/be`); the Rust binary is
+binary is PocketBase v0.42.3 (`~/be`); the Rust binary is
 `cargo build --release -p pb-cli`.
 
 Reproduce with the script shape in §8.
@@ -218,11 +218,11 @@ and batching changes.
 
 ```bash
 # terminal 1 — oracle
-cd ~/lab/sch/epkl4-pb
+cd ~/app
 ./be serve --http=127.0.0.1:18611 --dir "$TMP/go/pb_data"
 
 # terminal 2 — port
-cd /Users/zulhilmi/lab/pb-rs
+cd ~/pb-rs
 ./target/release/pocketbase serve --http=127.0.0.1:18612 --dir "$TMP/rust_pb_data"
 ```
 
