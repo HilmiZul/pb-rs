@@ -21,4 +21,3 @@ cargo build --release
 ## License
 
 PocketBase (c) Gani Georgiev; see `LICENSE.md`.
-(c) 2026, Rewrite and ported by Zul Hilmi.
